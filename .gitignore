@@ -1,0 +1,7 @@
+node_modules/
+.loom-data/
+scripts/output/
+.DS_Store
+*.log
+*.tmp
+*.bak

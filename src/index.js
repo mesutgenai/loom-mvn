@@ -1,0 +1,360 @@
+import { createLoomServer } from "./node/server.js";
+import { createEmailRelayFromEnv } from "./node/email_relay.js";
+import { createPostgresPersistenceFromEnv } from "./node/persistence_postgres.js";
+
+const port = Number(process.env.PORT || 8787);
+const host = process.env.HOST || "127.0.0.1";
+const domain = process.env.LOOM_DOMAIN || `${host}:${port}`;
+const federationOutboxAutoProcessIntervalMs = Number(process.env.LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
+const federationOutboxAutoProcessBatchSize = Number(process.env.LOOM_OUTBOX_AUTO_PROCESS_BATCH_SIZE || 20);
+const emailOutboxAutoProcessIntervalMs = Number(process.env.LOOM_EMAIL_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
+const emailOutboxAutoProcessBatchSize = Number(process.env.LOOM_EMAIL_OUTBOX_AUTO_PROCESS_BATCH_SIZE || 20);
+const webhookOutboxAutoProcessIntervalMs = Number(process.env.LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
+const webhookOutboxAutoProcessBatchSize = Number(process.env.LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_BATCH_SIZE || 20);
+const federationSigningPrivateKeyPem = process.env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM
+  ? process.env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM.replace(/\\n/g, "\n")
+  : null;
+const emailRelay = createEmailRelayFromEnv();
+const postgresPersistence = createPostgresPersistenceFromEnv();
+const runtimeStatus = {
+  started_at: new Date().toISOString(),
+  persistence_hydration: null,
+  federation_outbox_worker: {
+    enabled: false,
+    interval_ms: federationOutboxAutoProcessIntervalMs,
+    batch_size: federationOutboxAutoProcessBatchSize,
+    runs_total: 0,
+    in_progress: false,
+    last_run_at: null,
+    last_processed_count: 0,
+    last_error: null,
+    last_error_at: null
+  },
+  email_outbox_worker: {
+    enabled: false,
+    interval_ms: emailOutboxAutoProcessIntervalMs,
+    batch_size: emailOutboxAutoProcessBatchSize,
+    runs_total: 0,
+    in_progress: false,
+    last_run_at: null,
+    last_processed_count: 0,
+    last_error: null,
+    last_error_at: null
+  },
+  webhook_outbox_worker: {
+    enabled: false,
+    interval_ms: webhookOutboxAutoProcessIntervalMs,
+    batch_size: webhookOutboxAutoProcessBatchSize,
+    runs_total: 0,
+    in_progress: false,
+    last_run_at: null,
+    last_processed_count: 0,
+    last_error: null,
+    last_error_at: null
+  }
+};
+
+let storeRef = null;
+
+function runtimeStatusProvider() {
+  return {
+    ...runtimeStatus,
+    email_relay: typeof emailRelay.getStatus === "function" ? emailRelay.getStatus() : null,
+    postgres: typeof postgresPersistence?.getStatus === "function" ? postgresPersistence.getStatus() : null,
+    persistence: storeRef?.getPersistenceStatus?.() || null
+  };
+}
+
+const { server, store } = createLoomServer({
+  nodeId: process.env.LOOM_NODE_ID || "loom-node.local",
+  domain,
+  dataDir: process.env.LOOM_DATA_DIR || null,
+  federationSigningKeyId: process.env.LOOM_NODE_SIGNING_KEY_ID || "k_node_sign_local_1",
+  federationSigningPrivateKeyPem,
+  persistenceAdapter: postgresPersistence,
+  emailRelay,
+  runtimeStatusProvider
+});
+storeRef = store;
+
+let federationOutboxTimer = null;
+let isFederationOutboxProcessing = false;
+let emailOutboxTimer = null;
+let isEmailOutboxProcessing = false;
+let webhookOutboxTimer = null;
+let isWebhookOutboxProcessing = false;
+
+function startFederationOutboxWorker() {
+  if (!Number.isFinite(federationOutboxAutoProcessIntervalMs) || federationOutboxAutoProcessIntervalMs <= 0) {
+    runtimeStatus.federation_outbox_worker.enabled = false;
+    return;
+  }
+
+  runtimeStatus.federation_outbox_worker.enabled = true;
+
+  federationOutboxTimer = setInterval(async () => {
+    if (isFederationOutboxProcessing) {
+      return;
+    }
+
+    isFederationOutboxProcessing = true;
+    runtimeStatus.federation_outbox_worker.in_progress = true;
+    runtimeStatus.federation_outbox_worker.last_run_at = new Date().toISOString();
+    runtimeStatus.federation_outbox_worker.runs_total += 1;
+    try {
+      const result = await store.processFederationOutboxBatch(federationOutboxAutoProcessBatchSize, null);
+      runtimeStatus.federation_outbox_worker.last_processed_count = result.processed_count;
+      runtimeStatus.federation_outbox_worker.last_error = null;
+      runtimeStatus.federation_outbox_worker.last_error_at = null;
+      if (result.processed_count > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`LOOM federation outbox worker processed ${result.processed_count} item(s)`);
+      }
+    } catch (error) {
+      runtimeStatus.federation_outbox_worker.last_error = error?.message || "Unknown federation outbox worker error";
+      runtimeStatus.federation_outbox_worker.last_error_at = new Date().toISOString();
+      // eslint-disable-next-line no-console
+      console.error("LOOM federation outbox worker failed", error);
+    } finally {
+      isFederationOutboxProcessing = false;
+      runtimeStatus.federation_outbox_worker.in_progress = false;
+    }
+  }, federationOutboxAutoProcessIntervalMs);
+
+  federationOutboxTimer.unref?.();
+}
+
+function stopFederationOutboxWorker() {
+  if (federationOutboxTimer) {
+    clearInterval(federationOutboxTimer);
+    federationOutboxTimer = null;
+  }
+}
+
+function startEmailOutboxWorker() {
+  if (!emailRelay?.isEnabled?.()) {
+    runtimeStatus.email_outbox_worker.enabled = false;
+    return;
+  }
+
+  if (!Number.isFinite(emailOutboxAutoProcessIntervalMs) || emailOutboxAutoProcessIntervalMs <= 0) {
+    runtimeStatus.email_outbox_worker.enabled = false;
+    return;
+  }
+
+  runtimeStatus.email_outbox_worker.enabled = true;
+
+  emailOutboxTimer = setInterval(async () => {
+    if (isEmailOutboxProcessing) {
+      return;
+    }
+
+    isEmailOutboxProcessing = true;
+    runtimeStatus.email_outbox_worker.in_progress = true;
+    runtimeStatus.email_outbox_worker.last_run_at = new Date().toISOString();
+    runtimeStatus.email_outbox_worker.runs_total += 1;
+
+    try {
+      const result = await store.processEmailOutboxBatch(emailOutboxAutoProcessBatchSize, emailRelay, null);
+      runtimeStatus.email_outbox_worker.last_processed_count = result.processed_count;
+      runtimeStatus.email_outbox_worker.last_error = null;
+      runtimeStatus.email_outbox_worker.last_error_at = null;
+      if (result.processed_count > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`LOOM email outbox worker processed ${result.processed_count} item(s)`);
+      }
+    } catch (error) {
+      runtimeStatus.email_outbox_worker.last_error = error?.message || "Unknown email outbox worker error";
+      runtimeStatus.email_outbox_worker.last_error_at = new Date().toISOString();
+      // eslint-disable-next-line no-console
+      console.error("LOOM email outbox worker failed", error);
+    } finally {
+      isEmailOutboxProcessing = false;
+      runtimeStatus.email_outbox_worker.in_progress = false;
+    }
+  }, emailOutboxAutoProcessIntervalMs);
+
+  emailOutboxTimer.unref?.();
+}
+
+function stopEmailOutboxWorker() {
+  if (emailOutboxTimer) {
+    clearInterval(emailOutboxTimer);
+    emailOutboxTimer = null;
+  }
+}
+
+function startWebhookOutboxWorker() {
+  if (!Number.isFinite(webhookOutboxAutoProcessIntervalMs) || webhookOutboxAutoProcessIntervalMs <= 0) {
+    runtimeStatus.webhook_outbox_worker.enabled = false;
+    return;
+  }
+
+  runtimeStatus.webhook_outbox_worker.enabled = true;
+
+  webhookOutboxTimer = setInterval(async () => {
+    if (isWebhookOutboxProcessing) {
+      return;
+    }
+
+    isWebhookOutboxProcessing = true;
+    runtimeStatus.webhook_outbox_worker.in_progress = true;
+    runtimeStatus.webhook_outbox_worker.last_run_at = new Date().toISOString();
+    runtimeStatus.webhook_outbox_worker.runs_total += 1;
+
+    try {
+      const result = await store.processWebhookOutboxBatch(webhookOutboxAutoProcessBatchSize, "system");
+      runtimeStatus.webhook_outbox_worker.last_processed_count = result.processed_count;
+      runtimeStatus.webhook_outbox_worker.last_error = null;
+      runtimeStatus.webhook_outbox_worker.last_error_at = null;
+      if (result.processed_count > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`LOOM webhook outbox worker processed ${result.processed_count} item(s)`);
+      }
+    } catch (error) {
+      runtimeStatus.webhook_outbox_worker.last_error = error?.message || "Unknown webhook outbox worker error";
+      runtimeStatus.webhook_outbox_worker.last_error_at = new Date().toISOString();
+      // eslint-disable-next-line no-console
+      console.error("LOOM webhook outbox worker failed", error);
+    } finally {
+      isWebhookOutboxProcessing = false;
+      runtimeStatus.webhook_outbox_worker.in_progress = false;
+    }
+  }, webhookOutboxAutoProcessIntervalMs);
+
+  webhookOutboxTimer.unref?.();
+}
+
+function stopWebhookOutboxWorker() {
+  if (webhookOutboxTimer) {
+    clearInterval(webhookOutboxTimer);
+    webhookOutboxTimer = null;
+  }
+}
+
+async function initializePersistence() {
+  if (!postgresPersistence) {
+    runtimeStatus.persistence_hydration = {
+      enabled: false,
+      skipped: true,
+      completed_at: new Date().toISOString()
+    };
+    return;
+  }
+
+  const startedAt = new Date().toISOString();
+  runtimeStatus.persistence_hydration = {
+    enabled: true,
+    started_at: startedAt,
+    status: "in_progress"
+  };
+
+  try {
+    await postgresPersistence.initialize();
+    const hydration = await store.hydrateFromPersistence();
+    runtimeStatus.persistence_hydration = {
+      ...hydration,
+      enabled: true,
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+      status: "ok"
+    };
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `LOOM persistence hydrated (loaded=${runtimeStatus.persistence_hydration.loaded ? "yes" : "no"})`
+    );
+  } catch (error) {
+    runtimeStatus.persistence_hydration = {
+      enabled: true,
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+      status: "failed",
+      error: error?.message || String(error)
+    };
+    throw error;
+  }
+}
+
+async function flushAndClosePersistence() {
+  try {
+    await store.flushPersistenceQueueNow(15000);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("LOOM persistence flush failed", error);
+  }
+
+  if (postgresPersistence?.close) {
+    try {
+      await postgresPersistence.close();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("LOOM postgres persistence close failed", error);
+    }
+  }
+}
+
+let shuttingDown = false;
+
+async function shutdown(signal, exitCode = 0) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+
+  stopFederationOutboxWorker();
+  stopEmailOutboxWorker();
+  stopWebhookOutboxWorker();
+  // eslint-disable-next-line no-console
+  console.log(`Received ${signal}, shutting down LOOM MVN...`);
+
+  await flushAndClosePersistence();
+
+  await new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+
+    server.close(() => {
+      resolve();
+    });
+  });
+
+  process.exit(exitCode);
+}
+
+process.once("SIGINT", () => {
+  void shutdown("SIGINT", 0);
+});
+process.once("SIGTERM", () => {
+  void shutdown("SIGTERM", 0);
+});
+
+async function start() {
+  await initializePersistence();
+  await new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("error", onError);
+      reject(error);
+    };
+    server.once("error", onError);
+    server.listen(port, host, () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  const address = server.address();
+  const boundPort = typeof address === "object" && address ? address.port : port;
+  // eslint-disable-next-line no-console
+  console.log(`LOOM MVN listening at http://${host}:${boundPort}`);
+  startFederationOutboxWorker();
+  startEmailOutboxWorker();
+  startWebhookOutboxWorker();
+}
+
+start().catch((error) => {
+  // eslint-disable-next-line no-console
+  console.error("LOOM MVN failed to start", error);
+  void shutdown("STARTUP_FAILURE", 1);
+});
