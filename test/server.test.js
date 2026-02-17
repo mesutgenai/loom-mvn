@@ -2310,7 +2310,11 @@ test("API hardens SMTP and IMAP parsing for edge-case address and header formats
   assert.equal(smtpSubmit.response.status, 201, JSON.stringify(smtpSubmit.body));
   assert.equal(smtpSubmit.body.thread_id, inbound.body.thread_id);
 
-  const smtpEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${smtpSubmit.body.envelope_id}`);
+  const smtpEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${smtpSubmit.body.envelope_id}`, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
   assert.equal(smtpEnvelope.response.status, 200);
   const smtpRecipients = new Map(smtpEnvelope.body.to.map((recipient) => [recipient.identity, recipient.role]));
   assert.equal(smtpRecipients.get("loom://bob@node.test"), "primary");
@@ -2391,6 +2395,38 @@ test("API hides BCC recipients from non-sender IMAP recipient views", async (t) 
     })
   });
   assert.equal(smtpSubmit.response.status, 201, JSON.stringify(smtpSubmit.body));
+
+  const deniedEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${smtpSubmit.body.envelope_id}`);
+  assert.equal(deniedEnvelope.response.status, 403);
+  assert.equal(deniedEnvelope.body.error.code, "CAPABILITY_DENIED");
+
+  const bobEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${smtpSubmit.body.envelope_id}`, {
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    }
+  });
+  assert.equal(bobEnvelope.response.status, 200);
+  const bobEnvelopeRecipients = new Map(
+    bobEnvelope.body.to.map((recipient) => [recipient.identity, recipient.role])
+  );
+  assert.equal(bobEnvelopeRecipients.get("loom://bob@node.test"), "primary");
+  assert.equal(bobEnvelopeRecipients.has("loom://grace@node.test"), false);
+  assert.equal(typeof bobEnvelope.body.delivery_wrapper?.id, "string");
+  assert.equal(bobEnvelope.body.delivery_wrapper?.type, "delivery.wrapper@v1");
+
+  const bobWrapper = await jsonRequest(`${baseUrl}/v1/envelopes/${smtpSubmit.body.envelope_id}/delivery`, {
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    }
+  });
+  assert.equal(bobWrapper.response.status, 200);
+  assert.equal(bobWrapper.body.delivery_wrapper.envelope_id, smtpSubmit.body.envelope_id);
+  assert.equal(bobWrapper.body.delivery_wrapper.recipient_identity, "loom://bob@node.test");
+  assert.equal(typeof bobWrapper.body.delivery_wrapper.core_envelope_hash, "string");
+  assert.equal(
+    bobWrapper.body.delivery_wrapper.visible_recipients.some((recipient) => recipient.identity === "loom://grace@node.test"),
+    false
+  );
 
   const bobSent = await jsonRequest(`${baseUrl}/v1/gateway/imap/folders/Sent/messages?limit=20`, {
     headers: {

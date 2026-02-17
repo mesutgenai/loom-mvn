@@ -18,6 +18,7 @@ import {
 } from "../protocol/crypto.js";
 import { validateEnvelopeOrThrow } from "../protocol/envelope.js";
 import { LoomError } from "../protocol/errors.js";
+import { canonicalizeEnvelope, canonicalizeJson } from "../protocol/canonical.js";
 import { canonicalThreadOrder, validateThreadDag } from "../protocol/thread.js";
 import { isIdentity, normalizeLoomIdentity } from "../protocol/ids.js";
 import { generateUlid } from "../protocol/ulid.js";
@@ -113,6 +114,20 @@ function canonicalizeFederationReceipt(receipt) {
     acceptedIds.join(","),
     String(receipt?.timestamp || "")
   ].join("\n");
+}
+
+function canonicalizeDeliveryWrapper(wrapper) {
+  const canonical = {};
+  for (const [key, value] of Object.entries(wrapper || {})) {
+    if (key !== "signature") {
+      canonical[key] = value;
+    }
+  }
+  return canonicalizeJson(canonical);
+}
+
+function deliveryWrapperKey(envelopeId, recipientIdentity) {
+  return `${String(envelopeId || "").trim()}:${String(recipientIdentity || "").trim()}`;
 }
 
 function mergeFederationSigningKeys(baseKeys = [], nextKeys = []) {
@@ -260,6 +275,7 @@ export class LoomStore {
     this.federationNonceCache = new Map();
     this.federationOutboxById = new Map();
     this.emailOutboxById = new Map();
+    this.deliveryWrappersByEnvelopeAndIdentity = new Map();
     this.webhooksById = new Map();
     this.webhookOutboxById = new Map();
     this.emailMessageIndexById = new Map();
@@ -425,6 +441,11 @@ export class LoomStore {
     }
     this.federationOutboxById = new Map((state.federation_outbox || []).map((item) => [item.id, item]));
     this.emailOutboxById = new Map((state.email_outbox || []).map((item) => [item.id, item]));
+    this.deliveryWrappersByEnvelopeAndIdentity = new Map(
+      (state.delivery_wrappers || [])
+        .filter((wrapper) => wrapper?.envelope_id && wrapper?.recipient_identity)
+        .map((wrapper) => [deliveryWrapperKey(wrapper.envelope_id, wrapper.recipient_identity), wrapper])
+    );
     this.webhooksById = new Map((state.webhooks || []).map((item) => [item.id, item]));
     this.webhookOutboxById = new Map((state.webhook_outbox || []).map((item) => [item.id, item]));
     this.emailMessageIndexById = new Map((state.email_message_index || []).map((item) => [item.message_id, item]));
@@ -479,6 +500,7 @@ export class LoomStore {
       known_nodes: Array.from(this.knownNodesById.values()),
       federation_outbox: Array.from(this.federationOutboxById.values()),
       email_outbox: Array.from(this.emailOutboxById.values()),
+      delivery_wrappers: Array.from(this.deliveryWrappersByEnvelopeAndIdentity.values()),
       webhooks: Array.from(this.webhooksById.values()),
       webhook_outbox: Array.from(this.webhookOutboxById.values()),
       email_message_index: Array.from(this.emailMessageIndexById.values())
@@ -3452,6 +3474,182 @@ export class LoomStore {
     });
   }
 
+  hasBccRecipients(envelope) {
+    return Array.isArray(envelope?.to) && envelope.to.some((recipient) => recipient?.role === "bcc");
+  }
+
+  requiresRecipientDeliveryWrapper(envelope) {
+    if (!envelope || typeof envelope !== "object") {
+      return false;
+    }
+    return envelope?.audience?.mode === "recipients" || this.hasBccRecipients(envelope);
+  }
+
+  getDeliveryWrapper(envelopeId, recipientIdentity) {
+    const key = deliveryWrapperKey(envelopeId, recipientIdentity);
+    return this.deliveryWrappersByEnvelopeAndIdentity.get(key) || null;
+  }
+
+  issueDeliveryWrapperForRecipient(envelope, recipientIdentity) {
+    if (!this.requiresRecipientDeliveryWrapper(envelope)) {
+      return null;
+    }
+
+    const normalizedRecipientIdentity = String(recipientIdentity || "").trim();
+    if (!normalizedRecipientIdentity) {
+      return null;
+    }
+
+    const coreEnvelopeHash = createHash("sha256")
+      .update(canonicalizeEnvelope(envelope), "utf-8")
+      .digest("hex");
+    const visibleRecipients = this.getVisibleEnvelopeRecipients(envelope, normalizedRecipientIdentity).map((recipient) => ({
+      identity: recipient.identity,
+      role: recipient.role
+    }));
+    const existing = this.getDeliveryWrapper(envelope.id, normalizedRecipientIdentity);
+
+    if (
+      existing &&
+      existing.core_envelope_hash === coreEnvelopeHash &&
+      JSON.stringify(existing.visible_recipients || []) === JSON.stringify(visibleRecipients)
+    ) {
+      return existing;
+    }
+
+    const unsignedWrapper = {
+      loom: "1.1",
+      type: "delivery.wrapper@v1",
+      id: existing?.id || `dwr_${generateUlid()}`,
+      envelope_id: envelope.id,
+      thread_id: envelope.thread_id,
+      recipient_identity: normalizedRecipientIdentity,
+      visible_recipients: visibleRecipients,
+      audience_mode: envelope?.audience?.mode || "thread",
+      core_envelope_hash: coreEnvelopeHash,
+      issued_by_node: this.nodeId,
+      created_at: existing?.created_at || nowIso(),
+      updated_at: nowIso()
+    };
+
+    const signedWrapper = {
+      ...unsignedWrapper,
+      signature: {
+        algorithm: "Ed25519",
+        key_id: this.systemSigningKeyId,
+        value: signUtf8Message(this.systemSigningPrivateKeyPem, canonicalizeDeliveryWrapper(unsignedWrapper))
+      }
+    };
+
+    this.deliveryWrappersByEnvelopeAndIdentity.set(
+      deliveryWrapperKey(envelope.id, normalizedRecipientIdentity),
+      signedWrapper
+    );
+    return signedWrapper;
+  }
+
+  ensureDeliveryWrappersForEnvelope(envelope) {
+    if (!this.requiresRecipientDeliveryWrapper(envelope)) {
+      return [];
+    }
+
+    const recipientIdentities = Array.from(
+      new Set((envelope.to || []).map((recipient) => String(recipient?.identity || "").trim()).filter(Boolean))
+    );
+
+    const wrappers = [];
+    for (const identity of recipientIdentities) {
+      const wrapper = this.issueDeliveryWrapperForRecipient(envelope, identity);
+      if (wrapper) {
+        wrappers.push(wrapper);
+      }
+    }
+    return wrappers;
+  }
+
+  buildEnvelopeRecipientView(envelope, actorIdentity) {
+    const thread = this.threadsById.get(envelope.thread_id);
+    const normalizedActor = String(actorIdentity || "").trim();
+    const actorIsSender = envelope.from?.identity === normalizedActor;
+    const actorIsRecipient = (envelope.to || []).some((recipient) => recipient.identity === normalizedActor);
+    const actorIsParticipant = thread ? this.isActiveParticipant(thread, normalizedActor) : false;
+
+    if (!actorIsSender && !actorIsRecipient && !actorIsParticipant) {
+      throw new LoomError("CAPABILITY_DENIED", "Not authorized to view envelope", 403, {
+        envelope_id: envelope.id,
+        actor: normalizedActor
+      });
+    }
+
+    if (!this.requiresRecipientDeliveryWrapper(envelope)) {
+      return {
+        envelope,
+        delivery_wrapper: null
+      };
+    }
+
+    if (actorIsSender) {
+      return {
+        envelope,
+        delivery_wrapper: null
+      };
+    }
+
+    const wrapper = actorIsRecipient ? this.issueDeliveryWrapperForRecipient(envelope, normalizedActor) : null;
+    const visibleRecipients = wrapper
+      ? wrapper.visible_recipients
+      : this.getVisibleEnvelopeRecipients(envelope, normalizedActor).map((recipient) => ({
+          identity: recipient.identity,
+          role: recipient.role
+        }));
+    const coreEnvelopeHash = createHash("sha256")
+      .update(canonicalizeEnvelope(envelope), "utf-8")
+      .digest("hex");
+
+    return {
+      envelope: {
+        ...envelope,
+        to: visibleRecipients,
+        meta: {
+          ...(envelope.meta || {}),
+          delivery: {
+            wrapper_id: wrapper?.id || null,
+            recipient_identity: normalizedActor,
+            audience_mode: envelope?.audience?.mode || "thread",
+            bcc_redacted: true,
+            core_envelope_hash: coreEnvelopeHash
+          }
+        }
+      },
+      delivery_wrapper: wrapper || null
+    };
+  }
+
+  getEnvelopeForIdentity(envelopeId, actorIdentity) {
+    const envelope = this.envelopesById.get(envelopeId);
+    if (!envelope) {
+      return null;
+    }
+    return this.buildEnvelopeRecipientView(envelope, actorIdentity);
+  }
+
+  getThreadEnvelopesForIdentity(threadId, actorIdentity) {
+    const thread = this.threadsById.get(threadId);
+    if (!thread) {
+      return null;
+    }
+
+    if (!this.isActiveParticipant(thread, actorIdentity)) {
+      throw new LoomError("CAPABILITY_DENIED", "Only thread participants can view thread envelopes", 403, {
+        thread_id: threadId,
+        actor: actorIdentity
+      });
+    }
+
+    const envelopes = canonicalThreadOrder(thread.envelope_ids.map((id) => this.envelopesById.get(id)));
+    return envelopes.map((envelope) => this.buildEnvelopeRecipientView(envelope, actorIdentity));
+  }
+
   listGatewayImapMessages(folderName, actorIdentity, limit = 100) {
     const normalizedFolder = this.normalizeGatewayFolderName(folderName);
     const cappedLimit = Math.max(1, Math.min(Number(limit || 100), 500));
@@ -5039,6 +5237,7 @@ export class LoomStore {
     }
 
     const resolvedPendingParents = this.resolvePendingParentsForThread(thread, storedEnvelope.id);
+    const deliveryWrappers = this.ensureDeliveryWrappersForEnvelope(storedEnvelope);
 
     this.persistAndAudit("envelope.ingest", {
       envelope_id: storedEnvelope.id,
@@ -5046,6 +5245,7 @@ export class LoomStore {
       type: storedEnvelope.type,
       pending_parent: pendingParent,
       resolved_pending_parents: resolvedPendingParents,
+      delivery_wrapper_count: deliveryWrappers.length,
       actor: actorIdentity
     });
 

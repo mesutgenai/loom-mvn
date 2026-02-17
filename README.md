@@ -123,6 +123,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 - Signed federation delivery receipts with optional strict verification
 - Outbound federation outbox with retry-based store-and-forward processing
 - SMTP/IMAP gateway interoperability hardening (address-list parsing, case-insensitive headers, folder aliases)
+- Recipient-view delivery wrappers for BCC privacy (`delivery.wrapper@v1`) with per-recipient visible roster
 - Idempotency-key replay protection for key POST mutations
 - Admin persistence operations: schema status, backup export, and restore
 - In-memory node API:
@@ -137,6 +138,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `POST /v1/envelopes`
   - `POST /v1/threads/{id}/ops`
   - `GET /v1/envelopes/{id}`
+  - `GET /v1/envelopes/{id}/delivery` (authenticated recipient-view delivery wrapper)
   - `GET /v1/threads`
   - `GET /v1/threads/{id}`
   - `GET /v1/threads/{id}/envelopes`

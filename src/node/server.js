@@ -334,6 +334,15 @@ function requireActorIdentity(req, store) {
   return session.identity;
 }
 
+function resolveOptionalActorIdentity(req, store) {
+  const token = getBearerToken(req);
+  if (!token) {
+    return null;
+  }
+  const session = store.authenticateAccessToken(token);
+  return session.identity;
+}
+
 function getAdminToken(req) {
   const value = req.headers["x-loom-admin-token"];
   if (Array.isArray(value)) {
@@ -1118,6 +1127,30 @@ export function createLoomServer(options = {}) {
         return;
       }
 
+      if (methodIs(req, "GET") && path.startsWith("/v1/envelopes/") && path.endsWith("/delivery")) {
+        const actorIdentity = requireActorIdentity(req, store);
+        const envelopeId = path.slice("/v1/envelopes/".length, -"/delivery".length);
+        const envelope = store.getEnvelope(envelopeId);
+        if (!envelope) {
+          throw new LoomError("ENVELOPE_NOT_FOUND", `Envelope not found: ${envelopeId}`, 404, {
+            envelope_id: envelopeId
+          });
+        }
+
+        const view = store.getEnvelopeForIdentity(envelopeId, actorIdentity);
+        if (!view?.delivery_wrapper) {
+          throw new LoomError("ENVELOPE_INVALID", "Envelope does not require delivery wrapper for this identity", 400, {
+            envelope_id: envelopeId,
+            actor: actorIdentity
+          });
+        }
+        sendJson(res, 200, {
+          envelope: view.envelope,
+          delivery_wrapper: view.delivery_wrapper
+        });
+        return;
+      }
+
       if (methodIs(req, "GET") && path.startsWith("/v1/envelopes/")) {
         const envelopeId = path.slice("/v1/envelopes/".length);
         const envelope = store.getEnvelope(envelopeId);
@@ -1126,6 +1159,22 @@ export function createLoomServer(options = {}) {
             envelope_id: envelopeId
           });
         }
+
+        if (store.requiresRecipientDeliveryWrapper(envelope)) {
+          const actorIdentity = resolveOptionalActorIdentity(req, store);
+          if (!actorIdentity) {
+            throw new LoomError("CAPABILITY_DENIED", "Authentication required for recipient-view envelope", 403, {
+              envelope_id: envelopeId
+            });
+          }
+          const view = store.getEnvelopeForIdentity(envelopeId, actorIdentity);
+          sendJson(res, 200, {
+            ...view.envelope,
+            delivery_wrapper: view.delivery_wrapper
+          });
+          return;
+        }
+
         sendJson(res, 200, envelope);
         return;
       }
@@ -1539,6 +1588,21 @@ export function createLoomServer(options = {}) {
             thread_id: threadId
           });
         }
+
+        const requiresRecipientView = envelopes.some((envelope) => store.requiresRecipientDeliveryWrapper(envelope));
+        if (requiresRecipientView) {
+          const actorIdentity = requireActorIdentity(req, store);
+          const views = store.getThreadEnvelopesForIdentity(threadId, actorIdentity);
+          sendJson(res, 200, {
+            thread_id: threadId,
+            envelopes: views.map((view) => ({
+              ...view.envelope,
+              delivery_wrapper: view.delivery_wrapper
+            }))
+          });
+          return;
+        }
+
         sendJson(res, 200, { thread_id: threadId, envelopes });
         return;
       }
