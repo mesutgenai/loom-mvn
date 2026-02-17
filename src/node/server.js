@@ -1,5 +1,7 @@
 import { createServer } from "node:http";
+import { createSecureServer } from "node:http2";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { BlockList, isIP } from "node:net";
 
 import { toErrorResponse, LoomError } from "../protocol/errors.js";
@@ -41,6 +43,32 @@ function normalizeLogFormat(value, fallback = "json") {
     return "text";
   }
   return "json";
+}
+
+function normalizeIdentityDomain(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) {
+    return null;
+  }
+
+  const withoutScheme = raw.replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+  const hostPort = withoutScheme.split("/")[0];
+  if (!hostPort) {
+    return null;
+  }
+
+  if (hostPort.startsWith("[") && hostPort.includes("]")) {
+    return hostPort.slice(1, hostPort.indexOf("]")) || null;
+  }
+
+  const colonIndex = hostPort.indexOf(":");
+  if (colonIndex >= 0) {
+    return hostPort.slice(0, colonIndex) || null;
+  }
+
+  return hostPort;
 }
 
 function getIdempotencyKey(req) {
@@ -164,11 +192,13 @@ async function readRawBody(req, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
 }
 
 function requestPath(req) {
-  return new URL(req.url, `http://${req.headers.host || "localhost"}`).pathname;
+  const authority = req.headers.host || req.headers[":authority"] || "localhost";
+  return new URL(req.url, `http://${authority}`).pathname;
 }
 
 function requestUrl(req) {
-  return new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const authority = req.headers.host || req.headers[":authority"] || "localhost";
+  return new URL(req.url, `http://${authority}`);
 }
 
 function methodIs(req, method) {
@@ -228,6 +258,76 @@ function parseTrustedProxyAllowlist(value) {
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function parseHostAllowlist(value) {
+  if (value == null) {
+    return [];
+  }
+
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  return Array.from(
+    new Set(
+      list
+        .map((entry) =>
+          String(entry || "")
+            .trim()
+            .toLowerCase()
+            .replace(/\.+$/, "")
+        )
+        .filter(Boolean)
+    )
+  );
+}
+
+function normalizePem(value) {
+  if (value == null) {
+    return null;
+  }
+  const normalized = String(value).replace(/\\n/g, "\n").trim();
+  return normalized ? `${normalized}\n` : null;
+}
+
+function readPemFile(value) {
+  const filePath = String(value || "").trim();
+  if (!filePath) {
+    return null;
+  }
+
+  const raw = readFileSync(filePath, "utf-8");
+  return normalizePem(raw);
+}
+
+function resolveNativeTlsConfig(options = {}) {
+  const enabled = parseBoolean(options.nativeTlsEnabled ?? process.env.LOOM_NATIVE_TLS_ENABLED, false);
+  if (!enabled) {
+    return {
+      enabled: false
+    };
+  }
+
+  const certPem =
+    normalizePem(options.nativeTlsCertPem ?? process.env.LOOM_NATIVE_TLS_CERT_PEM) ??
+    readPemFile(options.nativeTlsCertFile ?? process.env.LOOM_NATIVE_TLS_CERT_FILE);
+  const keyPem =
+    normalizePem(options.nativeTlsKeyPem ?? process.env.LOOM_NATIVE_TLS_KEY_PEM) ??
+    readPemFile(options.nativeTlsKeyFile ?? process.env.LOOM_NATIVE_TLS_KEY_FILE);
+  if (!certPem || !keyPem) {
+    throw new Error("Native TLS requires both certificate and private key");
+  }
+
+  const minVersion = String(options.nativeTlsMinVersion ?? process.env.LOOM_NATIVE_TLS_MIN_VERSION ?? "TLSv1.3").trim();
+  if (minVersion !== "TLSv1.3") {
+    throw new Error("Native TLS minimum version must be TLSv1.3");
+  }
+
+  return {
+    enabled: true,
+    certPem,
+    keyPem,
+    minVersion,
+    allowHttp1: parseBoolean(options.nativeTlsAllowHttp1 ?? process.env.LOOM_NATIVE_TLS_ALLOW_HTTP1, true)
+  };
 }
 
 function buildTrustedProxyBlockList(entries) {
@@ -373,12 +473,17 @@ function constantTimeEqual(left, right) {
 }
 
 function isSensitiveRoute(method, path) {
+  if (method === "PATCH" && path.startsWith("/v1/identity/")) {
+    return true;
+  }
+
   if (method !== "POST") {
     return false;
   }
 
   if (
     path === "/v1/identity" ||
+    path === "/v1/identity/challenge" ||
     path === "/v1/auth/challenge" ||
     path === "/v1/auth/token" ||
     path === "/v1/auth/refresh" ||
@@ -518,7 +623,23 @@ function getCapabilityPresentationToken(req) {
 function requireActorIdentity(req, store) {
   const token = getBearerToken(req);
   const session = store.authenticateAccessToken(token);
+  store.enforceIdentityRateLimit({
+    identity: session.identity,
+    method: req.method || "GET",
+    path: requestPath(req)
+  });
   return session.identity;
+}
+
+function requireActorSession(req, store) {
+  const token = getBearerToken(req);
+  const session = store.authenticateAccessToken(token);
+  store.enforceIdentityRateLimit({
+    identity: session.identity,
+    method: req.method || "GET",
+    path: requestPath(req)
+  });
+  return session;
 }
 
 function resolveOptionalActorIdentity(req, store) {
@@ -527,6 +648,11 @@ function resolveOptionalActorIdentity(req, store) {
     return null;
   }
   const session = store.authenticateAccessToken(token);
+  store.enforceIdentityRateLimit({
+    identity: session.identity,
+    method: req.method || "GET",
+    path: requestPath(req)
+  });
   return session.identity;
 }
 
@@ -556,6 +682,14 @@ function requireAdminToken(req, adminToken) {
       field: "x-loom-admin-token"
     });
   }
+}
+
+function hasValidAdminToken(req, adminToken) {
+  if (!adminToken) {
+    return false;
+  }
+  const provided = getAdminToken(req);
+  return Boolean(provided && constantTimeEqual(provided, adminToken));
 }
 
 function assertRouteEnabled(enabled, req, path) {
@@ -889,6 +1023,96 @@ export function createLoomServer(options = {}) {
     options.federationChallengeDurationMs ?? process.env.LOOM_FEDERATION_CHALLENGE_DURATION_MS,
     15 * 60 * 1000
   );
+  const domain = options.domain || "localhost";
+  const localIdentityAuthority =
+    options.identityDomain ?? process.env.LOOM_IDENTITY_DOMAIN ?? options.nodeId ?? domain;
+  const localIdentityDomain = normalizeIdentityDomain(localIdentityAuthority);
+  const identityRequireProof = parseBoolean(
+    options.identityRequireProof ?? process.env.LOOM_IDENTITY_REQUIRE_PROOF,
+    false
+  );
+  const identityChallengeTtlMs = parsePositiveNumber(
+    options.identityChallengeTtlMs ?? process.env.LOOM_IDENTITY_CHALLENGE_TTL_MS,
+    2 * 60 * 1000
+  );
+  const remoteIdentityTtlMs = parsePositiveNumber(
+    options.remoteIdentityTtlMs ?? process.env.LOOM_REMOTE_IDENTITY_TTL_MS,
+    24 * 60 * 60 * 1000
+  );
+  const identityRateWindowMs = parsePositiveNumber(
+    options.identityRateWindowMs ?? process.env.LOOM_IDENTITY_RATE_LIMIT_WINDOW_MS,
+    60 * 1000
+  );
+  const identityRateDefaultMax = parsePositiveNumber(
+    options.identityRateDefaultMax ?? process.env.LOOM_IDENTITY_RATE_LIMIT_DEFAULT_MAX,
+    2000
+  );
+  const identityRateSensitiveMax = parsePositiveNumber(
+    options.identityRateSensitiveMax ?? process.env.LOOM_IDENTITY_RATE_LIMIT_SENSITIVE_MAX,
+    400
+  );
+  const envelopeDailyMax = Math.max(
+    0,
+    Math.floor(
+      parsePositiveNumber(options.envelopeDailyMax ?? process.env.LOOM_ENVELOPE_DAILY_MAX, 0)
+    )
+  );
+  const threadRecipientFanoutMax = Math.max(
+    0,
+    Math.floor(
+      parsePositiveNumber(options.threadRecipientFanoutMax ?? process.env.LOOM_THREAD_RECIPIENT_MAX, 0)
+    )
+  );
+  const blobDailyCountMax = Math.max(
+    0,
+    Math.floor(
+      parsePositiveNumber(options.blobDailyCountMax ?? process.env.LOOM_BLOB_DAILY_COUNT_MAX, 0)
+    )
+  );
+  const blobDailyBytesMax = Math.max(
+    0,
+    Math.floor(
+      parsePositiveNumber(options.blobDailyBytesMax ?? process.env.LOOM_BLOB_DAILY_BYTES_MAX, 0)
+    )
+  );
+  const blobIdentityTotalBytesMax = Math.max(
+    0,
+    Math.floor(
+      parsePositiveNumber(
+        options.blobIdentityTotalBytesMax ?? process.env.LOOM_BLOB_IDENTITY_TOTAL_BYTES_MAX,
+        0
+      )
+    )
+  );
+  const federationResolveRemoteIdentities = parseBoolean(
+    options.federationResolveRemoteIdentities ?? process.env.LOOM_FEDERATION_REMOTE_IDENTITY_RESOLVE_ENABLED,
+    true
+  );
+  const federationRequireSignedRemoteIdentity = parseBoolean(
+    options.federationRequireSignedRemoteIdentity ?? process.env.LOOM_FEDERATION_REQUIRE_SIGNED_REMOTE_IDENTITY,
+    true
+  );
+  const federationRemoteIdentityFetchTimeoutMs = parsePositiveNumber(
+    options.federationRemoteIdentityFetchTimeoutMs ?? process.env.LOOM_FEDERATION_REMOTE_IDENTITY_TIMEOUT_MS,
+    5000
+  );
+  const federationRemoteIdentityMaxResponseBytes = parsePositiveNumber(
+    options.federationRemoteIdentityMaxResponseBytes ?? process.env.LOOM_FEDERATION_REMOTE_IDENTITY_MAX_RESPONSE_BYTES,
+    256 * 1024
+  );
+  const federationOutboundHostAllowlist = parseHostAllowlist(
+    options.federationOutboundHostAllowlist ?? process.env.LOOM_FEDERATION_HOST_ALLOWLIST
+  );
+  const federationBootstrapHostAllowlist = parseHostAllowlist(
+    options.federationBootstrapHostAllowlist ?? process.env.LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST
+  );
+  const webhookOutboundHostAllowlist = parseHostAllowlist(
+    options.webhookOutboundHostAllowlist ?? process.env.LOOM_WEBHOOK_HOST_ALLOWLIST
+  );
+  const remoteIdentityHostAllowlist = parseHostAllowlist(
+    options.remoteIdentityHostAllowlist ?? process.env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST
+  );
+  const nativeTlsConfig = resolveNativeTlsConfig(options);
   const store =
     options.store ||
     new LoomStore({
@@ -913,9 +1137,28 @@ export function createLoomServer(options = {}) {
       federationDistributedGuardsEnabled,
       federationChallengeEscalationEnabled,
       federationChallengeThreshold,
-      federationChallengeDurationMs
+      federationChallengeDurationMs,
+      identityRegistrationProofRequired: identityRequireProof,
+      identityRegistrationChallengeTtlMs: identityChallengeTtlMs,
+      remoteIdentityTtlMs,
+      identityRateWindowMs,
+      identityRateDefaultMax,
+      identityRateSensitiveMax,
+      envelopeDailyMax,
+      threadRecipientFanoutMax,
+      blobDailyCountMax,
+      blobDailyBytesMax,
+      blobIdentityTotalBytesMax,
+      federationResolveRemoteIdentities,
+      federationRequireSignedRemoteIdentity,
+      federationRemoteIdentityFetchTimeoutMs,
+      federationRemoteIdentityMaxResponseBytes,
+      federationOutboundHostAllowlist,
+      federationBootstrapHostAllowlist,
+      webhookOutboundHostAllowlist,
+      remoteIdentityHostAllowlist,
+      localIdentityDomain
     });
-  const domain = options.domain || "localhost";
   const maxBodyBytes = parsePositiveNumber(
     options.maxBodyBytes ?? process.env.LOOM_MAX_BODY_BYTES,
     DEFAULT_MAX_BODY_BYTES
@@ -934,6 +1177,19 @@ export function createLoomServer(options = {}) {
   store.blobMaxBytes = blobMaxBytes;
   store.blobMaxPartBytes = blobMaxPartBytes;
   store.blobMaxParts = blobMaxParts;
+  store.envelopeDailyMax = envelopeDailyMax;
+  store.threadRecipientFanoutMax = threadRecipientFanoutMax;
+  store.blobDailyCountMax = blobDailyCountMax;
+  store.blobDailyBytesMax = blobDailyBytesMax;
+  store.blobIdentityTotalBytesMax = blobIdentityTotalBytesMax;
+  store.federationResolveRemoteIdentities = federationResolveRemoteIdentities;
+  store.federationRequireSignedRemoteIdentity = federationRequireSignedRemoteIdentity;
+  store.federationRemoteIdentityFetchTimeoutMs = Math.max(500, Math.floor(federationRemoteIdentityFetchTimeoutMs));
+  store.federationRemoteIdentityMaxResponseBytes = Math.max(1024, Math.floor(federationRemoteIdentityMaxResponseBytes));
+  store.federationOutboundHostAllowlist = federationOutboundHostAllowlist;
+  store.federationBootstrapHostAllowlist = federationBootstrapHostAllowlist;
+  store.webhookOutboundHostAllowlist = webhookOutboundHostAllowlist;
+  store.remoteIdentityHostAllowlist = remoteIdentityHostAllowlist;
   const rateLimiter = createRateLimiter({
     windowMs: options.rateLimitWindowMs ?? process.env.LOOM_RATE_LIMIT_WINDOW_MS,
     defaultMax: options.rateLimitDefaultMax ?? process.env.LOOM_RATE_LIMIT_DEFAULT_MAX,
@@ -960,10 +1216,14 @@ export function createLoomServer(options = {}) {
   const requestLogFormat = normalizeLogFormat(
     options.requestLogFormat ?? process.env.LOOM_REQUEST_LOG_FORMAT ?? "json"
   );
+  const demoPublicReads = parseBoolean(
+    options.demoPublicReads ?? process.env.LOOM_DEMO_PUBLIC_READS,
+    false
+  );
   const runtimeStatusProvider = typeof options.runtimeStatusProvider === "function" ? options.runtimeStatusProvider : null;
   const emailRelay = options.emailRelay || null;
 
-  const server = createServer(async (req, res) => {
+  const requestHandler = async (req, res) => {
     const reqId = `req_${randomUUID()}`;
     const startedAt = Date.now();
     const method = String(req.method || "GET").toUpperCase();
@@ -1246,12 +1506,42 @@ export function createLoomServer(options = {}) {
         return;
       }
 
-      if (methodIs(req, "POST") && path === "/v1/identity") {
+      if (methodIs(req, "POST") && path === "/v1/identity/challenge") {
         if (!identitySignupEnabled) {
           requireAdminToken(req, adminToken);
         }
         const body = await readJson(req, maxBodyBytes);
-        const identity = store.registerIdentity(body);
+        const challenge = store.createIdentityRegistrationChallenge(body, {
+          localIdentityDomain,
+          allowRemoteDomain: false
+        });
+        sendJson(res, 200, challenge);
+        return;
+      }
+
+      if (methodIs(req, "POST") && path === "/v1/identity") {
+        const adminRequest = hasValidAdminToken(req, adminToken);
+        if (!identitySignupEnabled) {
+          requireAdminToken(req, adminToken);
+        }
+        const body = await readJson(req, maxBodyBytes);
+        const importedRemote =
+          body?.imported_remote === true ||
+          body?.remote_import === true ||
+          String(body?.registration_mode || "").trim().toLowerCase() === "remote_import";
+        if (importedRemote && adminToken && !adminRequest) {
+          throw new LoomError("CAPABILITY_DENIED", "Admin token required for remote identity import", 403, {
+            field: "x-loom-admin-token"
+          });
+        }
+
+        const identity = store.registerIdentity(body, {
+          localIdentityDomain,
+          allowRemoteDomain: importedRemote,
+          allowOverwrite: false,
+          importedRemote,
+          requireProofOfKey: identityRequireProof && !adminRequest && !importedRemote
+        });
         sendJson(res, 201, identity);
         return;
       }
@@ -1259,12 +1549,22 @@ export function createLoomServer(options = {}) {
       if (methodIs(req, "GET") && path.startsWith("/v1/identity/")) {
         const encodedIdentity = path.slice("/v1/identity/".length);
         const identityUri = decodeURIComponent(encodedIdentity);
-        const identity = store.resolveIdentity(identityUri);
+        const identity = store.getIdentityDocument(identityUri);
         if (!identity) {
           throw new LoomError("IDENTITY_NOT_FOUND", `Identity not found: ${identityUri}`, 404, {
             identity: identityUri
           });
         }
+        sendJson(res, 200, identity);
+        return;
+      }
+
+      if (methodIs(req, "PATCH") && path.startsWith("/v1/identity/")) {
+        const session = requireActorSession(req, store);
+        const encodedIdentity = path.slice("/v1/identity/".length);
+        const identityUri = decodeURIComponent(encodedIdentity);
+        const body = await readJson(req, maxBodyBytes);
+        const identity = store.updateIdentity(identityUri, body, session);
         sendJson(res, 200, identity);
         return;
       }
@@ -1386,29 +1686,48 @@ export function createLoomServer(options = {}) {
 
       if (methodIs(req, "GET") && path.startsWith("/v1/envelopes/")) {
         const envelopeId = path.slice("/v1/envelopes/".length);
-        const envelope = store.getEnvelope(envelopeId);
-        if (!envelope) {
+        if (demoPublicReads) {
+          const envelope = store.getEnvelope(envelopeId);
+          if (!envelope) {
+            throw new LoomError("ENVELOPE_NOT_FOUND", `Envelope not found: ${envelopeId}`, 404, {
+              envelope_id: envelopeId
+            });
+          }
+
+          if (store.requiresRecipientDeliveryWrapper(envelope) || store.envelopeContainsCapabilitySecret(envelope)) {
+            const actorIdentity = resolveOptionalActorIdentity(req, store);
+            if (!actorIdentity) {
+              throw new LoomError("CAPABILITY_DENIED", "Authentication required for protected envelope view", 403, {
+                envelope_id: envelopeId
+              });
+            }
+            const view = store.getEnvelopeForIdentity(envelopeId, actorIdentity);
+            sendJson(res, 200, {
+              ...view.envelope,
+              delivery_wrapper: view.delivery_wrapper
+            });
+            return;
+          }
+
+          sendJson(res, 200, envelope);
+          return;
+        }
+
+        const actorIdentity = requireActorIdentity(req, store);
+        const capabilityPresentationToken = getCapabilityPresentationToken(req);
+        const view = store.getEnvelopeForIdentity(envelopeId, actorIdentity, {
+          capabilityTokenValue: capabilityPresentationToken
+        });
+        if (!view) {
           throw new LoomError("ENVELOPE_NOT_FOUND", `Envelope not found: ${envelopeId}`, 404, {
             envelope_id: envelopeId
           });
         }
 
-        if (store.requiresRecipientDeliveryWrapper(envelope) || store.envelopeContainsCapabilitySecret(envelope)) {
-          const actorIdentity = resolveOptionalActorIdentity(req, store);
-          if (!actorIdentity) {
-            throw new LoomError("CAPABILITY_DENIED", "Authentication required for protected envelope view", 403, {
-              envelope_id: envelopeId
-            });
-          }
-          const view = store.getEnvelopeForIdentity(envelopeId, actorIdentity);
-          sendJson(res, 200, {
-            ...view.envelope,
-            delivery_wrapper: view.delivery_wrapper
-          });
-          return;
-        }
-
-        sendJson(res, 200, envelope);
+        sendJson(res, 200, {
+          ...view.envelope,
+          delivery_wrapper: view.delivery_wrapper
+        });
         return;
       }
 
@@ -1529,7 +1848,7 @@ export function createLoomServer(options = {}) {
             rawBody
           });
 
-          const result = store.ingestFederationDelivery(wrapper, verifiedNode);
+          const result = await store.ingestFederationDelivery(wrapper, verifiedNode);
           await store.recordFederationInboundSuccess(verifiedNode.node_id);
           sendJson(res, 202, result);
           return;
@@ -1691,7 +2010,12 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "GET") && path === "/v1/threads") {
-        sendJson(res, 200, { threads: store.listThreads() });
+        if (demoPublicReads) {
+          sendJson(res, 200, { threads: store.listThreads() });
+          return;
+        }
+        const actorIdentity = requireActorIdentity(req, store);
+        sendJson(res, 200, { threads: store.listThreadsForIdentity(actorIdentity) });
         return;
       }
 
@@ -1836,36 +2160,73 @@ export function createLoomServer(options = {}) {
 
       if (methodIs(req, "GET") && path.startsWith("/v1/threads/") && path.endsWith("/envelopes")) {
         const threadId = path.slice("/v1/threads/".length, -"/envelopes".length);
-        const envelopes = store.getThreadEnvelopes(threadId);
-        if (!envelopes) {
+        if (demoPublicReads) {
+          const envelopes = store.getThreadEnvelopes(threadId);
+          if (!envelopes) {
+            throw new LoomError("THREAD_NOT_FOUND", `Thread not found: ${threadId}`, 404, {
+              thread_id: threadId
+            });
+          }
+
+          const requiresProtectedView = envelopes.some(
+            (envelope) => store.requiresRecipientDeliveryWrapper(envelope) || store.envelopeContainsCapabilitySecret(envelope)
+          );
+          if (requiresProtectedView) {
+            const actorIdentity = requireActorIdentity(req, store);
+            const views = store.getThreadEnvelopesForIdentity(threadId, actorIdentity);
+            sendJson(res, 200, {
+              thread_id: threadId,
+              envelopes: views.map((view) => ({
+                ...view.envelope,
+                delivery_wrapper: view.delivery_wrapper
+              }))
+            });
+            return;
+          }
+
+          sendJson(res, 200, { thread_id: threadId, envelopes });
+          return;
+        }
+
+        const actorIdentity = requireActorIdentity(req, store);
+        const capabilityPresentationToken = getCapabilityPresentationToken(req);
+        const views = store.getThreadEnvelopesForIdentity(threadId, actorIdentity, {
+          capabilityTokenValue: capabilityPresentationToken
+        });
+        if (!views) {
           throw new LoomError("THREAD_NOT_FOUND", `Thread not found: ${threadId}`, 404, {
             thread_id: threadId
           });
         }
 
-        const requiresProtectedView = envelopes.some(
-          (envelope) => store.requiresRecipientDeliveryWrapper(envelope) || store.envelopeContainsCapabilitySecret(envelope)
-        );
-        if (requiresProtectedView) {
-          const actorIdentity = requireActorIdentity(req, store);
-          const views = store.getThreadEnvelopesForIdentity(threadId, actorIdentity);
-          sendJson(res, 200, {
-            thread_id: threadId,
-            envelopes: views.map((view) => ({
-              ...view.envelope,
-              delivery_wrapper: view.delivery_wrapper
-            }))
-          });
-          return;
-        }
-
-        sendJson(res, 200, { thread_id: threadId, envelopes });
+        sendJson(res, 200, {
+          thread_id: threadId,
+          envelopes: views.map((view) => ({
+            ...view.envelope,
+            delivery_wrapper: view.delivery_wrapper
+          }))
+        });
         return;
       }
 
       if (methodIs(req, "GET") && path.startsWith("/v1/threads/")) {
         const threadId = path.slice("/v1/threads/".length);
-        const thread = store.getThread(threadId);
+        if (demoPublicReads) {
+          const thread = store.getThread(threadId);
+          if (!thread) {
+            throw new LoomError("THREAD_NOT_FOUND", `Thread not found: ${threadId}`, 404, {
+              thread_id: threadId
+            });
+          }
+          sendJson(res, 200, thread);
+          return;
+        }
+
+        const actorIdentity = requireActorIdentity(req, store);
+        const capabilityPresentationToken = getCapabilityPresentationToken(req);
+        const thread = store.getThreadForIdentity(threadId, actorIdentity, {
+          capabilityTokenValue: capabilityPresentationToken
+        });
         if (!thread) {
           throw new LoomError("THREAD_NOT_FOUND", `Thread not found: ${threadId}`, 404, {
             thread_id: threadId
@@ -1884,7 +2245,19 @@ export function createLoomServer(options = {}) {
       errorCode = body.error.code;
       sendJson(res, status, body);
     }
-  });
+  };
+
+  const server = nativeTlsConfig.enabled
+    ? createSecureServer(
+        {
+          allowHTTP1: nativeTlsConfig.allowHttp1,
+          minVersion: nativeTlsConfig.minVersion,
+          cert: nativeTlsConfig.certPem,
+          key: nativeTlsConfig.keyPem
+        },
+        requestHandler
+      )
+    : createServer(requestHandler);
 
   return { server, store };
 }

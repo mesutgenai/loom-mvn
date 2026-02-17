@@ -47,6 +47,11 @@ function parsePositiveInteger(value, fallback) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseNonNegativeInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function parseBoolean(value, fallback = false) {
   if (value == null) {
     return fallback;
@@ -148,13 +153,79 @@ function isPrivateOrLocalIp(ip) {
   return true;
 }
 
+function normalizeHostname(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\.+$/, "");
+}
+
+function normalizeHostnameAllowlist(value) {
+  if (value == null) {
+    return [];
+  }
+
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  return Array.from(
+    new Set(
+      list
+        .map((entry) => normalizeHostname(entry))
+        .filter(Boolean)
+    )
+  );
+}
+
+function hostnameMatchesAllowlist(hostname, allowlist = []) {
+  const normalizedHost = normalizeHostname(hostname);
+  if (!normalizedHost) {
+    return false;
+  }
+
+  for (const rawPattern of allowlist) {
+    const pattern = normalizeHostname(rawPattern);
+    if (!pattern) {
+      continue;
+    }
+
+    if (pattern.startsWith("*.")) {
+      const suffix = pattern.slice(2);
+      if (suffix && (normalizedHost === suffix || normalizedHost.endsWith(`.${suffix}`))) {
+        return true;
+      }
+      continue;
+    }
+
+    if (pattern.startsWith(".")) {
+      const suffix = pattern.slice(1);
+      if (suffix && (normalizedHost === suffix || normalizedHost.endsWith(`.${suffix}`))) {
+        return true;
+      }
+      continue;
+    }
+
+    if (normalizedHost === pattern) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 async function assertOutboundUrlHostAllowed(url, options = {}) {
   const allowPrivateNetwork = options.allowPrivateNetwork === true;
+  const allowedHosts = normalizeHostnameAllowlist(options.allowedHosts || []);
   const target = url instanceof URL ? url : new URL(String(url || ""));
 
   if (target.username || target.password) {
     throw new LoomError("ENVELOPE_INVALID", "URL credentials are not allowed", 400, {
       field: "url"
+    });
+  }
+
+  if (allowedHosts.length > 0 && !hostnameMatchesAllowlist(target.hostname, allowedHosts)) {
+    throw new LoomError("CAPABILITY_DENIED", "URL host is not in outbound allowlist", 403, {
+      host: target.hostname,
+      allowlist_count: allowedHosts.length
     });
   }
 
@@ -236,6 +307,56 @@ function normalizeFederationDeliverUrl(value, options = {}) {
   return target.toString();
 }
 
+function normalizeFederationIdentityResolveUrl(value, options = {}) {
+  if (value == null || String(value).trim().length === 0) {
+    return null;
+  }
+
+  const raw = String(value).trim();
+  const placeholderToken = "__loom_identity_placeholder__";
+  const hasIdentityPlaceholder = raw.includes("{identity}");
+  const candidate = hasIdentityPlaceholder ? raw.replace(/\{identity\}/g, placeholderToken) : raw;
+
+  let target;
+  try {
+    target = new URL(candidate);
+  } catch {
+    throw new LoomError("ENVELOPE_INVALID", "identity_resolve_url must be a valid absolute URL", 400, {
+      field: "identity_resolve_url"
+    });
+  }
+
+  if (target.username || target.password) {
+    throw new LoomError("ENVELOPE_INVALID", "identity_resolve_url must not include credentials", 400, {
+      field: "identity_resolve_url"
+    });
+  }
+
+  const allowInsecureHttp = options.allowInsecureHttp === true;
+  if (target.protocol !== "https:" && !(allowInsecureHttp && target.protocol === "http:")) {
+    throw new LoomError("ENVELOPE_INVALID", "identity_resolve_url must use https unless allow_insecure_http=true", 400, {
+      field: "identity_resolve_url",
+      protocol: target.protocol
+    });
+  }
+
+  if (options.allowPrivateNetwork !== true) {
+    const hostname = target.hostname;
+    if (isIP(hostname) > 0 && isPrivateOrLocalIp(hostname)) {
+      throw new LoomError("CAPABILITY_DENIED", "identity_resolve_url cannot target private or local IPs", 403, {
+        field: "identity_resolve_url",
+        host: hostname
+      });
+    }
+  }
+
+  const normalized = target.toString();
+  if (!hasIdentityPlaceholder) {
+    return normalized;
+  }
+  return normalized.split(placeholderToken).join("{identity}");
+}
+
 function isExpiredIso(value) {
   if (!value) {
     return false;
@@ -245,6 +366,64 @@ function isExpiredIso(value) {
     return true;
   }
   return parsed <= nowMs();
+}
+
+function parseLoomIdentityDomain(identityUri) {
+  const normalized = normalizeLoomIdentity(identityUri);
+  if (!normalized) {
+    return null;
+  }
+
+  const raw = normalized.slice("loom://".length);
+  const atIndex = raw.indexOf("@");
+  if (atIndex <= 0 || atIndex >= raw.length - 1) {
+    return null;
+  }
+
+  return raw.slice(atIndex + 1).toLowerCase();
+}
+
+function normalizeIdentitySigningKeys(signingKeys = []) {
+  const normalized = signingKeys
+    .map((key) => ({
+      key_id: String(key?.key_id || "").trim(),
+      public_key_pem: String(key?.public_key_pem || "").trim()
+    }))
+    .filter((key) => key.key_id && key.public_key_pem)
+    .sort((left, right) => left.key_id.localeCompare(right.key_id));
+
+  return normalized;
+}
+
+function buildIdentityRegistrationDocument({
+  identity,
+  type = "human",
+  displayName = null,
+  signingKeys = []
+}) {
+  return {
+    loom: "1.1",
+    id: identity,
+    type: String(type || "human"),
+    display_name: String(displayName || identity),
+    signing_keys: normalizeIdentitySigningKeys(signingKeys)
+  };
+}
+
+function hashIdentityRegistrationDocument(documentPayload) {
+  return createHash("sha256")
+    .update(canonicalizeJson(documentPayload), "utf-8")
+    .digest("hex");
+}
+
+function buildIdentityRegistrationProofMessage({ identity, keyId, documentHash, nonce }) {
+  return [
+    "loom.identity.register.v1",
+    String(identity || ""),
+    String(keyId || ""),
+    String(documentHash || ""),
+    String(nonce || "")
+  ].join("\n");
 }
 
 function toThreadSummary(thread) {
@@ -451,17 +630,56 @@ export class LoomStore {
     this.federationSigningKeyId = options.federationSigningKeyId || "k_node_sign_local_1";
     this.federationSigningPrivateKeyPem = options.federationSigningPrivateKeyPem || null;
     this.federationRequireSignedReceipts = options.federationRequireSignedReceipts === true;
+    this.identityRegistrationProofRequired = options.identityRegistrationProofRequired === true;
+    this.identityRegistrationChallengeTtlMs = Math.max(
+      30 * 1000,
+      parsePositiveInteger(options.identityRegistrationChallengeTtlMs, 2 * 60 * 1000)
+    );
+    this.remoteIdentityTtlMs = Math.max(
+      60 * 1000,
+      parsePositiveInteger(options.remoteIdentityTtlMs, 24 * 60 * 60 * 1000)
+    );
+    this.federationResolveRemoteIdentities = options.federationResolveRemoteIdentities !== false;
+    this.federationRequireSignedRemoteIdentity = options.federationRequireSignedRemoteIdentity !== false;
+    this.federationRemoteIdentityFetchTimeoutMs = Math.max(
+      500,
+      parsePositiveInteger(options.federationRemoteIdentityFetchTimeoutMs, 5000)
+    );
+    this.federationRemoteIdentityMaxResponseBytes = Math.max(
+      1024,
+      parsePositiveInteger(options.federationRemoteIdentityMaxResponseBytes, 256 * 1024)
+    );
+    this.localIdentityDomain =
+      typeof options.localIdentityDomain === "string" && options.localIdentityDomain.trim()
+        ? options.localIdentityDomain.trim().toLowerCase()
+        : null;
+    this.federationOutboundHostAllowlist = normalizeHostnameAllowlist(options.federationOutboundHostAllowlist);
+    this.federationBootstrapHostAllowlist = normalizeHostnameAllowlist(options.federationBootstrapHostAllowlist);
+    this.webhookOutboundHostAllowlist = normalizeHostnameAllowlist(options.webhookOutboundHostAllowlist);
+    this.remoteIdentityHostAllowlist = normalizeHostnameAllowlist(options.remoteIdentityHostAllowlist);
+    this.reservedSigningKeyIds = new Set(
+      [
+        this.systemSigningKeyId,
+        this.federationSigningKeyId,
+        ...(Array.isArray(options.reservedSigningKeyIds) ? options.reservedSigningKeyIds : [])
+      ]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    );
     this.dataDir = options.dataDir || null;
     this.stateFile = this.dataDir ? join(this.dataDir, "state.json") : null;
     this.auditFile = this.dataDir ? join(this.dataDir, "audit.log.jsonl") : null;
     this.persistenceAdapter = options.persistenceAdapter || null;
 
     this.identities = new Map();
+    this.remoteIdentities = new Map();
     this.publicKeysById = new Map();
+    this.keyOwnerById = new Map();
     this.envelopesById = new Map();
     this.threadsById = new Map();
 
     this.authChallenges = new Map();
+    this.identityRegistrationChallenges = new Map();
     this.accessTokens = new Map();
     this.refreshTokens = new Map();
     this.capabilitiesById = new Map();
@@ -485,6 +703,14 @@ export class LoomStore {
     this.blobMaxBytes = Math.max(1024, parsePositiveInteger(options.blobMaxBytes, 25 * 1024 * 1024));
     this.blobMaxPartBytes = Math.max(1024, parsePositiveInteger(options.blobMaxPartBytes, 2 * 1024 * 1024));
     this.blobMaxParts = Math.max(1, parsePositiveInteger(options.blobMaxParts, 64));
+    this.envelopeDailyMax = Math.max(0, parseNonNegativeInteger(options.envelopeDailyMax, 0));
+    this.threadRecipientFanoutMax = Math.max(0, parseNonNegativeInteger(options.threadRecipientFanoutMax, 0));
+    this.blobDailyCountMax = Math.max(0, parseNonNegativeInteger(options.blobDailyCountMax, 0));
+    this.blobDailyBytesMax = Math.max(0, parseNonNegativeInteger(options.blobDailyBytesMax, 0));
+    this.blobIdentityTotalBytesMax = Math.max(0, parseNonNegativeInteger(options.blobIdentityTotalBytesMax, 0));
+    this.identityEnvelopeUsageByDay = new Map();
+    this.identityBlobUsageByDay = new Map();
+    this.identityBlobTotalBytes = new Map();
     this.federationInboundRateWindowMs = Math.max(
       1000,
       parsePositiveInteger(options.federationNodeRateWindowMs, 60 * 1000)
@@ -539,6 +765,19 @@ export class LoomStore {
     );
     this.federationInboundAbuseByNode = new Map();
     this.federationChallengesByNode = new Map();
+    this.identityRateWindowMs = Math.max(
+      1000,
+      parsePositiveInteger(options.identityRateWindowMs, 60 * 1000)
+    );
+    this.identityRateDefaultMax = Math.max(
+      1,
+      parsePositiveInteger(options.identityRateDefaultMax, 2000)
+    );
+    this.identityRateSensitiveMax = Math.max(
+      1,
+      parsePositiveInteger(options.identityRateSensitiveMax, 400)
+    );
+    this.identityRateByBucket = new Map();
     this.persistenceQueue = [];
     this.persistenceFlushInProgress = false;
     this.persistenceWritesTotal = 0;
@@ -581,7 +820,349 @@ export class LoomStore {
   ensureSystemSigningKeyRegistered() {
     if (this.systemSigningPublicKeyPem) {
       this.publicKeysById.set(this.systemSigningKeyId, this.systemSigningPublicKeyPem);
+      this.keyOwnerById.set(this.systemSigningKeyId, "__loom_system__");
     }
+  }
+
+  applyIdentitySigningKeys(identityId, signingKeys = []) {
+    for (const key of Array.isArray(signingKeys) ? signingKeys : []) {
+      const keyId = String(key?.key_id || "").trim();
+      const publicKeyPem = String(key?.public_key_pem || "").trim();
+      if (!keyId || !publicKeyPem) {
+        continue;
+      }
+      this.publicKeysById.set(keyId, publicKeyPem);
+      this.keyOwnerById.set(keyId, identityId);
+    }
+  }
+
+  removeIdentitySigningKeys(identityId, signingKeys = []) {
+    for (const key of Array.isArray(signingKeys) ? signingKeys : []) {
+      const keyId = String(key?.key_id || "").trim();
+      if (!keyId) {
+        continue;
+      }
+      const owner = this.keyOwnerById.get(keyId);
+      if (owner === identityId) {
+        this.keyOwnerById.delete(keyId);
+        this.publicKeysById.delete(keyId);
+      }
+    }
+  }
+
+  rebuildIdentityKeyIndexes() {
+    this.publicKeysById = new Map();
+    this.keyOwnerById = new Map();
+    this.ensureSystemSigningKeyRegistered();
+
+    for (const identityDoc of this.identities.values()) {
+      this.applyIdentitySigningKeys(identityDoc.id, identityDoc.signing_keys);
+    }
+
+    for (const identityDoc of this.remoteIdentities.values()) {
+      this.applyIdentitySigningKeys(identityDoc.id, identityDoc.signing_keys);
+    }
+  }
+
+  toDailyQuotaBucket(timestamp) {
+    const parsed = parseTime(timestamp);
+    const date = parsed == null ? new Date() : new Date(parsed);
+    return date.toISOString().slice(0, 10);
+  }
+
+  buildIdentityDailyQuotaKey(identityUri, dayBucket) {
+    const normalizedIdentity = this.normalizeIdentityReference(identityUri);
+    const normalizedDayBucket = String(dayBucket || "").trim();
+    if (!normalizedIdentity || !normalizedDayBucket) {
+      return null;
+    }
+    return `${normalizedDayBucket}|${normalizedIdentity}`;
+  }
+
+  cleanupDailyQuotaMap(map, maxAgeDays = 8) {
+    const maxAgeMs = Math.max(1, Number(maxAgeDays || 8)) * 24 * 60 * 60 * 1000;
+    const cutoffMs = nowMs() - maxAgeMs;
+    for (const key of map.keys()) {
+      const [dayBucket] = String(key).split("|");
+      const dayStartMs = parseTime(`${dayBucket}T00:00:00.000Z`);
+      if (dayStartMs == null || dayStartMs < cutoffMs) {
+        map.delete(key);
+      }
+    }
+  }
+
+  ensureBlobDailyUsage(identityUri, dayBucket) {
+    const key = this.buildIdentityDailyQuotaKey(identityUri, dayBucket);
+    if (!key) {
+      return null;
+    }
+
+    let usage = this.identityBlobUsageByDay.get(key);
+    if (!usage || typeof usage !== "object") {
+      usage = { count: 0, bytes: 0 };
+      this.identityBlobUsageByDay.set(key, usage);
+    } else {
+      usage.count = Math.max(0, Number(usage.count || 0));
+      usage.bytes = Math.max(0, Number(usage.bytes || 0));
+    }
+
+    return usage;
+  }
+
+  getBlobDailyUsage(identityUri, dayBucket) {
+    const key = this.buildIdentityDailyQuotaKey(identityUri, dayBucket);
+    if (!key) {
+      return {
+        count: 0,
+        bytes: 0
+      };
+    }
+
+    const usage = this.identityBlobUsageByDay.get(key);
+    if (!usage || typeof usage !== "object") {
+      return {
+        count: 0,
+        bytes: 0
+      };
+    }
+
+    return {
+      count: Math.max(0, Number(usage.count || 0)),
+      bytes: Math.max(0, Number(usage.bytes || 0))
+    };
+  }
+
+  rebuildIdentityQuotaIndexes() {
+    this.identityEnvelopeUsageByDay = new Map();
+    this.identityBlobUsageByDay = new Map();
+    this.identityBlobTotalBytes = new Map();
+
+    for (const envelope of this.envelopesById.values()) {
+      const identity = this.normalizeIdentityReference(envelope?.from?.identity);
+      if (!identity) {
+        continue;
+      }
+
+      const dayBucket = this.toDailyQuotaBucket(envelope.created_at || envelope?.meta?.received_at);
+      const key = this.buildIdentityDailyQuotaKey(identity, dayBucket);
+      if (!key) {
+        continue;
+      }
+
+      this.identityEnvelopeUsageByDay.set(key, Math.max(0, Number(this.identityEnvelopeUsageByDay.get(key) || 0)) + 1);
+    }
+
+    for (const blob of this.blobsById.values()) {
+      const identity = this.normalizeIdentityReference(blob?.created_by);
+      if (!identity) {
+        continue;
+      }
+
+      const createdDayBucket = this.toDailyQuotaBucket(blob.created_at);
+      const createUsage = this.ensureBlobDailyUsage(identity, createdDayBucket);
+      if (createUsage) {
+        createUsage.count += 1;
+      }
+
+      let accountedBytes = Number(blob?.quota_accounted_bytes || 0);
+      if (!Number.isFinite(accountedBytes) || accountedBytes < 0) {
+        accountedBytes = 0;
+      }
+
+      if (accountedBytes === 0 && blob?.status === "complete") {
+        const fallbackSizeBytes = Number(blob?.size_bytes || 0);
+        if (Number.isFinite(fallbackSizeBytes) && fallbackSizeBytes > 0) {
+          accountedBytes = fallbackSizeBytes;
+        }
+      }
+
+      blob.quota_accounted_bytes = accountedBytes;
+      if (accountedBytes <= 0) {
+        continue;
+      }
+
+      const completedDayBucket = this.toDailyQuotaBucket(blob.completed_at || blob.created_at);
+      const completeUsage = this.ensureBlobDailyUsage(identity, completedDayBucket);
+      if (completeUsage) {
+        completeUsage.bytes += accountedBytes;
+      }
+
+      this.identityBlobTotalBytes.set(
+        identity,
+        Math.max(0, Number(this.identityBlobTotalBytes.get(identity) || 0)) + accountedBytes
+      );
+    }
+
+    this.cleanupDailyQuotaMap(this.identityEnvelopeUsageByDay);
+    this.cleanupDailyQuotaMap(this.identityBlobUsageByDay);
+  }
+
+  enforceThreadRecipientFanout(envelope) {
+    if (this.threadRecipientFanoutMax <= 0) {
+      return;
+    }
+
+    const recipientCount = Array.isArray(envelope?.to) ? envelope.to.length : 0;
+    if (recipientCount <= this.threadRecipientFanoutMax) {
+      return;
+    }
+
+    throw new LoomError("PAYLOAD_TOO_LARGE", "Recipient fanout exceeds configured thread cap", 413, {
+      field: "to",
+      recipient_count: recipientCount,
+      max_recipients: this.threadRecipientFanoutMax
+    });
+  }
+
+  enforceEnvelopeDailyQuota(identityUri, createdAt) {
+    if (this.envelopeDailyMax <= 0) {
+      return;
+    }
+
+    const dayBucket = this.toDailyQuotaBucket(createdAt);
+    const key = this.buildIdentityDailyQuotaKey(identityUri, dayBucket);
+    if (!key) {
+      return;
+    }
+
+    const count = Math.max(0, Number(this.identityEnvelopeUsageByDay.get(key) || 0));
+    if (count < this.envelopeDailyMax) {
+      return;
+    }
+
+    throw new LoomError("RATE_LIMIT_EXCEEDED", "Daily envelope quota exceeded", 429, {
+      scope: "identity:envelope_daily",
+      identity: this.normalizeIdentityReference(identityUri),
+      day: dayBucket,
+      limit: this.envelopeDailyMax
+    });
+  }
+
+  trackEnvelopeDailyQuota(identityUri, createdAt) {
+    if (this.envelopeDailyMax <= 0) {
+      return;
+    }
+
+    const dayBucket = this.toDailyQuotaBucket(createdAt);
+    const key = this.buildIdentityDailyQuotaKey(identityUri, dayBucket);
+    if (!key) {
+      return;
+    }
+
+    const count = Math.max(0, Number(this.identityEnvelopeUsageByDay.get(key) || 0));
+    this.identityEnvelopeUsageByDay.set(key, count + 1);
+    this.cleanupDailyQuotaMap(this.identityEnvelopeUsageByDay);
+  }
+
+  enforceBlobDailyCountQuota(identityUri, createdAt) {
+    if (this.blobDailyCountMax <= 0) {
+      return;
+    }
+
+    const dayBucket = this.toDailyQuotaBucket(createdAt);
+    const usage = this.getBlobDailyUsage(identityUri, dayBucket);
+    if (usage.count < this.blobDailyCountMax) {
+      return;
+    }
+
+    throw new LoomError("RATE_LIMIT_EXCEEDED", "Daily blob count quota exceeded", 429, {
+      scope: "identity:blob_daily_count",
+      identity: this.normalizeIdentityReference(identityUri),
+      day: dayBucket,
+      limit: this.blobDailyCountMax
+    });
+  }
+
+  trackBlobDailyCountQuota(identityUri, createdAt) {
+    if (this.blobDailyCountMax <= 0) {
+      return;
+    }
+
+    const dayBucket = this.toDailyQuotaBucket(createdAt);
+    const usage = this.ensureBlobDailyUsage(identityUri, dayBucket);
+    if (!usage) {
+      return;
+    }
+
+    usage.count += 1;
+    this.cleanupDailyQuotaMap(this.identityBlobUsageByDay);
+  }
+
+  enforceBlobByteQuotas(identityUri, additionalBytes, timestamp) {
+    const bytesToAdd = Math.max(0, Number(additionalBytes || 0));
+    if (bytesToAdd <= 0) {
+      return;
+    }
+
+    const normalizedIdentity = this.normalizeIdentityReference(identityUri);
+    if (!normalizedIdentity) {
+      return;
+    }
+
+    if (this.blobDailyBytesMax > 0) {
+      const dayBucket = this.toDailyQuotaBucket(timestamp);
+      const usage = this.getBlobDailyUsage(normalizedIdentity, dayBucket);
+      if (usage.bytes + bytesToAdd > this.blobDailyBytesMax) {
+        throw new LoomError("RATE_LIMIT_EXCEEDED", "Daily blob byte quota exceeded", 429, {
+          scope: "identity:blob_daily_bytes",
+          identity: normalizedIdentity,
+          day: dayBucket,
+          limit_bytes: this.blobDailyBytesMax
+        });
+      }
+    }
+
+    if (this.blobIdentityTotalBytesMax > 0) {
+      const totalBytes = Math.max(0, Number(this.identityBlobTotalBytes.get(normalizedIdentity) || 0));
+      if (totalBytes + bytesToAdd > this.blobIdentityTotalBytesMax) {
+        throw new LoomError("RATE_LIMIT_EXCEEDED", "Blob identity total byte quota exceeded", 429, {
+          scope: "identity:blob_total_bytes",
+          identity: normalizedIdentity,
+          limit_bytes: this.blobIdentityTotalBytesMax
+        });
+      }
+    }
+  }
+
+  trackBlobByteQuotas(identityUri, additionalBytes, timestamp) {
+    const bytesToAdd = Math.max(0, Number(additionalBytes || 0));
+    if (bytesToAdd <= 0) {
+      return;
+    }
+
+    const normalizedIdentity = this.normalizeIdentityReference(identityUri);
+    if (!normalizedIdentity) {
+      return;
+    }
+
+    const dayBucket = this.toDailyQuotaBucket(timestamp);
+    const usage = this.ensureBlobDailyUsage(normalizedIdentity, dayBucket);
+    if (usage) {
+      usage.bytes += bytesToAdd;
+    }
+
+    const totalBytes = Math.max(0, Number(this.identityBlobTotalBytes.get(normalizedIdentity) || 0));
+    this.identityBlobTotalBytes.set(normalizedIdentity, totalBytes + bytesToAdd);
+    this.cleanupDailyQuotaMap(this.identityBlobUsageByDay);
+  }
+
+  isRemoteIdentityExpired(identityDoc) {
+    if (!identityDoc || identityDoc.imported_remote !== true) {
+      return false;
+    }
+    if (!identityDoc.remote_expires_at) {
+      return false;
+    }
+    return isExpiredIso(identityDoc.remote_expires_at);
+  }
+
+  purgeExpiredRemoteIdentity(identityUri) {
+    const remoteIdentity = this.remoteIdentities.get(identityUri);
+    if (!remoteIdentity) {
+      return;
+    }
+    this.removeIdentitySigningKeys(identityUri, remoteIdentity.signing_keys);
+    this.remoteIdentities.delete(identityUri);
   }
 
   loadStateFromObject(state) {
@@ -590,8 +1171,38 @@ export class LoomStore {
     }
 
     this.nodeId = state.node_id || this.nodeId;
-    this.identities = new Map((state.identities || []).map((item) => [item.id, item]));
-    this.publicKeysById = new Map(state.public_keys || []);
+    const localIdentityEntries = [];
+    const remoteIdentityEntries = [];
+    for (const identityDoc of state.identities || []) {
+      if (!identityDoc?.id) {
+        continue;
+      }
+      if (identityDoc.imported_remote === true || identityDoc.identity_source === "remote") {
+        remoteIdentityEntries.push(identityDoc);
+      } else {
+        localIdentityEntries.push(identityDoc);
+      }
+    }
+    for (const identityDoc of state.remote_identities || []) {
+      if (!identityDoc?.id) {
+        continue;
+      }
+      remoteIdentityEntries.push({
+        ...identityDoc,
+        imported_remote: true,
+        identity_source: "remote"
+      });
+    }
+
+    this.identities = new Map(localIdentityEntries.map((item) => [item.id, item]));
+    this.remoteIdentities = new Map(remoteIdentityEntries.map((item) => [item.id, item]));
+    this.rebuildIdentityKeyIndexes();
+
+    for (const [identityUri, identityDoc] of this.remoteIdentities.entries()) {
+      if (this.isRemoteIdentityExpired(identityDoc)) {
+        this.purgeExpiredRemoteIdentity(identityUri);
+      }
+    }
     this.envelopesById = new Map((state.envelopes || []).map((item) => [item.id, item]));
     this.threadsById = new Map((state.threads || []).map((item) => [item.id, item]));
     for (const thread of this.threadsById.values()) {
@@ -633,6 +1244,10 @@ export class LoomStore {
     this.delegationsById = new Map((state.delegations || []).map((item) => [item.id, item]));
     this.revokedDelegationIds = new Set(state.revoked_delegation_ids || []);
     this.blobsById = new Map((state.blobs || []).map((item) => [item.id, item]));
+    for (const blob of this.blobsById.values()) {
+      const accountedBytes = Number(blob?.quota_accounted_bytes || 0);
+      blob.quota_accounted_bytes = Number.isFinite(accountedBytes) && accountedBytes >= 0 ? accountedBytes : 0;
+    }
     this.knownNodesById = new Map((state.known_nodes || []).map((item) => [item.node_id, item]));
     for (const node of this.knownNodesById.values()) {
       const signingKeys = getFederationNodeSigningKeys(node);
@@ -652,6 +1267,14 @@ export class LoomStore {
         });
       } catch {
         node.deliver_url = null;
+      }
+      try {
+        node.identity_resolve_url = normalizeFederationIdentityResolveUrl(node.identity_resolve_url, {
+          allowInsecureHttp: node.allow_insecure_http,
+          allowPrivateNetwork: node.allow_private_network
+        });
+      } catch {
+        node.identity_resolve_url = null;
       }
 
       node.reputation_score = Math.max(0, Number(node.reputation_score || 0));
@@ -697,6 +1320,7 @@ export class LoomStore {
         .filter(([key, seenAt]) => key.length > 0 && Number.isFinite(seenAt))
     );
     this.cleanupFederationNonces();
+    this.rebuildIdentityQuotaIndexes();
   }
 
   loadAuditFromEntries(entries) {
@@ -739,6 +1363,7 @@ export class LoomStore {
       node_id: this.nodeId,
       updated_at: nowIso(),
       identities: Array.from(this.identities.values()),
+      remote_identities: Array.from(this.remoteIdentities.values()),
       public_keys: Array.from(this.publicKeysById.entries()),
       envelopes: Array.from(this.envelopesById.values()),
       threads: Array.from(this.threadsById.values()),
@@ -1072,6 +1697,16 @@ export class LoomStore {
       });
     }
 
+    if (
+      this.webhookOutboundHostAllowlist.length > 0 &&
+      !hostnameMatchesAllowlist(parsedUrl.hostname, this.webhookOutboundHostAllowlist)
+    ) {
+      throw new LoomError("CAPABILITY_DENIED", "Webhook url host is not in outbound allowlist", 403, {
+        field: "url",
+        host: parsedUrl.hostname
+      });
+    }
+
     const allowPrivateNetwork = parseBoolean(payload.allow_private_network, false);
     if (!allowPrivateNetwork && isIP(parsedUrl.hostname) > 0 && isPrivateOrLocalIp(parsedUrl.hostname)) {
       throw new LoomError("CAPABILITY_DENIED", "Webhook url cannot target private or local network", 403, {
@@ -1331,7 +1966,8 @@ export class LoomStore {
     const webhookUrl = webhook.url;
     const parsedUrl = new URL(webhookUrl);
     await assertOutboundUrlHostAllowed(parsedUrl, {
-      allowPrivateNetwork: webhook.allow_private_network === true
+      allowPrivateNetwork: webhook.allow_private_network === true,
+      allowedHosts: this.webhookOutboundHostAllowlist
     });
     const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
     const signature = signUtf8Message(this.systemSigningPrivateKeyPem, canonical);
@@ -1631,6 +2267,14 @@ export class LoomStore {
       allowInsecureHttp,
       allowPrivateNetwork
     });
+    const hasIdentityResolveUrl = Object.prototype.hasOwnProperty.call(payload, "identity_resolve_url");
+    const identityResolveUrl = normalizeFederationIdentityResolveUrl(
+      hasIdentityResolveUrl ? payload.identity_resolve_url : existing?.identity_resolve_url || null,
+      {
+        allowInsecureHttp,
+        allowPrivateNetwork
+      }
+    );
 
     const node = {
       node_id: nodeId,
@@ -1638,6 +2282,7 @@ export class LoomStore {
       public_key_pem: activeKey.public_key_pem,
       signing_keys: signingKeys,
       deliver_url: deliverUrl,
+      identity_resolve_url: identityResolveUrl,
       allow_insecure_http: allowInsecureHttp,
       allow_private_network: allowPrivateNetwork,
       configured_policy: configuredPolicy,
@@ -1733,7 +2378,8 @@ export class LoomStore {
     }
 
     await assertOutboundUrlHostAllowed(nodeDocumentUrl, {
-      allowPrivateNetwork
+      allowPrivateNetwork,
+      allowedHosts: this.federationBootstrapHostAllowlist
     });
 
     const abortController = new AbortController();
@@ -1859,8 +2505,33 @@ export class LoomStore {
     }
 
     await assertOutboundUrlHostAllowed(deliverUrl, {
+      allowPrivateNetwork,
+      allowedHosts: this.federationOutboundHostAllowlist
+    });
+
+    const discoveredIdentityResolveUrl = String(
+      payload.identity_resolve_url ||
+        nodeDocument?.identity_resolve_url ||
+        nodeDocument?.federation?.identity_resolve_url ||
+        ""
+    ).trim();
+    const identityResolveUrl = normalizeFederationIdentityResolveUrl(discoveredIdentityResolveUrl || null, {
+      allowInsecureHttp,
       allowPrivateNetwork
     });
+    if (identityResolveUrl) {
+      const identityProbeUrl = new URL(
+        identityResolveUrl.replace(/\{identity\}/g, encodeURIComponent("loom://probe@bootstrap.local"))
+      );
+      const identityAllowedHosts =
+        this.remoteIdentityHostAllowlist.length > 0
+          ? this.remoteIdentityHostAllowlist
+          : this.federationOutboundHostAllowlist;
+      await assertOutboundUrlHostAllowed(identityProbeUrl, {
+        allowPrivateNetwork,
+        allowedHosts: identityAllowedHosts
+      });
+    }
 
     const node = this.registerFederationNode(
       {
@@ -1871,6 +2542,7 @@ export class LoomStore {
         active_key_id: activeKey.key_id,
         replace_signing_keys: payload.replace_signing_keys === true,
         deliver_url: deliverUrl.toString(),
+        identity_resolve_url: identityResolveUrl,
         allow_insecure_http: allowInsecureHttp,
         allow_private_network: allowPrivateNetwork,
         policy: Object.prototype.hasOwnProperty.call(payload, "policy") ? payload.policy : undefined
@@ -2631,7 +3303,7 @@ export class LoomStore {
     return node;
   }
 
-  ingestFederationDelivery(wrapper, verifiedNode) {
+  async ingestFederationDelivery(wrapper, verifiedNode) {
     if (!wrapper || typeof wrapper !== "object") {
       throw new LoomError("ENVELOPE_INVALID", "Federation wrapper must be an object", 400, {
         field: "wrapper"
@@ -2666,6 +3338,8 @@ export class LoomStore {
     const accepted = [];
     const quarantined = verifiedNode.policy === "quarantine";
     for (const envelope of wrapper.envelopes) {
+      await this.ensureFederatedSenderIdentity(envelope, verifiedNode);
+
       const envelopeWithPolicyMeta = quarantined
         ? {
             ...envelope,
@@ -3083,7 +3757,8 @@ export class LoomStore {
 
     try {
       await assertOutboundUrlHostAllowed(parsedUrl, {
-        allowPrivateNetwork: node.allow_private_network === true
+        allowPrivateNetwork: node.allow_private_network === true,
+        allowedHosts: this.federationOutboundHostAllowlist
       });
     } catch (error) {
       this.markOutboxFailure(item, error?.message || "Federation deliver_url host denied");
@@ -4134,14 +4809,15 @@ export class LoomStore {
     return wrappers;
   }
 
-  buildEnvelopeRecipientView(envelope, actorIdentity) {
+  buildEnvelopeRecipientView(envelope, actorIdentity, options = {}) {
     const thread = this.threadsById.get(envelope.thread_id);
     const normalizedActor = String(actorIdentity || "").trim();
+    const allowThreadReadCapability = options.allowThreadReadCapability === true;
     const actorIsSender = envelope.from?.identity === normalizedActor;
     const actorIsRecipient = (envelope.to || []).some((recipient) => recipient.identity === normalizedActor);
     const actorIsParticipant = thread ? this.isActiveParticipant(thread, normalizedActor) : false;
 
-    if (!actorIsSender && !actorIsRecipient && !actorIsParticipant) {
+    if (!actorIsSender && !actorIsRecipient && !actorIsParticipant && !allowThreadReadCapability) {
       throw new LoomError("CAPABILITY_DENIED", "Not authorized to view envelope", 403, {
         envelope_id: envelope.id,
         actor: normalizedActor
@@ -4213,29 +4889,62 @@ export class LoomStore {
     };
   }
 
-  getEnvelopeForIdentity(envelopeId, actorIdentity) {
+  getEnvelopeForIdentity(envelopeId, actorIdentity, options = {}) {
     const envelope = this.envelopesById.get(envelopeId);
     if (!envelope) {
       return null;
     }
-    return this.buildEnvelopeRecipientView(envelope, actorIdentity);
+    const thread = this.threadsById.get(envelope.thread_id);
+    const normalizedActor = this.normalizeIdentityReference(actorIdentity);
+    const actorIsSender = envelope.from?.identity === normalizedActor;
+    const actorIsRecipient = (envelope.to || []).some((recipient) => recipient.identity === normalizedActor);
+    const actorIsParticipant = thread ? this.isActiveParticipant(thread, normalizedActor) : false;
+
+    let capabilityAuthorized = false;
+    if (!actorIsSender && !actorIsRecipient && !actorIsParticipant) {
+      if (!thread) {
+        throw new LoomError("CAPABILITY_DENIED", "Not authorized to view envelope", 403, {
+          envelope_id: envelope.id,
+          actor: normalizedActor
+        });
+      }
+
+      this.validateCapabilityForThreadRead({
+        thread,
+        actorIdentity: normalizedActor,
+        capabilityTokenValue: options.capabilityTokenValue ?? null,
+        strict: true
+      });
+      capabilityAuthorized = true;
+    }
+
+    return this.buildEnvelopeRecipientView(envelope, normalizedActor, {
+      allowThreadReadCapability: capabilityAuthorized
+    });
   }
 
-  getThreadEnvelopesForIdentity(threadId, actorIdentity) {
+  getThreadEnvelopesForIdentity(threadId, actorIdentity, options = {}) {
     const thread = this.threadsById.get(threadId);
     if (!thread) {
       return null;
     }
 
-    if (!this.isActiveParticipant(thread, actorIdentity)) {
-      throw new LoomError("CAPABILITY_DENIED", "Only thread participants can view thread envelopes", 403, {
-        thread_id: threadId,
-        actor: actorIdentity
-      });
-    }
+    const normalizedActor = this.normalizeIdentityReference(actorIdentity);
+    const capabilityTokenValue = options.capabilityTokenValue ?? null;
+    const readToken = this.validateCapabilityForThreadRead({
+      thread,
+      actorIdentity: normalizedActor,
+      capabilityTokenValue,
+      strict: true
+    });
 
     const envelopes = canonicalThreadOrder(thread.envelope_ids.map((id) => this.envelopesById.get(id)));
-    return envelopes.map((envelope) => this.buildEnvelopeRecipientView(envelope, actorIdentity));
+    const allowThreadReadCapability = Boolean(readToken);
+    return envelopes.map((envelope) =>
+      this.buildEnvelopeRecipientView(envelope, normalizedActor, {
+        allowThreadReadCapability
+      })
+    );
   }
 
   listGatewayImapMessages(folderName, actorIdentity, limit = 100) {
@@ -4412,7 +5121,8 @@ export class LoomStore {
     );
 
     const stored = this.ingestEnvelope(signedEnvelope, {
-      actorIdentity
+      actorIdentity,
+      allowSystemSignatureOverride: true
     });
 
     this.recordEmailMessageIndex(messageId, stored.id, stored.thread_id);
@@ -4725,7 +5435,197 @@ export class LoomStore {
     };
   }
 
-  registerIdentity(identityDoc) {
+  normalizeIdentityReference(identity) {
+    if (typeof identity !== "string") {
+      return "";
+    }
+    const trimmed = identity.trim();
+    if (!trimmed) {
+      return "";
+    }
+    return normalizeLoomIdentity(trimmed) || trimmed;
+  }
+
+  resolveIdentitySigningKey(identityUri, keyId) {
+    const normalizedIdentity = this.normalizeIdentityReference(identityUri);
+    const normalizedKeyId = String(keyId || "").trim();
+    if (!normalizedIdentity || !normalizedKeyId) {
+      return null;
+    }
+
+    const identity = this.resolveIdentity(normalizedIdentity);
+    if (!identity) {
+      return null;
+    }
+
+    const signingKeys = Array.isArray(identity.signing_keys) ? identity.signing_keys : [];
+    return signingKeys.find((key) => key?.key_id === normalizedKeyId) || null;
+  }
+
+  resolveIdentitySigningPublicKey(identityUri, keyId) {
+    const signingKey = this.resolveIdentitySigningKey(identityUri, keyId);
+    return signingKey?.public_key_pem || null;
+  }
+
+  cleanupIdentityRegistrationChallenges(now = nowMs()) {
+    for (const [challengeId, challenge] of this.identityRegistrationChallenges.entries()) {
+      if (challenge?.used || isExpiredIso(challenge?.expires_at)) {
+        this.identityRegistrationChallenges.delete(challengeId);
+      }
+    }
+  }
+
+  createIdentityRegistrationChallenge(payload = {}, options = {}) {
+    const normalizedIdentity = normalizeLoomIdentity(payload.identity || payload.id);
+    if (!normalizedIdentity) {
+      throw new LoomError("ENVELOPE_INVALID", "identity must be a loom:// URI", 400, {
+        field: "identity"
+      });
+    }
+
+    const keyId = String(payload.key_id || "").trim();
+    if (!keyId) {
+      throw new LoomError("ENVELOPE_INVALID", "key_id is required", 400, {
+        field: "key_id"
+      });
+    }
+
+    const localIdentityDomain =
+      typeof options.localIdentityDomain === "string" && options.localIdentityDomain.trim()
+        ? options.localIdentityDomain.trim().toLowerCase()
+        : this.localIdentityDomain;
+    const identityDomain = parseLoomIdentityDomain(normalizedIdentity);
+    if (
+      localIdentityDomain &&
+      identityDomain &&
+      identityDomain !== localIdentityDomain &&
+      options.allowRemoteDomain !== true
+    ) {
+      throw new LoomError("CAPABILITY_DENIED", "Identity domain must match local node domain", 403, {
+        field: "identity",
+        identity_domain: identityDomain,
+        local_domain: localIdentityDomain
+      });
+    }
+
+    if (this.resolveIdentity(normalizedIdentity) && options.allowExistingIdentity !== true) {
+      throw new LoomError("ENVELOPE_DUPLICATE", `Identity already exists: ${normalizedIdentity}`, 409, {
+        identity: normalizedIdentity
+      });
+    }
+
+    this.cleanupIdentityRegistrationChallenges();
+
+    const challengeId = `ichl_${generateUlid()}`;
+    const nonce = `nonce_${generateUlid()}`;
+    const expiresAt = new Date(nowMs() + this.identityRegistrationChallengeTtlMs).toISOString();
+    const challenge = {
+      challenge_id: challengeId,
+      identity: normalizedIdentity,
+      key_id: keyId,
+      nonce,
+      expires_at: expiresAt,
+      used: false,
+      created_at: nowIso()
+    };
+
+    this.identityRegistrationChallenges.set(challengeId, challenge);
+    return {
+      challenge_id: challengeId,
+      identity: normalizedIdentity,
+      key_id: keyId,
+      nonce,
+      expires_at: expiresAt,
+      algorithm: "Ed25519",
+      purpose: "identity.register@v1"
+    };
+  }
+
+  consumeIdentityRegistrationProof(identityDoc, normalizedIdentity, normalizedSigningKeys, options = {}) {
+    const requireProofOfKey =
+      options.requireProofOfKey === true ||
+      (options.requireProofOfKey !== false && this.identityRegistrationProofRequired);
+    if (!requireProofOfKey || options.importedRemote === true) {
+      return null;
+    }
+
+    const proof = identityDoc?.registration_proof;
+    if (!proof || typeof proof !== "object") {
+      throw new LoomError("SIGNATURE_INVALID", "Identity registration proof is required", 401, {
+        field: "registration_proof"
+      });
+    }
+
+    const challengeId = String(proof.challenge_id || "").trim();
+    const proofKeyId = String(proof.key_id || "").trim();
+    const signature = String(proof.signature || "").trim();
+    if (!challengeId || !proofKeyId || !signature) {
+      throw new LoomError("SIGNATURE_INVALID", "registration_proof requires challenge_id, key_id, and signature", 401, {
+        field: "registration_proof"
+      });
+    }
+
+    const challenge = this.identityRegistrationChallenges.get(challengeId);
+    if (!challenge) {
+      throw new LoomError("SIGNATURE_INVALID", "Identity registration challenge not found", 401, {
+        field: "registration_proof.challenge_id"
+      });
+    }
+
+    if (challenge.used) {
+      throw new LoomError("SIGNATURE_INVALID", "Identity registration challenge already used", 401, {
+        field: "registration_proof.challenge_id"
+      });
+    }
+
+    if (isExpiredIso(challenge.expires_at)) {
+      throw new LoomError("SIGNATURE_INVALID", "Identity registration challenge expired", 401, {
+        field: "registration_proof.challenge_id"
+      });
+    }
+
+    if (challenge.identity !== normalizedIdentity || challenge.key_id !== proofKeyId) {
+      throw new LoomError("SIGNATURE_INVALID", "Identity registration challenge mismatch", 401, {
+        field: "registration_proof"
+      });
+    }
+
+    const proofKey = normalizedSigningKeys.find((key) => key.key_id === proofKeyId);
+    if (!proofKey) {
+      throw new LoomError("SIGNATURE_INVALID", "registration_proof.key_id must be present in signing_keys", 401, {
+        field: "registration_proof.key_id"
+      });
+    }
+
+    const registrationDocument = buildIdentityRegistrationDocument({
+      identity: normalizedIdentity,
+      type: identityDoc.type || "human",
+      displayName: identityDoc.display_name || normalizedIdentity,
+      signingKeys: normalizedSigningKeys
+    });
+    const documentHash = hashIdentityRegistrationDocument(registrationDocument);
+    const message = buildIdentityRegistrationProofMessage({
+      identity: normalizedIdentity,
+      keyId: proofKeyId,
+      documentHash,
+      nonce: challenge.nonce
+    });
+    const valid = verifyUtf8MessageSignature(proofKey.public_key_pem, message, signature);
+    if (!valid) {
+      throw new LoomError("SIGNATURE_INVALID", "Identity registration proof signature verification failed", 401, {
+        field: "registration_proof.signature"
+      });
+    }
+
+    challenge.used = true;
+    return {
+      challenge_id: challengeId,
+      key_id: proofKeyId,
+      document_hash: documentHash
+    };
+  }
+
+  registerIdentity(identityDoc, options = {}) {
     if (!identityDoc || typeof identityDoc !== "object") {
       throw new LoomError("ENVELOPE_INVALID", "Identity payload must be an object", 400, {
         field: "identity"
@@ -4739,6 +5639,37 @@ export class LoomStore {
       });
     }
 
+    const localIdentityDomain =
+      typeof options.localIdentityDomain === "string" && options.localIdentityDomain.trim()
+        ? options.localIdentityDomain.trim().toLowerCase()
+        : this.localIdentityDomain;
+    const identityDomain = parseLoomIdentityDomain(normalizedIdentity);
+    const allowRemoteDomain = options.allowRemoteDomain === true;
+    if (localIdentityDomain && identityDomain && identityDomain !== localIdentityDomain && !allowRemoteDomain) {
+      throw new LoomError("CAPABILITY_DENIED", "Identity domain must match local node domain", 403, {
+        field: "id",
+        identity_domain: identityDomain,
+        local_domain: localIdentityDomain
+      });
+    }
+
+    const existingLocalIdentity = this.identities.get(normalizedIdentity) || null;
+    const existingRemoteIdentity = this.remoteIdentities.get(normalizedIdentity) || null;
+    const existingIdentity = existingLocalIdentity || existingRemoteIdentity;
+    const targetMap = options.importedRemote === true ? this.remoteIdentities : this.identities;
+    const nonTargetMap = options.importedRemote === true ? this.identities : this.remoteIdentities;
+    const allowOverwrite = options.allowOverwrite === true;
+    if (existingIdentity && !allowOverwrite) {
+      throw new LoomError("ENVELOPE_DUPLICATE", `Identity already exists: ${normalizedIdentity}`, 409, {
+        identity: normalizedIdentity
+      });
+    }
+    if (allowOverwrite && nonTargetMap.has(normalizedIdentity)) {
+      throw new LoomError("CAPABILITY_DENIED", "Cannot overwrite identity across local/remote stores", 403, {
+        identity: normalizedIdentity
+      });
+    }
+
     const signingKeys = Array.isArray(identityDoc.signing_keys) ? identityDoc.signing_keys : [];
     if (signingKeys.length === 0) {
       throw new LoomError("ENVELOPE_INVALID", "Identity must include at least one signing key", 400, {
@@ -4746,49 +5677,552 @@ export class LoomStore {
       });
     }
 
+    const normalizedSigningKeys = [];
+    const seenSigningKeyIds = new Set();
     for (const key of signingKeys) {
-      if (!key?.key_id || !key?.public_key_pem) {
+      const keyId = String(key?.key_id || "").trim();
+      const publicKeyPem = String(key?.public_key_pem || "").trim();
+      if (!keyId || !publicKeyPem) {
         throw new LoomError("ENVELOPE_INVALID", "Signing key entries require key_id and public_key_pem", 400, {
           field: "signing_keys"
         });
       }
-      this.publicKeysById.set(key.key_id, key.public_key_pem);
+
+      if (this.reservedSigningKeyIds.has(keyId)) {
+        throw new LoomError("ENVELOPE_INVALID", `Signing key id is reserved: ${keyId}`, 400, {
+          field: "signing_keys.key_id",
+          key_id: keyId
+        });
+      }
+
+      if (seenSigningKeyIds.has(keyId)) {
+        throw new LoomError("ENVELOPE_INVALID", `Duplicate signing key id in identity payload: ${keyId}`, 400, {
+          field: "signing_keys.key_id",
+          key_id: keyId
+        });
+      }
+      seenSigningKeyIds.add(keyId);
+
+      const existingOwner = this.keyOwnerById.get(keyId);
+      if (existingOwner && existingOwner !== normalizedIdentity) {
+        throw new LoomError("ENVELOPE_INVALID", `Signing key id is already assigned to another identity: ${keyId}`, 400, {
+          field: "signing_keys.key_id",
+          key_id: keyId
+        });
+      }
+
+      const existingPublicKeyPem = this.publicKeysById.get(keyId);
+      if (existingPublicKeyPem && existingPublicKeyPem !== publicKeyPem) {
+        throw new LoomError("ENVELOPE_INVALID", `Signing key id already exists with a different public key: ${keyId}`, 400, {
+          field: "signing_keys.key_id",
+          key_id: keyId
+        });
+      }
+
+      normalizedSigningKeys.push({
+        key_id: keyId,
+        public_key_pem: publicKeyPem
+      });
     }
+
+    normalizedSigningKeys.sort((left, right) => left.key_id.localeCompare(right.key_id));
+
+    const registrationProof = this.consumeIdentityRegistrationProof(
+      identityDoc,
+      normalizedIdentity,
+      normalizedSigningKeys,
+      options
+    );
+
+    const remoteExpiresAtInput = options.remoteExpiresAt || identityDoc.remote_expires_at || null;
+    const remoteExpiresAt = options.importedRemote
+      ? remoteExpiresAtInput && parseTime(remoteExpiresAtInput) != null
+        ? new Date(parseTime(remoteExpiresAtInput)).toISOString()
+        : new Date(nowMs() + this.remoteIdentityTtlMs).toISOString()
+      : null;
 
     const stored = {
       id: normalizedIdentity,
       type: identityDoc.type || "human",
       display_name: identityDoc.display_name || normalizedIdentity,
-      signing_keys: signingKeys,
-      created_at: identityDoc.created_at || nowIso(),
-      updated_at: nowIso()
+      signing_keys: normalizedSigningKeys,
+      created_at: existingIdentity?.created_at || identityDoc.created_at || nowIso(),
+      updated_at: nowIso(),
+      identity_source: options.importedRemote === true ? "remote" : "local",
+      imported_remote: options.importedRemote === true,
+      remote_fetched_at: options.importedRemote === true ? nowIso() : null,
+      remote_expires_at: remoteExpiresAt
     };
 
-    this.identities.set(stored.id, stored);
+    if (existingIdentity) {
+      this.removeIdentitySigningKeys(existingIdentity.id, existingIdentity.signing_keys);
+    }
+    for (const key of normalizedSigningKeys) {
+      this.publicKeysById.set(key.key_id, key.public_key_pem);
+      this.keyOwnerById.set(key.key_id, normalizedIdentity);
+    }
+
+    targetMap.set(stored.id, stored);
     this.persistAndAudit("identity.register", {
       identity: stored.id,
-      type: stored.type
+      type: stored.type,
+      imported_remote: options.importedRemote === true,
+      proof_of_key: Boolean(registrationProof)
     });
     return stored;
   }
 
+  updateIdentity(identityUri, payload = {}, session = {}) {
+    const normalizedIdentity = normalizeLoomIdentity(identityUri);
+    if (!normalizedIdentity) {
+      throw new LoomError("ENVELOPE_INVALID", "Identity id must be a loom:// URI", 400, {
+        field: "id"
+      });
+    }
+
+    const identity = this.identities.get(normalizedIdentity) || null;
+    if (!identity) {
+      if (this.remoteIdentities.has(normalizedIdentity)) {
+        throw new LoomError("CAPABILITY_DENIED", "Remote imported identities are read-only", 403, {
+          identity: normalizedIdentity
+        });
+      }
+      throw new LoomError("IDENTITY_NOT_FOUND", `Identity not found: ${normalizedIdentity}`, 404, {
+        identity: normalizedIdentity
+      });
+    }
+
+    const actorIdentity = this.normalizeIdentityReference(session?.identity);
+    if (actorIdentity !== normalizedIdentity) {
+      throw new LoomError("CAPABILITY_DENIED", "Only identity owner may update identity document", 403, {
+        actor: actorIdentity,
+        identity: normalizedIdentity
+      });
+    }
+
+    const actorKeyId = String(session?.key_id || "").trim();
+    if (!actorKeyId || !this.resolveIdentitySigningKey(normalizedIdentity, actorKeyId)) {
+      throw new LoomError("CAPABILITY_DENIED", "Authenticated session key is not authorized for identity update", 403, {
+        actor: actorIdentity,
+        key_id: actorKeyId
+      });
+    }
+
+    if (!payload || typeof payload !== "object") {
+      throw new LoomError("ENVELOPE_INVALID", "Identity update payload must be an object", 400, {
+        field: "identity"
+      });
+    }
+
+    const nextDisplayName =
+      payload.display_name == null ? identity.display_name : String(payload.display_name || "").trim();
+    if (!nextDisplayName) {
+      throw new LoomError("ENVELOPE_INVALID", "display_name cannot be empty", 400, {
+        field: "display_name"
+      });
+    }
+
+    let nextSigningKeys = identity.signing_keys;
+    if (payload.signing_keys != null) {
+      if (!Array.isArray(payload.signing_keys) || payload.signing_keys.length === 0) {
+        throw new LoomError("ENVELOPE_INVALID", "signing_keys must be a non-empty array when provided", 400, {
+          field: "signing_keys"
+        });
+      }
+
+      const normalizedSigningKeys = [];
+      const seenKeyIds = new Set();
+      for (const key of payload.signing_keys) {
+        const keyId = String(key?.key_id || "").trim();
+        const publicKeyPem = String(key?.public_key_pem || "").trim();
+        if (!keyId || !publicKeyPem) {
+          throw new LoomError("ENVELOPE_INVALID", "Signing key entries require key_id and public_key_pem", 400, {
+            field: "signing_keys"
+          });
+        }
+
+        if (this.reservedSigningKeyIds.has(keyId)) {
+          throw new LoomError("ENVELOPE_INVALID", `Signing key id is reserved: ${keyId}`, 400, {
+            field: "signing_keys.key_id",
+            key_id: keyId
+          });
+        }
+
+        if (seenKeyIds.has(keyId)) {
+          throw new LoomError("ENVELOPE_INVALID", `Duplicate signing key id in identity payload: ${keyId}`, 400, {
+            field: "signing_keys.key_id",
+            key_id: keyId
+          });
+        }
+        seenKeyIds.add(keyId);
+
+        const existingOwner = this.keyOwnerById.get(keyId);
+        if (existingOwner && existingOwner !== normalizedIdentity) {
+          throw new LoomError("ENVELOPE_INVALID", `Signing key id is already assigned to another identity: ${keyId}`, 400, {
+            field: "signing_keys.key_id",
+            key_id: keyId
+          });
+        }
+
+        const existingPublicKeyPem = this.publicKeysById.get(keyId);
+        if (existingPublicKeyPem && existingPublicKeyPem !== publicKeyPem) {
+          throw new LoomError("ENVELOPE_INVALID", `Signing key id already exists with a different public key: ${keyId}`, 400, {
+            field: "signing_keys.key_id",
+            key_id: keyId
+          });
+        }
+
+        normalizedSigningKeys.push({
+          key_id: keyId,
+          public_key_pem: publicKeyPem
+        });
+      }
+
+      normalizedSigningKeys.sort((left, right) => left.key_id.localeCompare(right.key_id));
+      if (!normalizedSigningKeys.some((key) => key.key_id === actorKeyId)) {
+        throw new LoomError("CAPABILITY_DENIED", "Identity rotation must retain the currently authenticated key", 403, {
+          field: "signing_keys",
+          key_id: actorKeyId
+        });
+      }
+
+      nextSigningKeys = normalizedSigningKeys;
+    }
+
+    const updated = {
+      ...identity,
+      display_name: nextDisplayName,
+      signing_keys: nextSigningKeys,
+      updated_at: nowIso(),
+      identity_source: "local",
+      imported_remote: false,
+      remote_fetched_at: null,
+      remote_expires_at: null
+    };
+
+    this.removeIdentitySigningKeys(identity.id, identity.signing_keys);
+    this.applyIdentitySigningKeys(updated.id, updated.signing_keys);
+    this.identities.set(updated.id, updated);
+
+    this.persistAndAudit("identity.update", {
+      identity: updated.id,
+      actor: actorIdentity,
+      key_id: actorKeyId,
+      signing_key_count: updated.signing_keys.length
+    });
+
+    return updated;
+  }
+
   resolveIdentity(identityUri) {
-    return this.identities.get(identityUri) || null;
+    const normalizedIdentity = this.normalizeIdentityReference(identityUri);
+    if (!normalizedIdentity) {
+      return null;
+    }
+
+    const localIdentity = this.identities.get(normalizedIdentity) || null;
+    if (localIdentity) {
+      return localIdentity;
+    }
+
+    const remoteIdentity = this.remoteIdentities.get(normalizedIdentity) || null;
+    if (!remoteIdentity) {
+      return null;
+    }
+
+    if (this.isRemoteIdentityExpired(remoteIdentity)) {
+      this.purgeExpiredRemoteIdentity(normalizedIdentity);
+      return null;
+    }
+
+    return remoteIdentity;
   }
 
   resolvePublicKey(keyId) {
     return this.publicKeysById.get(keyId) || null;
   }
 
-  createAuthChallenge({ identity, key_id }) {
-    const identityDoc = this.resolveIdentity(identity);
-    if (!identityDoc) {
-      throw new LoomError("IDENTITY_NOT_FOUND", `Identity not found: ${identity}`, 404, {
-        identity
+  resolveKnownNodeById(nodeId) {
+    const normalizedNodeId = String(nodeId || "").trim();
+    if (!normalizedNodeId) {
+      return null;
+    }
+
+    const direct = this.knownNodesById.get(normalizedNodeId);
+    if (direct) {
+      return direct;
+    }
+
+    const lower = normalizedNodeId.toLowerCase();
+    for (const [knownNodeId, node] of this.knownNodesById.entries()) {
+      if (String(knownNodeId || "").trim().toLowerCase() === lower) {
+        return node;
+      }
+    }
+
+    return null;
+  }
+
+  assertFederatedEnvelopeIdentityAuthority(envelope, verifiedNode) {
+    const fromIdentity = this.normalizeIdentityReference(envelope?.from?.identity);
+    const identityDomain = parseLoomIdentityDomain(fromIdentity);
+    if (!fromIdentity || !identityDomain) {
+      throw new LoomError("SIGNATURE_INVALID", "Federated envelope sender identity must include a valid domain", 401, {
+        field: "from.identity"
       });
     }
 
-    const signingKey = identityDoc.signing_keys.find((key) => key.key_id === key_id);
+    const authorityNodeId = String(verifiedNode?.node_id || "").trim().toLowerCase();
+    if (authorityNodeId && identityDomain.toLowerCase() !== authorityNodeId) {
+      throw new LoomError("SIGNATURE_INVALID", "Federated envelope sender identity domain does not match sender node", 401, {
+        field: "from.identity",
+        identity_domain: identityDomain,
+        sender_node: verifiedNode?.node_id || null
+      });
+    }
+
+    return {
+      fromIdentity,
+      identityDomain
+    };
+  }
+
+  resolveFederationIdentityFetchUrl(node, identityUri) {
+    const encodedIdentity = encodeURIComponent(identityUri);
+    const explicitUrl = String(node?.identity_resolve_url || "").trim();
+    if (explicitUrl) {
+      try {
+        if (explicitUrl.includes("{identity}")) {
+          return new URL(explicitUrl.replace("{identity}", encodedIdentity));
+        }
+
+        const template = new URL(explicitUrl);
+        if (template.pathname.endsWith("/")) {
+          template.pathname = `${template.pathname}${encodedIdentity}`;
+          return template;
+        }
+        template.pathname = `${template.pathname}/${encodedIdentity}`;
+        return template;
+      } catch {
+        throw new LoomError("ENVELOPE_INVALID", "Federation node identity_resolve_url is invalid", 400, {
+          node_id: node?.node_id || null,
+          identity_resolve_url: explicitUrl
+        });
+      }
+    }
+
+    const deliverUrlRaw = String(node?.deliver_url || "").trim() || `https://${node?.node_id}/v1/federation/deliver`;
+    let deliverUrl;
+    try {
+      deliverUrl = new URL(deliverUrlRaw);
+    } catch {
+      throw new LoomError("ENVELOPE_INVALID", "Federation node deliver_url is invalid", 400, {
+        node_id: node?.node_id || null
+      });
+    }
+
+    const base = `${deliverUrl.protocol}//${deliverUrl.host}`;
+    return new URL(`/v1/identity/${encodedIdentity}`, base);
+  }
+
+  async fetchRemoteIdentityDocument(node, identityUri) {
+    const identityUrl = this.resolveFederationIdentityFetchUrl(node, identityUri);
+    const allowInsecureHttp = node?.allow_insecure_http === true;
+    if (identityUrl.protocol !== "https:" && !(allowInsecureHttp && identityUrl.protocol === "http:")) {
+      throw new LoomError("CAPABILITY_DENIED", "Remote identity fetch requires https unless node allows insecure http", 403, {
+        node_id: node?.node_id || null,
+        identity_url: identityUrl.toString()
+      });
+    }
+
+    const allowedHosts =
+      this.remoteIdentityHostAllowlist.length > 0
+        ? this.remoteIdentityHostAllowlist
+        : this.federationOutboundHostAllowlist;
+    await assertOutboundUrlHostAllowed(identityUrl, {
+      allowPrivateNetwork: node?.allow_private_network === true,
+      allowedHosts
+    });
+
+    let response;
+    try {
+      response = await fetch(identityUrl, {
+        method: "GET",
+        redirect: "error",
+        headers: {
+          accept: "application/json"
+        },
+        signal: AbortSignal.timeout(this.federationRemoteIdentityFetchTimeoutMs)
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new LoomError("DELIVERY_TIMEOUT", "Remote identity fetch timed out", 504, {
+          identity: identityUri,
+          node_id: node?.node_id || null,
+          timeout_ms: this.federationRemoteIdentityFetchTimeoutMs
+        });
+      }
+
+      throw new LoomError("NODE_UNREACHABLE", "Remote identity fetch failed", 502, {
+        identity: identityUri,
+        node_id: node?.node_id || null,
+        reason: error?.message || String(error)
+      });
+    }
+
+    if (!response.ok) {
+      throw new LoomError("IDENTITY_NOT_FOUND", "Remote identity endpoint returned non-success status", 404, {
+        identity: identityUri,
+        node_id: node?.node_id || null,
+        status: response.status
+      });
+    }
+
+    let payload;
+    try {
+      const rawBody = await response.text();
+      if (Buffer.byteLength(rawBody, "utf-8") > this.federationRemoteIdentityMaxResponseBytes) {
+        throw new LoomError("PAYLOAD_TOO_LARGE", "Remote identity response exceeds allowed size", 413, {
+          identity: identityUri,
+          node_id: node?.node_id || null,
+          max_response_bytes: this.federationRemoteIdentityMaxResponseBytes
+        });
+      }
+      payload = JSON.parse(rawBody);
+    } catch (error) {
+      if (error instanceof LoomError) {
+        throw error;
+      }
+      throw new LoomError("ENVELOPE_INVALID", "Remote identity response must be valid JSON", 400, {
+        identity: identityUri,
+        node_id: node?.node_id || null
+      });
+    }
+
+    this.verifyRemoteIdentityDocumentSignature(payload, node);
+
+    return payload;
+  }
+
+  verifyRemoteIdentityDocumentSignature(identityDocument, node) {
+    if (this.federationRequireSignedRemoteIdentity !== true) {
+      return;
+    }
+
+    const signature = identityDocument?.node_signature;
+    if (!signature || typeof signature !== "object") {
+      throw new LoomError("SIGNATURE_INVALID", "Remote identity document signature is required", 401, {
+        field: "node_signature",
+        node_id: node?.node_id || null
+      });
+    }
+
+    const algorithm = String(signature.algorithm || "").trim();
+    const keyId = String(signature.key_id || "").trim();
+    const value = String(signature.value || "").trim();
+    if (algorithm !== "Ed25519" || !keyId || !value) {
+      throw new LoomError("SIGNATURE_INVALID", "Remote identity document signature is invalid", 401, {
+        field: "node_signature",
+        node_id: node?.node_id || null
+      });
+    }
+
+    const signingKey = resolveFederationNodeSigningKey(node, keyId);
+    if (!signingKey) {
+      throw new LoomError("SIGNATURE_INVALID", "Remote identity document signature key is not trusted for node", 401, {
+        field: "node_signature.key_id",
+        node_id: node?.node_id || null,
+        key_id: keyId
+      });
+    }
+
+    const canonicalIdentity = buildIdentityRegistrationDocument({
+      identity: identityDocument?.id,
+      type: identityDocument?.type || "human",
+      displayName: identityDocument?.display_name || identityDocument?.id,
+      signingKeys: Array.isArray(identityDocument?.signing_keys) ? identityDocument.signing_keys : []
+    });
+    const canonicalPayload = canonicalizeJson(canonicalIdentity);
+    const valid = verifyUtf8MessageSignature(signingKey.public_key_pem, canonicalPayload, value);
+    if (!valid) {
+      throw new LoomError("SIGNATURE_INVALID", "Remote identity document signature verification failed", 401, {
+        field: "node_signature",
+        node_id: node?.node_id || null,
+        key_id: keyId
+      });
+    }
+  }
+
+  async ensureFederatedSenderIdentity(envelope, verifiedNode) {
+    const { fromIdentity, identityDomain } = this.assertFederatedEnvelopeIdentityAuthority(envelope, verifiedNode);
+
+    const currentIdentity = this.resolveIdentity(fromIdentity);
+    const signingKeyId = String(envelope?.signature?.key_id || envelope?.from?.key_id || "").trim();
+    if (currentIdentity && this.resolveIdentitySigningKey(fromIdentity, signingKeyId)) {
+      return currentIdentity;
+    }
+
+    if (!this.federationResolveRemoteIdentities) {
+      throw new LoomError("IDENTITY_NOT_FOUND", "Federated sender identity is not registered locally", 404, {
+        identity: fromIdentity
+      });
+    }
+
+    const authorityNode = this.resolveKnownNodeById(verifiedNode?.node_id || identityDomain);
+    if (!authorityNode) {
+      throw new LoomError("IDENTITY_NOT_FOUND", "Federation authority node for sender identity is unknown", 404, {
+        identity: fromIdentity,
+        identity_domain: identityDomain
+      });
+    }
+
+    const remotePayload = await this.fetchRemoteIdentityDocument(authorityNode, fromIdentity);
+    const normalizedRemoteIdentity = normalizeLoomIdentity(remotePayload?.id);
+    if (!normalizedRemoteIdentity || normalizedRemoteIdentity !== fromIdentity) {
+      throw new LoomError("SIGNATURE_INVALID", "Remote identity document id does not match sender identity", 401, {
+        expected_identity: fromIdentity,
+        actual_identity: remotePayload?.id || null
+      });
+    }
+
+    const remoteSigningKeys = Array.isArray(remotePayload?.signing_keys) ? remotePayload.signing_keys : [];
+    if (remoteSigningKeys.length === 0) {
+      throw new LoomError("SIGNATURE_INVALID", "Remote identity document must include signing_keys", 401, {
+        identity: fromIdentity
+      });
+    }
+
+    return this.registerIdentity(
+      {
+        ...remotePayload,
+        id: fromIdentity
+      },
+      {
+        importedRemote: true,
+        allowOverwrite: true,
+        allowRemoteDomain: true,
+        requireProofOfKey: false,
+        remoteExpiresAt: new Date(nowMs() + this.remoteIdentityTtlMs).toISOString()
+      }
+    );
+  }
+
+  createAuthChallenge({ identity, key_id }) {
+    const normalizedIdentity = this.normalizeIdentityReference(identity);
+    const identityDoc = this.resolveIdentity(normalizedIdentity);
+    if (!identityDoc) {
+      throw new LoomError("IDENTITY_NOT_FOUND", `Identity not found: ${normalizedIdentity || identity}`, 404, {
+        identity: normalizedIdentity || identity
+      });
+    }
+
+    if (identityDoc.imported_remote === true || identityDoc.identity_source === "remote") {
+      throw new LoomError("CAPABILITY_DENIED", "Authentication challenge is only available for local identities", 403, {
+        identity: identityDoc.id
+      });
+    }
+
+    const signingKey = this.resolveIdentitySigningKey(identityDoc.id, key_id);
     if (!signingKey) {
       throw new LoomError("SIGNATURE_INVALID", `Unknown signing key for identity: ${key_id}`, 401, {
         field: "key_id"
@@ -4801,7 +6235,7 @@ export class LoomStore {
 
     this.authChallenges.set(challengeId, {
       challenge_id: challengeId,
-      identity,
+      identity: identityDoc.id,
       key_id,
       nonce,
       expires_at: expiresAt,
@@ -4811,7 +6245,7 @@ export class LoomStore {
 
     return {
       challenge_id: challengeId,
-      identity,
+      identity: identityDoc.id,
       key_id,
       nonce,
       expires_at: expiresAt,
@@ -4839,15 +6273,16 @@ export class LoomStore {
       });
     }
 
-    if (challenge.identity !== identity || challenge.key_id !== key_id) {
+    const normalizedIdentity = this.normalizeIdentityReference(identity);
+    if (challenge.identity !== normalizedIdentity || challenge.key_id !== key_id) {
       throw new LoomError("SIGNATURE_INVALID", "Challenge identity/key mismatch", 401, {
         field: "identity"
       });
     }
 
-    const publicKeyPem = this.resolvePublicKey(key_id);
+    const publicKeyPem = this.resolveIdentitySigningPublicKey(challenge.identity, key_id);
     if (!publicKeyPem) {
-      throw new LoomError("SIGNATURE_INVALID", `Unknown signing key: ${key_id}`, 401, {
+      throw new LoomError("SIGNATURE_INVALID", `Unknown signing key for identity: ${key_id}`, 401, {
         field: "key_id"
       });
     }
@@ -4874,7 +6309,7 @@ export class LoomStore {
 
     this.accessTokens.set(accessToken, {
       access_token: accessToken,
-      identity,
+      identity: challenge.identity,
       key_id,
       created_at: nowIso(),
       expires_at: accessExpiresAt
@@ -4882,7 +6317,7 @@ export class LoomStore {
 
     this.refreshTokens.set(refreshToken, {
       refresh_token: refreshToken,
-      identity,
+      identity: challenge.identity,
       key_id,
       created_at: nowIso(),
       expires_at: refreshExpiresAt
@@ -4893,7 +6328,7 @@ export class LoomStore {
       access_token: accessToken,
       refresh_token: refreshToken,
       expires_in: 3600,
-      identity,
+      identity: challenge.identity,
       key_id
     };
   }
@@ -4941,6 +6376,55 @@ export class LoomStore {
     }
 
     return session;
+  }
+
+  isIdentitySensitiveRoute(method, path) {
+    const normalizedMethod = String(method || "GET").toUpperCase();
+    if (normalizedMethod !== "GET") {
+      return true;
+    }
+
+    const normalizedPath = String(path || "").trim();
+    return normalizedPath === "/v1/audit" || normalizedPath === "/metrics";
+  }
+
+  enforceIdentityRateLimit({ identity, method = "GET", path = "/" } = {}) {
+    const normalizedIdentity = this.normalizeIdentityReference(identity);
+    if (!normalizedIdentity) {
+      return;
+    }
+
+    const windowMs = this.identityRateWindowMs;
+    const sensitive = this.isIdentitySensitiveRoute(method, path);
+    const max = sensitive ? this.identityRateSensitiveMax : this.identityRateDefaultMax;
+    if (!windowMs || !max) {
+      return;
+    }
+
+    const bucket = sensitive ? "sensitive" : "default";
+    const key = `${bucket}:${normalizedIdentity}`;
+    const now = nowMs();
+    const current = this.identityRateByBucket.get(key);
+    if (!current || now - current.window_started_at >= windowMs) {
+      this.identityRateByBucket.set(key, {
+        count: 1,
+        window_started_at: now
+      });
+      return;
+    }
+
+    if (current.count >= max) {
+      const retryAfterMs = Math.max(1, current.window_started_at + windowMs - now);
+      throw new LoomError("RATE_LIMIT_EXCEEDED", "Identity rate limit exceeded", 429, {
+        limit: max,
+        window_ms: windowMs,
+        retry_after_ms: retryAfterMs,
+        scope: `identity:${bucket}`,
+        identity: normalizedIdentity
+      });
+    }
+
+    current.count += 1;
   }
 
   createDelegation(payload, actorIdentity) {
@@ -5091,6 +6575,9 @@ export class LoomStore {
       }
     }
 
+    const createdAt = nowIso();
+    this.enforceBlobDailyCountQuota(actorIdentity, createdAt);
+
     const requestedSizeBytes = Number(payload.size_bytes || 0);
     if (!Number.isFinite(requestedSizeBytes) || requestedSizeBytes < 0) {
       throw new LoomError("ENVELOPE_INVALID", "size_bytes must be a non-negative number", 400, {
@@ -5113,15 +6600,17 @@ export class LoomStore {
       filename: payload.filename || null,
       mime_type: payload.mime_type || "application/octet-stream",
       size_bytes: requestedSizeBytes,
-      created_at: nowIso(),
+      created_at: createdAt,
       completed_at: null,
       status: "pending",
       parts: {},
       data_base64: null,
-      hash: null
+      hash: null,
+      quota_accounted_bytes: 0
     };
 
     this.blobsById.set(blob.id, blob);
+    this.trackBlobDailyCountQuota(actorIdentity, createdAt);
     this.persistAndAudit("blob.create", {
       blob_id: blob.id,
       actor: actorIdentity,
@@ -5260,11 +6749,18 @@ export class LoomStore {
       });
     }
 
+    const accountedBytes = Math.max(0, Number(blob.quota_accounted_bytes || 0));
+    const additionalBytes = Math.max(0, joined.byteLength - accountedBytes);
+    const completedAt = nowIso();
+    this.enforceBlobByteQuotas(blob.created_by, additionalBytes, completedAt);
+
     blob.data_base64 = joined.toString("base64");
     blob.size_bytes = joined.byteLength;
     blob.hash = `sha256:${createHash("sha256").update(joined).digest("hex")}`;
     blob.status = "complete";
-    blob.completed_at = nowIso();
+    blob.completed_at = completedAt;
+    blob.quota_accounted_bytes = Math.max(accountedBytes, joined.byteLength);
+    this.trackBlobByteQuotas(blob.created_by, additionalBytes, completedAt);
 
     this.persistAndAudit("blob.complete", {
       blob_id: blobId,
@@ -5565,6 +7061,101 @@ export class LoomStore {
     return token;
   }
 
+  validateCapabilityForThreadRead({ thread, actorIdentity, capabilityTokenValue, strict = true }) {
+    const normalizedActor = this.normalizeIdentityReference(actorIdentity);
+    if (!normalizedActor) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Authentication required for thread read", 403, {
+        field: "authorization"
+      });
+    }
+
+    if (this.isActiveParticipant(thread, normalizedActor)) {
+      return null;
+    }
+
+    const normalizedCapabilityTokenValue = String(capabilityTokenValue || "").trim();
+    if (!normalizedCapabilityTokenValue) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Capability read token required for non-participant thread access", 403, {
+        thread_id: thread.id,
+        actor: normalizedActor
+      });
+    }
+
+    const token = this.resolveCapabilityTokenByPresentation({
+      capabilityTokenValue: normalizedCapabilityTokenValue
+    });
+
+    if (!token) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Capability token invalid", 403, {
+        thread_id: thread.id,
+        actor: normalizedActor
+      });
+    }
+
+    if (token.thread_id !== thread.id) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Capability token thread scope mismatch", 403, {
+        capability_token: token.id,
+        thread_id: thread.id
+      });
+    }
+
+    if (token.issued_to !== normalizedActor) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Capability token issued to different identity", 403, {
+        capability_token: token.id,
+        actor: normalizedActor
+      });
+    }
+
+    if (token.revoked || token.spent || isExpiredIso(token.expires_at)) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Capability token not usable", 403, {
+        capability_token: token.id
+      });
+    }
+
+    if (token.epoch !== thread.cap_epoch) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Capability token epoch mismatch", 403, {
+        capability_token: token.id,
+        token_epoch: token.epoch,
+        thread_epoch: thread.cap_epoch
+      });
+    }
+
+    const grantSet = new Set(token.grants);
+    if (!grantSet.has("admin") && !grantSet.has("read")) {
+      if (!strict) {
+        return null;
+      }
+      throw new LoomError("CAPABILITY_DENIED", "Capability token grant missing for read operation", 403, {
+        capability_token: token.id,
+        required_grant: "read"
+      });
+    }
+
+    token.secret_last_used_at = nowIso();
+    return token;
+  }
+
   resolveDelegationRequiredActions(envelope) {
     const type = String(envelope?.type || "").trim();
     if (!type) {
@@ -5828,6 +7419,64 @@ export class LoomStore {
     };
   }
 
+  resolveEnvelopeSignaturePublicKey(envelope, signatureKeyId, context = {}) {
+    const normalizedSignatureKeyId = String(signatureKeyId || "").trim();
+    const normalizedFromKeyId = String(envelope?.from?.key_id || "").trim();
+    if (!normalizedFromKeyId || normalizedFromKeyId !== normalizedSignatureKeyId) {
+      throw new LoomError("SIGNATURE_INVALID", "from.key_id must match signature.key_id", 401, {
+        field: "from.key_id"
+      });
+    }
+
+    const fromIdentity = this.normalizeIdentityReference(envelope?.from?.identity);
+    if (!fromIdentity) {
+      throw new LoomError("SIGNATURE_INVALID", "Envelope sender identity is missing", 401, {
+        field: "from.identity"
+      });
+    }
+
+    if (fromIdentity.startsWith("bridge://")) {
+      if (normalizedSignatureKeyId !== this.systemSigningKeyId) {
+        throw new LoomError("SIGNATURE_INVALID", "Bridge identities must be signed by system signing key", 401, {
+          field: "signature.key_id",
+          identity: fromIdentity
+        });
+      }
+      const systemPublicKey = this.resolvePublicKey(this.systemSigningKeyId);
+      if (!systemPublicKey) {
+        throw new LoomError("SIGNATURE_INVALID", "System signing key is not available for verification", 401, {
+          field: "signature.key_id"
+        });
+      }
+      return systemPublicKey;
+    }
+
+    if (context.allowSystemSignatureOverride === true && normalizedSignatureKeyId === this.systemSigningKeyId) {
+      const systemPublicKey = this.resolvePublicKey(this.systemSigningKeyId);
+      if (!systemPublicKey) {
+        throw new LoomError("SIGNATURE_INVALID", "System signing key is not available for verification", 401, {
+          field: "signature.key_id"
+        });
+      }
+      return systemPublicKey;
+    }
+
+    const identityPublicKey = this.resolveIdentitySigningPublicKey(fromIdentity, normalizedSignatureKeyId);
+    if (!identityPublicKey) {
+      throw new LoomError(
+        "SIGNATURE_INVALID",
+        `Signing key is not registered for envelope sender identity: ${normalizedSignatureKeyId}`,
+        401,
+        {
+          field: "signature.key_id",
+          identity: fromIdentity
+        }
+      );
+    }
+
+    return identityPublicKey;
+  }
+
   ingestEnvelope(envelope, context = {}) {
     validateEnvelopeOrThrow(envelope);
 
@@ -5839,13 +7488,19 @@ export class LoomStore {
       });
     }
 
+    this.enforceThreadRecipientFanout(envelope);
+
     if (this.envelopesById.has(envelope.id)) {
       throw new LoomError("ENVELOPE_DUPLICATE", `Envelope already exists: ${envelope.id}`, 409, {
         envelope_id: envelope.id
       });
     }
 
-    verifyEnvelopeSignature(envelope, (keyId) => this.resolvePublicKey(keyId));
+    this.enforceEnvelopeDailyQuota(actorIdentity, envelope.created_at);
+
+    verifyEnvelopeSignature(envelope, (keyId, signedEnvelope) =>
+      this.resolveEnvelopeSignaturePublicKey(signedEnvelope, keyId, context)
+    );
 
     if (envelope.from?.type === "agent") {
       const contextRequiredActions = Array.isArray(context.requiredActions)
@@ -5995,6 +7650,7 @@ export class LoomStore {
 
     const resolvedPendingParents = this.resolvePendingParentsForThread(thread, storedEnvelope.id);
     const deliveryWrappers = this.ensureDeliveryWrappersForEnvelope(storedEnvelope);
+    this.trackEnvelopeDailyQuota(storedEnvelope.from?.identity, storedEnvelope.created_at);
 
     this.persistAndAudit("envelope.ingest", {
       envelope_id: storedEnvelope.id,
@@ -6019,9 +7675,39 @@ export class LoomStore {
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
 
+  listThreadsForIdentity(actorIdentity) {
+    const normalizedActor = this.normalizeIdentityReference(actorIdentity);
+    if (!normalizedActor) {
+      throw new LoomError("CAPABILITY_DENIED", "Authentication required to list threads", 403, {
+        field: "authorization"
+      });
+    }
+
+    return Array.from(this.threadsById.values())
+      .filter((thread) => this.isActiveParticipant(thread, normalizedActor))
+      .map((thread) => toThreadSummary(thread))
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }
+
   getThread(threadId) {
     const thread = this.threadsById.get(threadId);
     return thread ? toThreadSummary(thread) : null;
+  }
+
+  getThreadForIdentity(threadId, actorIdentity, options = {}) {
+    const thread = this.threadsById.get(threadId);
+    if (!thread) {
+      return null;
+    }
+
+    this.validateCapabilityForThreadRead({
+      thread,
+      actorIdentity,
+      capabilityTokenValue: options.capabilityTokenValue ?? null,
+      strict: true
+    });
+
+    return toThreadSummary(thread);
   }
 
   getThreadEnvelopes(threadId) {
@@ -6140,14 +7826,17 @@ export class LoomStore {
       api_url: `https://${domain}/v1`,
       websocket_url: `wss://${domain}/ws`,
       deliver_url: `https://${domain}/v1/federation/deliver`,
+      identity_resolve_url: `https://${domain}/v1/identity/{identity}`,
       federation: {
         signing_key_id: this.federationSigningKeyId,
         public_key_pem: federationPublicKeyPem,
         signing_keys: federationSigningKeys,
         outbox_url: `https://${domain}/v1/federation/outbox`,
-        challenge_url: `https://${domain}/v1/federation/challenge`
+        challenge_url: `https://${domain}/v1/federation/challenge`,
+        identity_resolve_url: `https://${domain}/v1/identity/{identity}`
       },
       auth_endpoints: {
+        identity_challenge: `https://${domain}/v1/identity/challenge`,
         challenge: `https://${domain}/v1/auth/challenge`,
         token: `https://${domain}/v1/auth/token`,
         refresh: `https://${domain}/v1/auth/refresh`
@@ -6158,6 +7847,46 @@ export class LoomStore {
       },
       generated_at: nowIso(),
       request_id: randomUUID()
+    };
+  }
+
+  getIdentityDocument(identityUri) {
+    const identity = this.resolveIdentity(identityUri);
+    if (!identity) {
+      return null;
+    }
+
+    const payload = {
+      ...identity,
+      signing_keys: normalizeIdentitySigningKeys(identity.signing_keys)
+    };
+
+    if (identity.imported_remote === true || identity.identity_source === "remote") {
+      return payload;
+    }
+
+    if (!this.federationSigningPrivateKeyPem) {
+      return payload;
+    }
+
+    const canonicalIdentity = buildIdentityRegistrationDocument({
+      identity: payload.id,
+      type: payload.type || "human",
+      displayName: payload.display_name || payload.id,
+      signingKeys: payload.signing_keys
+    });
+    const nodeSignature = signUtf8Message(
+      this.federationSigningPrivateKeyPem,
+      canonicalizeJson(canonicalIdentity)
+    );
+
+    return {
+      ...payload,
+      node_signature: {
+        algorithm: "Ed25519",
+        key_id: this.federationSigningKeyId,
+        value: nodeSignature
+      }
     };
   }
 }

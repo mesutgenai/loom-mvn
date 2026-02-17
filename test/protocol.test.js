@@ -104,6 +104,14 @@ test("canonical JSON uses deterministic member ordering and rejects unsupported 
       }),
     /undefined/
   );
+
+  assert.throws(
+    () =>
+      canonicalizeJson({
+        bad: "broken-\uD800"
+      }),
+    /unpaired surrogate/
+  );
 });
 
 test("signed envelope verifies; tampered envelope fails verification", () => {
@@ -453,6 +461,87 @@ test("store rejects envelope submission when actor identity mismatches envelope 
   );
 });
 
+test("store rejects envelope signed by key not in sender identity keyset", () => {
+  const aliceKeys = generateSigningKeyPair();
+  const attackerKeys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: aliceKeys.publicKeyPem }]
+  });
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FK0",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FK1",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_attacker_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:29:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "forged", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    attackerKeys.privateKeyPem,
+    "k_sign_attacker_1"
+  );
+
+  assert.throws(() => store.ingestEnvelope(envelope), (error) => error?.code === "SIGNATURE_INVALID");
+});
+
+test("store rejects envelope when from.key_id and signature.key_id differ", () => {
+  const keys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: keys.publicKeyPem }]
+  });
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FK2",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FK3",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:29:30Z",
+      priority: "normal",
+      content: {
+        human: { text: "mismatch", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_other_1"
+  );
+
+  assert.throws(() => store.ingestEnvelope(envelope), (error) => error?.code === "SIGNATURE_INVALID");
+});
+
 test("agent envelope with valid delegation chain is accepted", () => {
   const ownerKeys = generateSigningKeyPair();
   const agentKeys = generateSigningKeyPair();
@@ -519,6 +608,97 @@ test("agent envelope with valid delegation chain is accepted", () => {
 
   const stored = store.ingestEnvelope(envelope);
   assert.equal(stored.id, envelope.id);
+});
+
+test("agent envelope fails when delegation chain exceeds max_sub_delegation_depth", () => {
+  const ownerKeys = generateSigningKeyPair();
+  const delegateKeys = generateSigningKeyPair();
+  const agentKeys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://owner@node.test",
+    display_name: "Owner",
+    signing_keys: [{ key_id: "k_sign_owner_1", public_key_pem: ownerKeys.publicKeyPem }]
+  });
+
+  store.registerIdentity({
+    id: "loom://delegate@node.test",
+    type: "agent",
+    display_name: "Delegate",
+    signing_keys: [{ key_id: "k_sign_delegate_1", public_key_pem: delegateKeys.publicKeyPem }]
+  });
+
+  store.registerIdentity({
+    id: "loom://assistant.owner@node.test",
+    type: "agent",
+    display_name: "Assistant",
+    signing_keys: [{ key_id: "k_sign_agent_1", public_key_pem: agentKeys.publicKeyPem }]
+  });
+
+  const firstLinkUnsigned = {
+    id: "dlg_01ARZ3NDEKTSV4RRFFQ69G5FD0",
+    delegator: "loom://owner@node.test",
+    delegate: "loom://delegate@node.test",
+    scope: ["message.general@v1"],
+    created_at: "2026-02-16T20:30:00Z",
+    expires_at: "2027-02-16T20:30:00Z",
+    revocable: true,
+    allow_sub_delegation: true,
+    max_sub_delegation_depth: 0,
+    key_id: "k_sign_owner_1"
+  };
+  const firstLink = {
+    ...firstLinkUnsigned,
+    signature: signUtf8Message(ownerKeys.privateKeyPem, canonicalizeDelegationLink(firstLinkUnsigned))
+  };
+
+  const secondLinkUnsigned = {
+    id: "dlg_01ARZ3NDEKTSV4RRFFQ69G5FD1",
+    delegator: "loom://delegate@node.test",
+    delegate: "loom://assistant.owner@node.test",
+    scope: ["message.general@v1"],
+    created_at: "2026-02-16T20:30:10Z",
+    expires_at: "2027-02-16T20:30:10Z",
+    revocable: true,
+    allow_sub_delegation: false,
+    max_sub_delegation_depth: 0,
+    key_id: "k_sign_delegate_1"
+  };
+  const secondLink = {
+    ...secondLinkUnsigned,
+    signature: signUtf8Message(delegateKeys.privateKeyPem, canonicalizeDelegationLink(secondLinkUnsigned))
+  };
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FE9",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FF0",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://assistant.owner@node.test",
+        display: "Assistant",
+        key_id: "k_sign_agent_1",
+        type: "agent",
+        delegation_chain: [firstLink, secondLink]
+      },
+      to: [{ identity: "loom://target@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:31:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "Too deep", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    agentKeys.privateKeyPem,
+    "k_sign_agent_1"
+  );
+
+  assert.throws(() => store.ingestEnvelope(envelope), (error) => error?.code === "DELEGATION_INVALID");
 });
 
 test("agent envelope fails when delegation is revoked", () => {

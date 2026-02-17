@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
+import { connect as connectHttp2 } from "node:http2";
+import { readFileSync } from "node:fs";
 
 import { createLoomServer } from "../src/node/server.js";
 import {
@@ -10,7 +12,11 @@ import {
   signUtf8Message,
   verifyUtf8MessageSignature
 } from "../src/protocol/crypto.js";
+import { canonicalizeJson } from "../src/protocol/canonical.js";
 import { canonicalizeDelegationLink } from "../src/protocol/delegation.js";
+
+const TEST_TLS_KEY_PEM = readFileSync(new URL("./fixtures/wire_tls_key.pem", import.meta.url), "utf-8");
+const TEST_TLS_CERT_PEM = readFileSync(new URL("./fixtures/wire_tls_cert.pem", import.meta.url), "utf-8");
 
 async function jsonRequest(url, options = {}) {
   const response = await fetch(url, {
@@ -31,6 +37,81 @@ async function textRequest(url, options = {}) {
   return { response, body };
 }
 
+function buildIdentityRegistrationProof({
+  challengeId,
+  identity,
+  keyId,
+  nonce,
+  signingKeys,
+  privateKeyPem,
+  type = "human",
+  displayName = null
+}) {
+  const normalizedSigningKeys = [...signingKeys]
+    .map((key) => ({
+      key_id: String(key?.key_id || "").trim(),
+      public_key_pem: String(key?.public_key_pem || "").trim()
+    }))
+    .sort((left, right) => left.key_id.localeCompare(right.key_id));
+  const registrationDocument = {
+    loom: "1.1",
+    id: identity,
+    type,
+    display_name: displayName || identity,
+    signing_keys: normalizedSigningKeys
+  };
+  const documentHash = createHash("sha256")
+    .update(canonicalizeJson(registrationDocument), "utf-8")
+    .digest("hex");
+  const message = [
+    "loom.identity.register.v1",
+    identity,
+    keyId,
+    documentHash,
+    nonce
+  ].join("\n");
+
+  return {
+    challenge_id: challengeId,
+    key_id: keyId,
+    signature: signUtf8Message(privateKeyPem, message)
+  };
+}
+
+function buildNodeSignedIdentityDocument({
+  identity,
+  signingKeys,
+  nodeKeyId,
+  nodePrivateKeyPem,
+  type = "human",
+  displayName = null
+}) {
+  const normalizedSigningKeys = [...(signingKeys || [])]
+    .map((key) => ({
+      key_id: String(key?.key_id || "").trim(),
+      public_key_pem: String(key?.public_key_pem || "").trim()
+    }))
+    .sort((left, right) => left.key_id.localeCompare(right.key_id));
+
+  const identityDocument = {
+    loom: "1.1",
+    id: identity,
+    type,
+    display_name: displayName || identity,
+    signing_keys: normalizedSigningKeys
+  };
+  const signature = signUtf8Message(nodePrivateKeyPem, canonicalizeJson(identityDocument));
+
+  return {
+    ...identityDocument,
+    node_signature: {
+      algorithm: "Ed25519",
+      key_id: nodeKeyId,
+      value: signature
+    }
+  };
+}
+
 test("API serves LOOM live dashboard at root path", async (t) => {
   const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -43,6 +124,90 @@ test("API serves LOOM live dashboard at root path", async (t) => {
   assert.equal(page.response.status, 200);
   assert.match(page.response.headers.get("content-type") || "", /text\/html/i);
   assert.match(page.body, /LOOM Live Console/);
+});
+
+test("API can serve over native TLS HTTP/2", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    nativeTlsEnabled: true,
+    nativeTlsKeyPem: TEST_TLS_KEY_PEM,
+    nativeTlsCertPem: TEST_TLS_CERT_PEM
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const client = connectHttp2(`https://127.0.0.1:${address.port}`, {
+    rejectUnauthorized: false
+  });
+  t.after(() => {
+    client.close();
+  });
+
+  const response = await new Promise((resolve, reject) => {
+    const request = client.request({
+      ":method": "GET",
+      ":path": "/health"
+    });
+    let headers = null;
+    let body = "";
+    request.setEncoding("utf-8");
+    request.on("response", (value) => {
+      headers = value;
+    });
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("error", reject);
+    request.on("end", () => {
+      resolve({
+        headers,
+        body
+      });
+    });
+    request.end();
+  });
+
+  assert.equal(response.headers[":status"], 200);
+  const parsedBody = JSON.parse(response.body);
+  assert.equal(parsedBody.ok, true);
+  assert.equal(parsedBody.service, "loom-mvn");
+});
+
+test("API node document advertises identity resolve URL", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const aliceKeys = generateSigningKeyPair();
+
+  const nodeDocument = await jsonRequest(`${baseUrl}/.well-known/loom.json`);
+  assert.equal(nodeDocument.response.status, 200);
+  assert.equal(nodeDocument.body.identity_resolve_url, "https://127.0.0.1/v1/identity/{identity}");
+  assert.equal(
+    nodeDocument.body?.federation?.identity_resolve_url,
+    "https://127.0.0.1/v1/identity/{identity}"
+  );
+
+  const registerAlice = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_node_doc_1", public_key_pem: aliceKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAlice.response.status, 201);
+
+  const identity = await jsonRequest(`${baseUrl}/v1/identity/${encodeURIComponent("loom://alice@node.test")}`);
+  assert.equal(identity.response.status, 200);
+  assert.equal(identity.body.id, "loom://alice@node.test");
+  assert.equal(identity.body.node_signature?.algorithm, "Ed25519");
+  assert.equal(identity.body.node_signature?.key_id, "k_node_sign_local_1");
+  assert.equal(typeof identity.body.node_signature?.value, "string");
 });
 
 test("API rejects request bodies larger than configured max", async (t) => {
@@ -112,6 +277,350 @@ test("API can disable public identity signup", async (t) => {
   });
   assert.equal(allowed.response.status, 201);
   assert.equal(allowed.body.id, payload.id);
+});
+
+test("API enforces local-domain identity registration and gated remote imports", async (t) => {
+  const keys = generateSigningKeyPair();
+  const remoteKeys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const localIdentity = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_local_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(localIdentity.response.status, 201);
+
+  const remoteDenied = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@remote.test",
+      display_name: "Remote Alice",
+      signing_keys: [{ key_id: "k_sign_remote_import_1", public_key_pem: remoteKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(remoteDenied.response.status, 403);
+  assert.equal(remoteDenied.body.error.code, "CAPABILITY_DENIED");
+
+  const remoteAllowed = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    },
+    body: JSON.stringify({
+      id: "loom://alice@remote.test",
+      imported_remote: true,
+      display_name: "Remote Alice",
+      signing_keys: [{ key_id: "k_sign_remote_import_1", public_key_pem: remoteKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(remoteAllowed.response.status, 201);
+  assert.equal(remoteAllowed.body.id, "loom://alice@remote.test");
+});
+
+test("API rejects reserved/system signing key ids during identity registration", async (t) => {
+  const keys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const reserved = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_system_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(reserved.response.status, 400);
+  assert.equal(reserved.body.error.code, "ENVELOPE_INVALID");
+});
+
+test("API rejects cross-identity key_id reuse during identity registration", async (t) => {
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const alice = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_shared_1", public_key_pem: aliceKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(alice.response.status, 201);
+
+  const bob = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://bob@node.test",
+      display_name: "Bob",
+      signing_keys: [{ key_id: "k_sign_shared_1", public_key_pem: bobKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(bob.response.status, 400);
+  assert.equal(bob.body.error.code, "ENVELOPE_INVALID");
+});
+
+test("API can require proof-of-key for identity registration", async (t) => {
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    identityRequireProof: true
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/identity/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_proof_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200, JSON.stringify(challenge.body));
+
+  const missingProof = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_proof_1", public_key_pem: aliceKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(missingProof.response.status, 401);
+  assert.equal(missingProof.body.error.code, "SIGNATURE_INVALID");
+
+  const badProof = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_proof_1", public_key_pem: aliceKeys.publicKeyPem }],
+      registration_proof: {
+        challenge_id: challenge.body.challenge_id,
+        key_id: "k_sign_alice_proof_1",
+        signature: signUtf8Message(aliceKeys.privateKeyPem, "wrong-message")
+      }
+    })
+  });
+  assert.equal(badProof.response.status, 401);
+  assert.equal(badProof.body.error.code, "SIGNATURE_INVALID");
+
+  const goodProof = buildIdentityRegistrationProof({
+    challengeId: challenge.body.challenge_id,
+    identity: "loom://alice@node.test",
+    keyId: "k_sign_alice_proof_1",
+    nonce: challenge.body.nonce,
+    signingKeys: [{ key_id: "k_sign_alice_proof_1", public_key_pem: aliceKeys.publicKeyPem }],
+    privateKeyPem: aliceKeys.privateKeyPem,
+    displayName: "Alice"
+  });
+  const registered = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_proof_1", public_key_pem: aliceKeys.publicKeyPem }],
+      registration_proof: goodProof
+    })
+  });
+  assert.equal(registered.response.status, 201, JSON.stringify(registered.body));
+
+  const reusedProof = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://bob@node.test",
+      display_name: "Bob",
+      signing_keys: [{ key_id: "k_sign_bob_proof_1", public_key_pem: bobKeys.publicKeyPem }],
+      registration_proof: {
+        ...goodProof,
+        key_id: "k_sign_bob_proof_1"
+      }
+    })
+  });
+  assert.equal(reusedProof.response.status, 401);
+  assert.equal(reusedProof.body.error.code, "SIGNATURE_INVALID");
+});
+
+test("API supports owner-authenticated identity key rotation and blocks non-owner updates", async (t) => {
+  const aliceKey1 = generateSigningKeyPair();
+  const aliceKey2 = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const registerAlice = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_rotate_1", public_key_pem: aliceKey1.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAlice.response.status, 201);
+
+  const registerBob = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://bob@node.test",
+      display_name: "Bob",
+      signing_keys: [{ key_id: "k_sign_bob_rotate_1", public_key_pem: bobKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerBob.response.status, 201);
+
+  const challengeAlice = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_rotate_1"
+    })
+  });
+  assert.equal(challengeAlice.response.status, 200);
+
+  const tokenAlice = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_rotate_1",
+      challenge_id: challengeAlice.body.challenge_id,
+      signature: signUtf8Message(aliceKey1.privateKeyPem, challengeAlice.body.nonce)
+    })
+  });
+  assert.equal(tokenAlice.response.status, 200);
+
+  const challengeBob = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://bob@node.test",
+      key_id: "k_sign_bob_rotate_1"
+    })
+  });
+  assert.equal(challengeBob.response.status, 200);
+
+  const tokenBob = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://bob@node.test",
+      key_id: "k_sign_bob_rotate_1",
+      challenge_id: challengeBob.body.challenge_id,
+      signature: signUtf8Message(bobKeys.privateKeyPem, challengeBob.body.nonce)
+    })
+  });
+  assert.equal(tokenBob.response.status, 200);
+
+  const deniedPatch = await jsonRequest(`${baseUrl}/v1/identity/${encodeURIComponent("loom://alice@node.test")}`, {
+    method: "PATCH",
+    headers: {
+      authorization: `Bearer ${tokenBob.body.access_token}`
+    },
+    body: JSON.stringify({
+      display_name: "Not Allowed"
+    })
+  });
+  assert.equal(deniedPatch.response.status, 403);
+  assert.equal(deniedPatch.body.error.code, "CAPABILITY_DENIED");
+
+  const rotated = await jsonRequest(`${baseUrl}/v1/identity/${encodeURIComponent("loom://alice@node.test")}`, {
+    method: "PATCH",
+    headers: {
+      authorization: `Bearer ${tokenAlice.body.access_token}`
+    },
+    body: JSON.stringify({
+      display_name: "Alice Rotated",
+      signing_keys: [
+        { key_id: "k_sign_alice_rotate_1", public_key_pem: aliceKey1.publicKeyPem },
+        { key_id: "k_sign_alice_rotate_2", public_key_pem: aliceKey2.publicKeyPem }
+      ]
+    })
+  });
+  assert.equal(rotated.response.status, 200, JSON.stringify(rotated.body));
+  assert.equal(rotated.body.display_name, "Alice Rotated");
+  assert.equal(rotated.body.signing_keys.length, 2);
+
+  const challengeWithNewKey = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_rotate_2"
+    })
+  });
+  assert.equal(challengeWithNewKey.response.status, 200);
+});
+
+test("API blocks auth challenge for imported remote identities", async (t) => {
+  const remoteKeys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const imported = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    },
+    body: JSON.stringify({
+      id: "loom://alice@remote.test",
+      imported_remote: true,
+      display_name: "Remote Alice",
+      signing_keys: [{ key_id: "k_sign_remote_auth_block_1", public_key_pem: remoteKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(imported.response.status, 201);
+
+  const remoteChallenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@remote.test",
+      key_id: "k_sign_remote_auth_block_1"
+    })
+  });
+  assert.equal(remoteChallenge.response.status, 403);
+  assert.equal(remoteChallenge.body.error.code, "CAPABILITY_DENIED");
 });
 
 test("API can disable bridge and gateway send routes", async (t) => {
@@ -203,6 +712,281 @@ test("API enforces rate limit on sensitive auth routes", async (t) => {
   assert.equal(third.response.status, 429);
   assert.equal(third.body.error.code, "RATE_LIMIT_EXCEEDED");
   assert.equal(third.body.error.details.scope, "sensitive");
+});
+
+test("API enforces per-identity rate limit in addition to per-IP limits", async (t) => {
+  const keys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    rateLimitWindowMs: 60_000,
+    rateLimitDefaultMax: 10_000,
+    rateLimitSensitiveMax: 10_000,
+    identityRateWindowMs: 60_000,
+    identityRateDefaultMax: 2,
+    identityRateSensitiveMax: 2
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_idrl_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_idrl_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_idrl_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const first = await jsonRequest(`${baseUrl}/v1/threads`, {
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    }
+  });
+  assert.equal(first.response.status, 200);
+
+  const second = await jsonRequest(`${baseUrl}/v1/threads`, {
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    }
+  });
+  assert.equal(second.response.status, 200);
+
+  const third = await jsonRequest(`${baseUrl}/v1/threads`, {
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    }
+  });
+  assert.equal(third.response.status, 429);
+  assert.equal(third.body.error.code, "RATE_LIMIT_EXCEEDED");
+  assert.equal(third.body.error.details.scope, "identity:default");
+});
+
+test("API enforces per-identity daily envelope quota", async (t) => {
+  const keys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    envelopeDailyMax: 1
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_quota_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_quota_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_quota_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const firstEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G6Q10",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G6Q11",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_quota_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T21:00:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "first", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_quota_1"
+  );
+
+  const firstSend = await jsonRequest(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify(firstEnvelope)
+  });
+  assert.equal(firstSend.response.status, 201);
+
+  const secondEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G6Q12",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G6Q13",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_quota_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://carol@node.test", role: "primary" }],
+      created_at: "2026-02-16T21:01:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "second", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_quota_1"
+  );
+
+  const secondSend = await jsonRequest(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify(secondEnvelope)
+  });
+  assert.equal(secondSend.response.status, 429);
+  assert.equal(secondSend.body.error.code, "RATE_LIMIT_EXCEEDED");
+  assert.equal(secondSend.body.error.details.scope, "identity:envelope_daily");
+});
+
+test("API enforces thread recipient fanout cap", async (t) => {
+  const keys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    threadRecipientFanoutMax: 1
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_fanout_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_fanout_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_fanout_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G6Q14",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G6Q15",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_fanout_1",
+        type: "human"
+      },
+      to: [
+        { identity: "loom://bob@node.test", role: "primary" },
+        { identity: "loom://carol@node.test", role: "cc" }
+      ],
+      created_at: "2026-02-16T21:10:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "fanout", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_fanout_1"
+  );
+
+  const send = await jsonRequest(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify(envelope)
+  });
+  assert.equal(send.response.status, 413);
+  assert.equal(send.body.error.code, "PAYLOAD_TOO_LARGE");
 });
 
 test("API does not trust x-forwarded-for for rate limit buckets by default", async (t) => {
@@ -592,9 +1376,110 @@ test("API enforces auth for envelope submission and supports proof-of-key login"
 
   assert.equal(opResponse.response.status, 201);
 
-  const threadResponse = await jsonRequest(`${baseUrl}/v1/threads/${envelope.thread_id}`);
+  const threadResponse = await jsonRequest(`${baseUrl}/v1/threads/${envelope.thread_id}`, {
+    headers: {
+      authorization: `Bearer ${tokenResult.body.access_token}`
+    }
+  });
   assert.equal(threadResponse.response.status, 200);
   assert.equal(threadResponse.body.state, "resolved");
+});
+
+test("API requires authentication for thread and envelope reads by default", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+
+  const registerAlice = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_read_1", public_key_pem: aliceKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAlice.response.status, 201);
+
+  const registerBob = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://bob@node.test",
+      display_name: "Bob",
+      signing_keys: [{ key_id: "k_sign_bob_read_1", public_key_pem: bobKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerBob.response.status, 201);
+
+  const challengeAlice = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_read_1"
+    })
+  });
+  assert.equal(challengeAlice.response.status, 200);
+
+  const tokenAlice = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_read_1",
+      challenge_id: challengeAlice.body.challenge_id,
+      signature: signUtf8Message(aliceKeys.privateKeyPem, challengeAlice.body.nonce)
+    })
+  });
+  assert.equal(tokenAlice.response.status, 200);
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5R11",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5R12",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_read_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:25:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "private read route", format: "markdown" },
+        structured: {
+          intent: "message.general@v1",
+          parameters: {}
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    aliceKeys.privateKeyPem,
+    "k_sign_alice_read_1"
+  );
+
+  const sendEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${tokenAlice.body.access_token}`
+    },
+    body: JSON.stringify(envelope)
+  });
+  assert.equal(sendEnvelope.response.status, 201, JSON.stringify(sendEnvelope.body));
+
+  const unauthEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${envelope.id}`);
+  assert.equal(unauthEnvelope.response.status, 401);
+
+  const unauthThread = await jsonRequest(`${baseUrl}/v1/threads/${envelope.thread_id}`);
+  assert.equal(unauthThread.response.status, 401);
 });
 
 test("API supports delegation create/list/revoke for authenticated delegator", async (t) => {
@@ -901,8 +1786,339 @@ test("API enforces blob part size and count limits", async (t) => {
   assert.equal(secondPart.body.error.code, "PAYLOAD_TOO_LARGE");
 });
 
+test("API enforces per-identity blob daily count quota", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    blobDailyCountMax: 1,
+    blobIdentityTotalBytesMax: 4
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const keys = generateSigningKeyPair();
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_blob_quota_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_quota_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_quota_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const createBlob = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "quota.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(createBlob.response.status, 201);
+  const blobId = createBlob.body.blob_id;
+
+  const firstCreate = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "count-limit.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(firstCreate.response.status, 429);
+  assert.equal(firstCreate.body.error.code, "RATE_LIMIT_EXCEEDED");
+  assert.equal(firstCreate.body.error.details.scope, "identity:blob_daily_count");
+
+  const firstPart = await jsonRequest(`${baseUrl}/v1/blobs/${blobId}/parts/1`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("abcd", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(firstPart.response.status, 200);
+
+  const firstComplete = await jsonRequest(`${baseUrl}/v1/blobs/${blobId}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(firstComplete.response.status, 200);
+
+  const secondBlob = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "total-limit.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(secondBlob.response.status, 429);
+  assert.equal(secondBlob.body.error.details.scope, "identity:blob_daily_count");
+});
+
+test("API enforces per-identity daily blob byte quota on complete", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    blobDailyCountMax: 10,
+    blobDailyBytesMax: 4,
+    blobIdentityTotalBytesMax: 100
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const keys = generateSigningKeyPair();
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_blob_quota_3", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_quota_3"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_quota_3",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const firstBlob = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "first-daily-bytes.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(firstBlob.response.status, 201);
+
+  const firstPart = await jsonRequest(`${baseUrl}/v1/blobs/${firstBlob.body.blob_id}/parts/1`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("abcd", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(firstPart.response.status, 200);
+
+  const firstComplete = await jsonRequest(`${baseUrl}/v1/blobs/${firstBlob.body.blob_id}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(firstComplete.response.status, 200);
+
+  const secondBlob = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "second-daily-bytes.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(secondBlob.response.status, 201);
+
+  const secondPart = await jsonRequest(`${baseUrl}/v1/blobs/${secondBlob.body.blob_id}/parts/1`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("a", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(secondPart.response.status, 200);
+
+  const secondComplete = await jsonRequest(`${baseUrl}/v1/blobs/${secondBlob.body.blob_id}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(secondComplete.response.status, 429);
+  assert.equal(secondComplete.body.error.code, "RATE_LIMIT_EXCEEDED");
+  assert.equal(secondComplete.body.error.details.scope, "identity:blob_daily_bytes");
+});
+
+test("API enforces per-identity total blob byte quota on complete", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    blobDailyCountMax: 10,
+    blobIdentityTotalBytesMax: 4
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const keys = generateSigningKeyPair();
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_blob_quota_2", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_quota_2"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_quota_2",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const firstBlob = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "first.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(firstBlob.response.status, 201);
+
+  const firstPart = await jsonRequest(`${baseUrl}/v1/blobs/${firstBlob.body.blob_id}/parts/1`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("abcd", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(firstPart.response.status, 200);
+
+  const firstComplete = await jsonRequest(`${baseUrl}/v1/blobs/${firstBlob.body.blob_id}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(firstComplete.response.status, 200);
+
+  const secondBlob = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "second.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(secondBlob.response.status, 201);
+
+  const secondPart = await jsonRequest(`${baseUrl}/v1/blobs/${secondBlob.body.blob_id}/parts/1`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("a", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(secondPart.response.status, 200);
+
+  const secondComplete = await jsonRequest(`${baseUrl}/v1/blobs/${secondBlob.body.blob_id}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(secondComplete.response.status, 429);
+  assert.equal(secondComplete.body.error.code, "RATE_LIMIT_EXCEEDED");
+  assert.equal(secondComplete.body.error.details.scope, "identity:blob_total_bytes");
+});
+
 test("API accepts signed federation delivery from trusted node", async (t) => {
-  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  const { server, store } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
 
@@ -928,6 +2144,8 @@ test("API accepts signed federation delivery from trusted node", async (t) => {
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -1032,9 +2250,647 @@ test("API accepts signed federation delivery from trusted node", async (t) => {
   assert.equal(deliver.response.status, 202, JSON.stringify(deliver.body));
   assert.equal(deliver.body.accepted_count, 1);
 
-  const getEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${remoteEnvelope.id}`);
-  assert.equal(getEnvelope.response.status, 200);
-  assert.equal(getEnvelope.body.id, remoteEnvelope.id);
+  const getEnvelope = store.getEnvelope(remoteEnvelope.id);
+  assert.equal(getEnvelope.id, remoteEnvelope.id);
+});
+
+test("API auto-resolves remote sender identity during federation delivery", async (t) => {
+  const { server, store } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const remoteSenderKeys = generateSigningKeyPair();
+  let identityResolveHits = 0;
+  const remoteIdentityServer = createHttpServer((req, res) => {
+    const expectedPath = `/identity/resolve?identity=${encodeURIComponent("loom://alice@remote.test")}`;
+    if (req.method === "GET" && req.url === expectedPath) {
+      identityResolveHits += 1;
+      const payload = buildNodeSignedIdentityDocument({
+        identity: "loom://alice@remote.test",
+        displayName: "Remote Alice",
+        signingKeys: [{ key_id: "k_sign_remote_alice_auto_1", public_key_pem: remoteSenderKeys.publicKeyPem }],
+        nodeKeyId: "k_node_sign_remote_auto_1",
+        nodePrivateKeyPem: remoteNodeKeys.privateKeyPem
+      });
+      const body = JSON.stringify(payload);
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body).toString()
+      });
+      res.end(body);
+      return;
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not_found" }));
+  });
+  await new Promise((resolve) => remoteIdentityServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => remoteIdentityServer.close(resolve)));
+  const remoteAddress = remoteIdentityServer.address();
+  const remoteBaseUrl = `http://127.0.0.1:${remoteAddress.port}`;
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const adminKeys = generateSigningKeyPair();
+  const remoteNodeKeys = generateSigningKeyPair();
+
+  const registerAdmin = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_auto_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAdmin.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_auto_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_auto_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const trustNode = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_id: "remote.test",
+      key_id: "k_node_sign_remote_auto_1",
+      public_key_pem: remoteNodeKeys.publicKeyPem,
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      identity_resolve_url: `${remoteBaseUrl}/identity/resolve?identity={identity}`,
+      allow_insecure_http: true,
+      allow_private_network: true
+    })
+  });
+  assert.equal(trustNode.response.status, 201, JSON.stringify(trustNode.body));
+
+  const remoteEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FHA",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FHB",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@remote.test",
+        display: "Remote Alice",
+        key_id: "k_sign_remote_alice_auto_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://team@node.test", role: "primary" }],
+      created_at: "2026-02-16T22:00:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "Auto-resolved identity", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    remoteSenderKeys.privateKeyPem,
+    "k_sign_remote_alice_auto_1"
+  );
+
+  const wrapper = {
+    loom: "1.1",
+    sender_node: "remote.test",
+    timestamp: new Date().toISOString(),
+    envelopes: [remoteEnvelope]
+  };
+  const rawBody = JSON.stringify(wrapper);
+  const timestamp = new Date().toISOString();
+  const nonce = "nonce_test_federation_auto_identity_1";
+  const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+  const canonical = `POST\n/v1/federation/deliver\n${bodyHash}\n${timestamp}\n${nonce}`;
+  const requestSignature = signUtf8Message(remoteNodeKeys.privateKeyPem, canonical);
+
+  const deliver = await jsonRequest(`${baseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: {
+      "x-loom-node": "remote.test",
+      "x-loom-timestamp": timestamp,
+      "x-loom-nonce": nonce,
+      "x-loom-key-id": "k_node_sign_remote_auto_1",
+      "x-loom-signature": requestSignature
+    },
+    body: rawBody
+  });
+  assert.equal(deliver.response.status, 202, JSON.stringify(deliver.body));
+  assert.equal(deliver.body.accepted_count, 1);
+
+  const remoteIdentity = store.resolveIdentity("loom://alice@remote.test");
+  assert.equal(remoteIdentity?.id, "loom://alice@remote.test");
+  assert.equal(remoteIdentity?.imported_remote, true);
+  assert.equal(identityResolveHits, 1);
+});
+
+test("API rejects unsigned remote identity documents during federation auto-resolve by default", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const remoteSenderKeys = generateSigningKeyPair();
+  const remoteIdentityServer = createHttpServer((req, res) => {
+    const expectedPath = `/v1/identity/${encodeURIComponent("loom://alice@remote.test")}`;
+    if (req.method === "GET" && req.url === expectedPath) {
+      const payload = {
+        id: "loom://alice@remote.test",
+        display_name: "Remote Alice",
+        signing_keys: [{ key_id: "k_sign_remote_alice_unsigned_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
+      };
+      const body = JSON.stringify(payload);
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body).toString()
+      });
+      res.end(body);
+      return;
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not_found" }));
+  });
+  await new Promise((resolve) => remoteIdentityServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => remoteIdentityServer.close(resolve)));
+  const remoteAddress = remoteIdentityServer.address();
+  const remoteBaseUrl = `http://127.0.0.1:${remoteAddress.port}`;
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const adminKeys = generateSigningKeyPair();
+  const remoteNodeKeys = generateSigningKeyPair();
+
+  await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_unsigned_identity_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_unsigned_identity_1"
+    })
+  });
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_unsigned_identity_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const trustNode = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_id: "remote.test",
+      key_id: "k_node_sign_remote_unsigned_1",
+      public_key_pem: remoteNodeKeys.publicKeyPem,
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      allow_insecure_http: true,
+      allow_private_network: true
+    })
+  });
+  assert.equal(trustNode.response.status, 201, JSON.stringify(trustNode.body));
+
+  const remoteEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FHG",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FHH",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@remote.test",
+        display: "Remote Alice",
+        key_id: "k_sign_remote_alice_unsigned_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://team@node.test", role: "primary" }],
+      created_at: "2026-02-16T22:00:30Z",
+      priority: "normal",
+      content: {
+        human: { text: "Unsigned identity document should fail", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    remoteSenderKeys.privateKeyPem,
+    "k_sign_remote_alice_unsigned_1"
+  );
+
+  const wrapper = {
+    loom: "1.1",
+    sender_node: "remote.test",
+    timestamp: new Date().toISOString(),
+    envelopes: [remoteEnvelope]
+  };
+  const rawBody = JSON.stringify(wrapper);
+  const timestamp = new Date().toISOString();
+  const nonce = "nonce_test_federation_auto_identity_unsigned_1";
+  const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+  const canonical = `POST\n/v1/federation/deliver\n${bodyHash}\n${timestamp}\n${nonce}`;
+  const requestSignature = signUtf8Message(remoteNodeKeys.privateKeyPem, canonical);
+
+  const deliver = await jsonRequest(`${baseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: {
+      "x-loom-node": "remote.test",
+      "x-loom-timestamp": timestamp,
+      "x-loom-nonce": nonce,
+      "x-loom-key-id": "k_node_sign_remote_unsigned_1",
+      "x-loom-signature": requestSignature
+    },
+    body: rawBody
+  });
+  assert.equal(deliver.response.status, 401);
+  assert.equal(deliver.body.error.code, "SIGNATURE_INVALID");
+});
+
+test("API can disable signed remote identity requirement for federation auto-resolve compatibility", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationRequireSignedRemoteIdentity: false
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const remoteSenderKeys = generateSigningKeyPair();
+  const remoteIdentityServer = createHttpServer((req, res) => {
+    const expectedPath = `/v1/identity/${encodeURIComponent("loom://alice@remote.test")}`;
+    if (req.method === "GET" && req.url === expectedPath) {
+      const payload = {
+        id: "loom://alice@remote.test",
+        display_name: "Remote Alice",
+        signing_keys: [{ key_id: "k_sign_remote_alice_compat_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
+      };
+      const body = JSON.stringify(payload);
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body).toString()
+      });
+      res.end(body);
+      return;
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not_found" }));
+  });
+  await new Promise((resolve) => remoteIdentityServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => remoteIdentityServer.close(resolve)));
+  const remoteAddress = remoteIdentityServer.address();
+  const remoteBaseUrl = `http://127.0.0.1:${remoteAddress.port}`;
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const adminKeys = generateSigningKeyPair();
+  const remoteNodeKeys = generateSigningKeyPair();
+
+  await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_compat_identity_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_compat_identity_1"
+    })
+  });
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_compat_identity_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const trustNode = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_id: "remote.test",
+      key_id: "k_node_sign_remote_compat_1",
+      public_key_pem: remoteNodeKeys.publicKeyPem,
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      allow_insecure_http: true,
+      allow_private_network: true
+    })
+  });
+  assert.equal(trustNode.response.status, 201, JSON.stringify(trustNode.body));
+
+  const remoteEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FHK",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FHM",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@remote.test",
+        display: "Remote Alice",
+        key_id: "k_sign_remote_alice_compat_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://team@node.test", role: "primary" }],
+      created_at: "2026-02-16T22:00:45Z",
+      priority: "normal",
+      content: {
+        human: { text: "Unsigned identity document accepted in compatibility mode", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    remoteSenderKeys.privateKeyPem,
+    "k_sign_remote_alice_compat_1"
+  );
+
+  const wrapper = {
+    loom: "1.1",
+    sender_node: "remote.test",
+    timestamp: new Date().toISOString(),
+    envelopes: [remoteEnvelope]
+  };
+  const rawBody = JSON.stringify(wrapper);
+  const timestamp = new Date().toISOString();
+  const nonce = "nonce_test_federation_auto_identity_compat_1";
+  const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+  const canonical = `POST\n/v1/federation/deliver\n${bodyHash}\n${timestamp}\n${nonce}`;
+  const requestSignature = signUtf8Message(remoteNodeKeys.privateKeyPem, canonical);
+
+  const deliver = await jsonRequest(`${baseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: {
+      "x-loom-node": "remote.test",
+      "x-loom-timestamp": timestamp,
+      "x-loom-nonce": nonce,
+      "x-loom-key-id": "k_node_sign_remote_compat_1",
+      "x-loom-signature": requestSignature
+    },
+    body: rawBody
+  });
+  assert.equal(deliver.response.status, 202, JSON.stringify(deliver.body));
+  assert.equal(deliver.body.accepted_count, 1);
+});
+
+test("API enforces remote identity host allowlist during federation auto-resolve", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    remoteIdentityHostAllowlist: ["identity.allowed.test"]
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const adminKeys = generateSigningKeyPair();
+  const remoteNodeKeys = generateSigningKeyPair();
+  const remoteSenderKeys = generateSigningKeyPair();
+
+  await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_auto_allowlist_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_auto_allowlist_1"
+    })
+  });
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_auto_allowlist_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const trustNode = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_id: "remote.test",
+      key_id: "k_node_sign_remote_auto_allowlist_1",
+      public_key_pem: remoteNodeKeys.publicKeyPem,
+      deliver_url: "http://127.0.0.1:34343/v1/federation/deliver",
+      identity_resolve_url: "http://127.0.0.1:34343/v1/identity/{identity}",
+      allow_insecure_http: true,
+      allow_private_network: true
+    })
+  });
+  assert.equal(trustNode.response.status, 201, JSON.stringify(trustNode.body));
+
+  const remoteEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FHE",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FHF",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@remote.test",
+        display: "Remote Alice",
+        key_id: "k_sign_remote_alice_auto_allowlist_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://team@node.test", role: "primary" }],
+      created_at: "2026-02-16T22:01:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "Auto-resolve host allowlist", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    remoteSenderKeys.privateKeyPem,
+    "k_sign_remote_alice_auto_allowlist_1"
+  );
+
+  const wrapper = {
+    loom: "1.1",
+    sender_node: "remote.test",
+    timestamp: new Date().toISOString(),
+    envelopes: [remoteEnvelope]
+  };
+  const rawBody = JSON.stringify(wrapper);
+  const timestamp = new Date().toISOString();
+  const nonce = "nonce_test_federation_auto_identity_allowlist_1";
+  const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+  const canonical = `POST\n/v1/federation/deliver\n${bodyHash}\n${timestamp}\n${nonce}`;
+  const requestSignature = signUtf8Message(remoteNodeKeys.privateKeyPem, canonical);
+
+  const deliver = await jsonRequest(`${baseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: {
+      "x-loom-node": "remote.test",
+      "x-loom-timestamp": timestamp,
+      "x-loom-nonce": nonce,
+      "x-loom-key-id": "k_node_sign_remote_auto_allowlist_1",
+      "x-loom-signature": requestSignature
+    },
+    body: rawBody
+  });
+  assert.equal(deliver.response.status, 403);
+  assert.equal(deliver.body.error.code, "CAPABILITY_DENIED");
+});
+
+test("API rejects federated envelopes whose sender identity domain mismatches sender node", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const adminKeys = generateSigningKeyPair();
+  const remoteNodeKeys = generateSigningKeyPair();
+  const remoteSenderKeys = generateSigningKeyPair();
+
+  await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_domain_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_domain_1"
+    })
+  });
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_domain_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const trustNode = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_id: "remote.test",
+      key_id: "k_node_sign_remote_domain_1",
+      public_key_pem: remoteNodeKeys.publicKeyPem
+    })
+  });
+  assert.equal(trustNode.response.status, 201);
+
+  const mismatchedEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FHC",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FHD",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@other.test",
+        display: "Remote Alice",
+        key_id: "k_sign_remote_mismatch_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://team@node.test", role: "primary" }],
+      created_at: "2026-02-16T22:02:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "mismatch domain", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    remoteSenderKeys.privateKeyPem,
+    "k_sign_remote_mismatch_1"
+  );
+
+  const wrapper = {
+    loom: "1.1",
+    sender_node: "remote.test",
+    timestamp: new Date().toISOString(),
+    envelopes: [mismatchedEnvelope]
+  };
+  const rawBody = JSON.stringify(wrapper);
+  const timestamp = new Date().toISOString();
+  const nonce = "nonce_test_federation_domain_mismatch_1";
+  const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+  const canonical = `POST\n/v1/federation/deliver\n${bodyHash}\n${timestamp}\n${nonce}`;
+  const requestSignature = signUtf8Message(remoteNodeKeys.privateKeyPem, canonical);
+
+  const deliver = await jsonRequest(`${baseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: {
+      "x-loom-node": "remote.test",
+      "x-loom-timestamp": timestamp,
+      "x-loom-nonce": nonce,
+      "x-loom-key-id": "k_node_sign_remote_domain_1",
+      "x-loom-signature": requestSignature
+    },
+    body: rawBody
+  });
+  assert.equal(deliver.response.status, 401);
+  assert.equal(deliver.body.error.code, "SIGNATURE_INVALID");
 });
 
 test("API rejects inbound federation when node policy is deny", async (t) => {
@@ -1062,6 +2918,8 @@ test("API rejects inbound federation when node policy is deny", async (t) => {
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -1157,7 +3015,7 @@ test("API rejects inbound federation when node policy is deny", async (t) => {
 });
 
 test("API marks inbound federation threads as quarantined when node policy is quarantine", async (t) => {
-  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  const { server, store } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
 
@@ -1181,6 +3039,8 @@ test("API marks inbound federation threads as quarantined when node policy is qu
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -1273,9 +3133,8 @@ test("API marks inbound federation threads as quarantined when node policy is qu
 
   assert.equal(deliver.response.status, 202);
 
-  const thread = await jsonRequest(`${baseUrl}/v1/threads/${remoteEnvelope.thread_id}`);
-  assert.equal(thread.response.status, 200);
-  assert.equal(thread.body.labels.includes("sys.quarantine"), true);
+  const thread = store.getThread(remoteEnvelope.thread_id);
+  assert.equal(thread.labels.includes("sys.quarantine"), true);
 });
 
 test("API rejects inbound federation delivery when envelope batch exceeds configured max", async (t) => {
@@ -1307,6 +3166,8 @@ test("API rejects inbound federation delivery when envelope batch exceeds config
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -1457,6 +3318,8 @@ test("API rate-limits inbound federation requests per trusted node", async (t) =
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -1604,7 +3467,7 @@ test("API rate-limits inbound federation requests per trusted node", async (t) =
 });
 
 test("API auto-quarantines federation node after repeated failed inbound verification", async (t) => {
-  const { server } = createLoomServer({
+  const { server, store } = createLoomServer({
     nodeId: "node.test",
     domain: "127.0.0.1",
     federationAbuseQuarantineThreshold: 1,
@@ -1635,6 +3498,8 @@ test("API auto-quarantines federation node after repeated failed inbound verific
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -1746,9 +3611,8 @@ test("API auto-quarantines federation node after repeated failed inbound verific
   });
   assert.equal(goodDeliver.response.status, 202, JSON.stringify(goodDeliver.body));
 
-  const thread = await jsonRequest(`${baseUrl}/v1/threads/${remoteEnvelope.thread_id}`);
-  assert.equal(thread.response.status, 200);
-  assert.equal(thread.body.labels.includes("sys.quarantine"), true);
+  const thread = store.getThread(remoteEnvelope.thread_id);
+  assert.equal(thread.labels.includes("sys.quarantine"), true);
 
   const nodes = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
     headers: {
@@ -1793,6 +3657,8 @@ test("API auto-denies federation node after repeated failed inbound verification
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -1928,7 +3794,7 @@ test("API processes outbound federation outbox and delivers to remote node", asy
   const remoteNodeSigningKeysPrimary = generateSigningKeyPair();
   const remoteNodeSigningKeysSecondary = generateSigningKeyPair();
 
-  const { server: remoteServer } = createLoomServer({
+  const { server: remoteServer, store: remoteStore } = createLoomServer({
     nodeId: "remote.test",
     domain: "127.0.0.1",
     federationSigningKeyId: "k_node_sign_remote_2",
@@ -2052,6 +3918,8 @@ test("API processes outbound federation outbox and delivers to remote node", asy
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@local.test",
+
+      imported_remote: true,
       display_name: "alice@local.test",
       signing_keys: [{ key_id: "k_sign_local_sender_1", public_key_pem: localSenderKeys.publicKeyPem }]
     })
@@ -2121,9 +3989,8 @@ test("API processes outbound federation outbox and delivers to remote node", asy
   assert.equal(process.body.processed[0].status, "delivered");
   assert.equal(process.body.processed[0].receipt_verified, true);
 
-  const delivered = await jsonRequest(`${remoteBaseUrl}/v1/envelopes/${envelope.id}`);
-  assert.equal(delivered.response.status, 200);
-  assert.equal(delivered.body.id, envelope.id);
+  const delivered = remoteStore.getEnvelope(envelope.id);
+  assert.equal(delivered.id, envelope.id);
 });
 
 test("API can require signed federation receipts for outbound delivery", async (t) => {
@@ -2333,6 +4200,8 @@ test("API bootstraps federation node trust from node discovery document", async 
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_bootstrap_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -2368,12 +4237,14 @@ test("API bootstraps federation node trust from node discovery document", async 
       node_document_url: `${remoteBaseUrl}/.well-known/loom.json`,
       allow_insecure_http: true,
       allow_private_network: true,
-      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      identity_resolve_url: `${remoteBaseUrl}/v1/identity/{identity}`
     })
   });
   assert.equal(bootstrap.response.status, 201, JSON.stringify(bootstrap.body));
   assert.equal(bootstrap.body.node.node_id, "remote.test");
   assert.equal(bootstrap.body.node.key_id, "k_node_sign_remote_bootstrap_1");
+  assert.equal(bootstrap.body.node.identity_resolve_url, `${remoteBaseUrl}/v1/identity/{identity}`);
   assert.equal(Array.isArray(bootstrap.body.node.signing_keys), true);
   assert.equal(bootstrap.body.node.signing_keys.length >= 1, true);
   assert.equal(bootstrap.body.discovery.node_document_url, `${remoteBaseUrl}/.well-known/loom.json`);
@@ -2487,6 +4358,65 @@ test("API rejects federation bootstrap to private network by default", async (t)
   assert.equal(bootstrap.body.error.code, "CAPABILITY_DENIED");
 });
 
+test("API enforces federation bootstrap host allowlist", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationBootstrapHostAllowlist: ["bootstrap.allowed.test"]
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const adminKeys = generateSigningKeyPair();
+
+  const registerAdmin = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_bootstrap_allowlist_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAdmin.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_bootstrap_allowlist_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_bootstrap_allowlist_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const bootstrap = await jsonRequest(`${baseUrl}/v1/federation/nodes/bootstrap`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_document_url: "http://127.0.0.1:34567/.well-known/loom.json",
+      allow_insecure_http: true,
+      allow_private_network: true
+    })
+  });
+
+  assert.equal(bootstrap.response.status, 403);
+  assert.equal(bootstrap.body.error.code, "CAPABILITY_DENIED");
+});
+
 test("API rejects webhook private-network targets unless explicitly allowed", async (t) => {
   const { server } = createLoomServer({
     nodeId: "node.test",
@@ -2514,6 +4444,46 @@ test("API rejects webhook private-network targets unless explicitly allowed", as
 
   assert.equal(webhookCreate.response.status, 403);
   assert.equal(webhookCreate.body.error.code, "CAPABILITY_DENIED");
+});
+
+test("API enforces webhook outbound host allowlist", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret-token",
+    webhookOutboundHostAllowlist: ["hooks.allowed.test"]
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const denied = await jsonRequest(`${baseUrl}/v1/webhooks`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      url: "https://hooks.blocked.test/hook",
+      events: ["email.outbox.process.delivered"]
+    })
+  });
+  assert.equal(denied.response.status, 403);
+  assert.equal(denied.body.error.code, "CAPABILITY_DENIED");
+
+  const allowed = await jsonRequest(`${baseUrl}/v1/webhooks`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      url: "https://hooks.allowed.test/hook",
+      events: ["email.outbox.process.delivered"]
+    })
+  });
+  assert.equal(allowed.response.status, 201);
+  assert.equal(allowed.body.url, "https://hooks.allowed.test/hook");
 });
 
 test("API supports bridge and gateway email surfaces", async (t) => {
@@ -2577,7 +4547,11 @@ test("API supports bridge and gateway email surfaces", async (t) => {
   assert.equal(typeof inbound.body.envelope_id, "string");
   assert.equal(typeof inbound.body.thread_id, "string");
 
-  const inboundEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${inbound.body.envelope_id}`);
+  const inboundEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${inbound.body.envelope_id}`, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
   assert.equal(inboundEnvelope.response.status, 200);
   assert.equal(inboundEnvelope.body.from.identity, "bridge://sender@example.net");
 
@@ -2703,7 +4677,11 @@ test("API hardens SMTP and IMAP parsing for edge-case address and header formats
   });
   assert.equal(inbound.response.status, 201, JSON.stringify(inbound.body));
 
-  const inboundEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${inbound.body.envelope_id}`);
+  const inboundEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${inbound.body.envelope_id}`, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
   assert.equal(inboundEnvelope.response.status, 200);
   assert.equal(inboundEnvelope.body.content.human.text.includes("Hello world"), true);
   assert.equal(inboundEnvelope.body.meta.bridge.original_message_id, "msg-edge-1@example.net");
@@ -2821,8 +4799,8 @@ test("API hides BCC recipients from non-sender IMAP recipient views", async (t) 
   assert.equal(smtpSubmit.response.status, 201, JSON.stringify(smtpSubmit.body));
 
   const deniedEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${smtpSubmit.body.envelope_id}`);
-  assert.equal(deniedEnvelope.response.status, 403);
-  assert.equal(deniedEnvelope.body.error.code, "CAPABILITY_DENIED");
+  assert.equal(deniedEnvelope.response.status, 401);
+  assert.equal(deniedEnvelope.body.error.code, "SIGNATURE_INVALID");
 
   const bobEnvelope = await jsonRequest(`${baseUrl}/v1/envelopes/${smtpSubmit.body.envelope_id}`, {
     headers: {
@@ -3155,8 +5133,7 @@ test("API supports capability presentation token in header for thread operations
   assert.equal(opAccepted.response.status, 201, JSON.stringify(opAccepted.body));
 
   const publicEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opEnvelope.id}`);
-  assert.equal(publicEnvelopeView.response.status, 200);
-  assert.equal(publicEnvelopeView.body.content.structured.parameters.capability_token, undefined);
+  assert.equal(publicEnvelopeView.response.status, 401);
 
   const aliceEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opEnvelope.id}`, {
     headers: {
@@ -3166,7 +5143,11 @@ test("API supports capability presentation token in header for thread operations
   assert.equal(aliceEnvelopeView.response.status, 200);
   assert.equal(aliceEnvelopeView.body.content.structured.parameters.capability_token, undefined);
 
-  const thread = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}`);
+  const thread = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}`, {
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    }
+  });
   assert.equal(thread.response.status, 200);
   assert.equal(thread.body.state, "resolved");
 });
@@ -3876,6 +5857,8 @@ test("API enforces federation challenge escalation and single-use challenge toke
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })
@@ -4158,6 +6141,8 @@ test("API enforces distributed federation node rate guard on first request in a 
     method: "POST",
     body: JSON.stringify({
       id: "loom://alice@remote.test",
+
+      imported_remote: true,
       display_name: "Remote Alice",
       signing_keys: [{ key_id: "k_sign_remote_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
     })

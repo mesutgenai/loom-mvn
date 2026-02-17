@@ -42,6 +42,15 @@ const domain = process.env.LOOM_DOMAIN || `${host}:${port}`;
 const adminToken = process.env.LOOM_ADMIN_TOKEN || null;
 const metricsPublic = parseBoolean(process.env.LOOM_METRICS_PUBLIC, false);
 const allowPublicMetricsOnPublicBind = parseBoolean(process.env.LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND, false);
+const requireTlsProxyOnPublicBind = parseBoolean(process.env.LOOM_REQUIRE_TLS_PROXY, true);
+const tlsProxyConfirmed = parseBoolean(process.env.LOOM_TLS_PROXY_CONFIRMED, false);
+const nativeTlsEnabled = parseBoolean(process.env.LOOM_NATIVE_TLS_ENABLED, false);
+const demoPublicReads = parseBoolean(process.env.LOOM_DEMO_PUBLIC_READS, false);
+const demoPublicReadsConfirmed = parseBoolean(process.env.LOOM_DEMO_PUBLIC_READS_CONFIRMED, false);
+const identityRequireProof = parseBoolean(
+  process.env.LOOM_IDENTITY_REQUIRE_PROOF,
+  isPublicBindHost(process.env.HOST || "127.0.0.1")
+);
 const publicBind = isPublicBindHost(host);
 
 if (publicBind && !adminToken) {
@@ -52,6 +61,16 @@ if (publicBind && metricsPublic && !allowPublicMetricsOnPublicBind) {
   throw new Error(
     "Refusing LOOM_METRICS_PUBLIC=true on public bind without LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true"
   );
+}
+
+if (publicBind && requireTlsProxyOnPublicBind && !tlsProxyConfirmed && !nativeTlsEnabled) {
+  throw new Error(
+    "Refusing public bind without LOOM_TLS_PROXY_CONFIRMED=true when LOOM_REQUIRE_TLS_PROXY=true (or enable LOOM_NATIVE_TLS_ENABLED=true)"
+  );
+}
+
+if (publicBind && demoPublicReads && !demoPublicReadsConfirmed) {
+  throw new Error("Refusing LOOM_DEMO_PUBLIC_READS=true on public bind without LOOM_DEMO_PUBLIC_READS_CONFIRMED=true");
 }
 
 const federationOutboxAutoProcessIntervalMs = Number(process.env.LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
@@ -124,6 +143,7 @@ const { server, store } = createLoomServer({
   metricsPublic,
   federationSigningKeyId: process.env.LOOM_NODE_SIGNING_KEY_ID || "k_node_sign_local_1",
   federationSigningPrivateKeyPem,
+  identityRequireProof,
   persistenceAdapter: postgresPersistence,
   emailRelay,
   runtimeStatusProvider

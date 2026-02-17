@@ -283,6 +283,18 @@ export function verifyDelegationChainOrThrow(envelope, options = {}) {
       });
     }
 
+    const remainingDepth = chain.length - (index + 1);
+    const maxSubDelegationDepth = Number(link.max_sub_delegation_depth);
+    if (remainingDepth > 0 && Number.isFinite(maxSubDelegationDepth) && maxSubDelegationDepth >= 0) {
+      if (remainingDepth > maxSubDelegationDepth) {
+        throw new LoomError("DELEGATION_INVALID", "Delegation chain exceeds max_sub_delegation_depth", 403, {
+          index,
+          max_sub_delegation_depth: maxSubDelegationDepth,
+          remaining_depth: remainingDepth
+        });
+      }
+    }
+
     if (index > 0) {
       const previous = chain[index - 1];
       if (previous.delegate !== link.delegator) {

@@ -5,6 +5,24 @@ function compareMemberNames(left, right) {
   return left < right ? -1 : 1;
 }
 
+function assertValidUnicodeString(value, path) {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = value.charCodeAt(index + 1);
+      if (!(nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff)) {
+        throw new TypeError(`Canonical JSON does not allow unpaired surrogate code points (${path})`);
+      }
+      index += 1;
+      continue;
+    }
+
+    if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new TypeError(`Canonical JSON does not allow unpaired surrogate code points (${path})`);
+    }
+  }
+}
+
 function assertSupportedPrimitive(value, path) {
   const valueType = typeof value;
   if (valueType === "number") {
@@ -14,7 +32,12 @@ function assertSupportedPrimitive(value, path) {
     return;
   }
 
-  if (valueType === "string" || valueType === "boolean") {
+  if (valueType === "string") {
+    assertValidUnicodeString(value, path);
+    return;
+  }
+
+  if (valueType === "boolean") {
     return;
   }
 
@@ -56,6 +79,7 @@ function serializeCanonicalJson(value, path = "$") {
   const members = keys.map((key) => {
     const memberValue = value[key];
     const memberPath = `${path}.${key}`;
+    assertValidUnicodeString(key, `${path}.<key>`);
     if (memberValue === undefined) {
       throw new TypeError(`Canonical JSON does not allow undefined values (${memberPath})`);
     }
