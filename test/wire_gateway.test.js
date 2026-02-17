@@ -96,6 +96,43 @@ function createIdentityAndToken(store, identity, keyId, keys) {
   return token.access_token;
 }
 
+test("wire gateway refuses authenticated mode without TLS by default", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  assert.throws(
+    () =>
+      new LoomWireGateway({
+        store,
+        enabled: true,
+        host: "127.0.0.1",
+        smtpEnabled: true,
+        imapEnabled: false,
+        requireAuth: true,
+        tlsEnabled: false
+      }),
+    /Refusing authenticated wire gateway without TLS/
+  );
+});
+
+test("wire gateway refuses insecure auth override on public bind without explicit confirmation", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  assert.throws(
+    () =>
+      new LoomWireGateway({
+        store,
+        enabled: true,
+        host: "0.0.0.0",
+        smtpEnabled: true,
+        imapEnabled: false,
+        requireAuth: true,
+        allowInsecureAuth: true,
+        tlsEnabled: true,
+        tlsKeyPem: TEST_TLS_KEY_PEM,
+        tlsCertPem: TEST_TLS_CERT_PEM
+      }),
+    /LOOM_WIRE_ALLOW_INSECURE_AUTH=true on public bind/
+  );
+});
+
 test("wire SMTP gateway accepts AUTH and submits envelope into store", async (t) => {
   const store = new LoomStore({ nodeId: "node.test" });
   const keys = generateSigningKeyPair();
@@ -108,7 +145,8 @@ test("wire SMTP gateway accepts AUTH and submits envelope into store", async (t)
     smtpEnabled: true,
     smtpPort: 0,
     imapEnabled: false,
-    requireAuth: true
+    requireAuth: true,
+    allowInsecureAuth: true
   });
   await gateway.start();
   t.after(async () => {
@@ -180,7 +218,8 @@ test("wire IMAP gateway supports LOGIN LIST SELECT FETCH flow", async (t) => {
     smtpEnabled: false,
     imapEnabled: true,
     imapPort: 0,
-    requireAuth: true
+    requireAuth: true,
+    allowInsecureAuth: true
   });
   await gateway.start();
   t.after(async () => {
@@ -240,7 +279,8 @@ test("wire IMAP gateway supports IDLE, APPEND, MOVE, UID MOVE, and sectioned FET
     smtpEnabled: false,
     imapEnabled: true,
     imapPort: 0,
-    requireAuth: true
+    requireAuth: true,
+    allowInsecureAuth: true
   });
   await gateway.start();
   t.after(async () => {
@@ -359,6 +399,10 @@ test("wire SMTP gateway supports STARTTLS upgrade", async (t) => {
   await waitForPlain((line) => line.includes("STARTTLS"));
   await waitForPlain((line) => line.startsWith("250 SIZE "));
 
+  const plain = Buffer.from(`\u0000loom://alice@node.test\u0000${token}`, "utf-8").toString("base64");
+  socket.write(`AUTH PLAIN ${plain}\r\n`);
+  await waitForPlain((line) => line.startsWith("538 "));
+
   socket.write("STARTTLS\r\n");
   await waitForPlain((line) => line.startsWith("220 "));
 
@@ -375,7 +419,6 @@ test("wire SMTP gateway supports STARTTLS upgrade", async (t) => {
   tlsSocket.write("EHLO localhost\r\n");
   await waitForTls((line) => line.startsWith("250 SIZE "));
 
-  const plain = Buffer.from(`\u0000loom://alice@node.test\u0000${token}`, "utf-8").toString("base64");
   tlsSocket.write(`AUTH PLAIN ${plain}\r\n`);
   await waitForTls((line) => line.startsWith("235 "));
   tlsSocket.write("QUIT\r\n");
@@ -427,6 +470,9 @@ test("wire IMAP gateway supports STARTTLS and extended mailbox commands", async 
   socket.write("a1 CAPABILITY\r\n");
   await waitForPlain((line) => line.includes("STARTTLS"));
   await waitForPlain((line) => line.startsWith("a1 OK"));
+
+  socket.write(`a1b LOGIN "loom://alice@node.test" "${token}"\r\n`);
+  await waitForPlain((line) => line.startsWith("a1b NO [PRIVACYREQUIRED]"));
 
   socket.write("a2 STARTTLS\r\n");
   await waitForPlain((line) => line.startsWith("a2 OK"));

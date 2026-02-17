@@ -18,6 +18,25 @@ function parseBoolean(value, fallback = false) {
   return fallback;
 }
 
+function isPublicBindHost(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1") {
+    return false;
+  }
+
+  if (normalized.startsWith("127.")) {
+    return false;
+  }
+
+  return true;
+}
+
 function parsePositiveInt(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -542,10 +561,12 @@ function createSmtpGatewayServer(options) {
     host,
     port,
     requireAuth = true,
+    allowInsecureAuth = false,
     maxMessageBytes = 10 * 1024 * 1024,
     startTlsEnabled = false,
     tlsContext = null
   } = options;
+  const requireSecureAuth = requireAuth && !allowInsecureAuth;
 
   const server = createTcpServer((socket) => {
     const state = {
@@ -583,7 +604,10 @@ function createSmtpGatewayServer(options) {
     };
 
     const advertiseEhlo = () => {
-      const capabilities = ["AUTH PLAIN LOGIN XOAUTH2"];
+      const capabilities = [];
+      if (!requireSecureAuth || state.secure) {
+        capabilities.push("AUTH PLAIN LOGIN XOAUTH2");
+      }
       if (startTlsEnabled && tlsContext && !state.secure) {
         capabilities.push("STARTTLS");
       }
@@ -641,6 +665,13 @@ function createSmtpGatewayServer(options) {
     };
 
     const handleAuth = (rawArgs) => {
+      if (requireSecureAuth && !state.secure) {
+        state.authLoginStage = null;
+        state.authLoginUser = null;
+        writeLine("538 5.7.11 Encryption required for requested authentication mechanism");
+        return;
+      }
+
       const args = parseImapAtoms(rawArgs);
       const mechanism = String(args[0] || "").toUpperCase();
       const initialResponse = args[1] || null;
@@ -745,12 +776,24 @@ function createSmtpGatewayServer(options) {
       }
 
       if (state.authLoginStage === "plain") {
+        if (requireSecureAuth && !state.secure) {
+          state.authLoginStage = null;
+          state.authLoginUser = null;
+          writeLine("538 5.7.11 Encryption required for requested authentication mechanism");
+          return;
+        }
         state.authLoginStage = null;
         handleAuth(`PLAIN ${line}`);
         return;
       }
 
       if (state.authLoginStage === "login_user") {
+        if (requireSecureAuth && !state.secure) {
+          state.authLoginStage = null;
+          state.authLoginUser = null;
+          writeLine("538 5.7.11 Encryption required for requested authentication mechanism");
+          return;
+        }
         state.authLoginStage = "login_password";
         state.authLoginUser = decodeBase64Utf8(line).trim();
         writeLine("334 UGFzc3dvcmQ6");
@@ -758,6 +801,12 @@ function createSmtpGatewayServer(options) {
       }
 
       if (state.authLoginStage === "login_password") {
+        if (requireSecureAuth && !state.secure) {
+          state.authLoginStage = null;
+          state.authLoginUser = null;
+          writeLine("538 5.7.11 Encryption required for requested authentication mechanism");
+          return;
+        }
         state.authLoginStage = null;
         const token = decodeBase64Utf8(line).trim();
         const expectedIdentity = extractIdentityFromImapUser(state.authLoginUser);
@@ -810,6 +859,10 @@ function createSmtpGatewayServer(options) {
       }
 
       if (command === "AUTH") {
+        if (requireSecureAuth && !state.secure) {
+          writeLine("538 5.7.11 Encryption required for requested authentication mechanism");
+          return;
+        }
         handleAuth(rawArgs);
         return;
       }
@@ -893,9 +946,11 @@ function createImapGatewayServer(options) {
     host,
     port,
     requireAuth = true,
+    allowInsecureAuth = false,
     startTlsEnabled = false,
     tlsContext = null
   } = options;
+  const requireSecureAuth = requireAuth && !allowInsecureAuth;
 
   const server = createTcpServer((socket) => {
     const state = {
@@ -919,7 +974,12 @@ function createImapGatewayServer(options) {
     };
 
     const capabilityTokens = () => {
-      const caps = ["IMAP4rev1", "UIDPLUS", "AUTH=PLAIN", "AUTH=LOGIN", "NAMESPACE", "ID"];
+      const caps = ["IMAP4rev1", "UIDPLUS", "NAMESPACE", "ID"];
+      if (!requireSecureAuth || state.secure) {
+        caps.push("AUTH=PLAIN", "AUTH=LOGIN");
+      } else {
+        caps.push("LOGINDISABLED");
+      }
       if (startTlsEnabled && tlsContext && !state.secure && !state.authIdentity) {
         caps.push("STARTTLS");
       }
@@ -1159,6 +1219,10 @@ function createImapGatewayServer(options) {
       }
 
       if (command === "LOGIN") {
+        if (requireSecureAuth && !state.secure) {
+          writeLine(`${tag} NO [PRIVACYREQUIRED] TLS required before authentication`);
+          return;
+        }
         const args = parseImapAtoms(rawArgs);
         const username = args[0] || "";
         const token = args[1] || "";
@@ -1174,6 +1238,10 @@ function createImapGatewayServer(options) {
       }
 
       if (command === "AUTHENTICATE") {
+        if (requireSecureAuth && !state.secure) {
+          writeLine(`${tag} NO [PRIVACYREQUIRED] TLS required before authentication`);
+          return;
+        }
         const args = parseImapAtoms(rawArgs);
         const mechanism = String(args[0] || "").toUpperCase();
         const initial = args[1] || "";
@@ -1522,7 +1590,10 @@ export class LoomWireGateway {
     this.store = options.store;
     this.enabled = options.enabled === true;
     this.host = options.host || "127.0.0.1";
+    this.publicBind = isPublicBindHost(this.host);
     this.requireAuth = options.requireAuth !== false;
+    this.allowInsecureAuth = options.allowInsecureAuth === true;
+    this.allowInsecureAuthOnPublicBind = options.allowInsecureAuthOnPublicBind === true;
     this.maxMessageBytes = parsePositiveInt(options.maxMessageBytes, 10 * 1024 * 1024);
     this.smtpEnabled = this.enabled && options.smtpEnabled !== false;
     this.imapEnabled = this.enabled && options.imapEnabled !== false;
@@ -1544,6 +1615,41 @@ export class LoomWireGateway {
       });
     }
 
+    if (this.enabled && this.requireAuth && !this.allowInsecureAuth && !this.tlsEnabled) {
+      throw new Error(
+        "Refusing authenticated wire gateway without TLS; enable LOOM_WIRE_TLS_ENABLED=true or set LOOM_WIRE_ALLOW_INSECURE_AUTH=true"
+      );
+    }
+
+    if (this.enabled && this.requireAuth && !this.allowInsecureAuth) {
+      if (this.smtpEnabled && !this.smtpStartTlsEnabled) {
+        throw new Error(
+          "Refusing SMTP wire gateway auth without STARTTLS; enable LOOM_WIRE_SMTP_STARTTLS_ENABLED=true or set LOOM_WIRE_ALLOW_INSECURE_AUTH=true"
+        );
+      }
+      if (this.imapEnabled && !this.imapStartTlsEnabled) {
+        throw new Error(
+          "Refusing IMAP wire gateway auth without STARTTLS; enable LOOM_WIRE_IMAP_STARTTLS_ENABLED=true or set LOOM_WIRE_ALLOW_INSECURE_AUTH=true"
+        );
+      }
+    }
+
+    if (this.enabled && this.publicBind && this.requireAuth && !this.tlsEnabled) {
+      throw new Error("Refusing public bind of authenticated wire gateway without TLS");
+    }
+
+    if (
+      this.enabled &&
+      this.publicBind &&
+      this.requireAuth &&
+      this.allowInsecureAuth &&
+      !this.allowInsecureAuthOnPublicBind
+    ) {
+      throw new Error(
+        "Refusing LOOM_WIRE_ALLOW_INSECURE_AUTH=true on public bind without LOOM_WIRE_ALLOW_INSECURE_AUTH_ON_PUBLIC_BIND=true"
+      );
+    }
+
     this.smtpServer = null;
     this.imapServer = null;
     this.smtpSockets = new Set();
@@ -1559,6 +1665,7 @@ export class LoomWireGateway {
       enabled: this.enabled,
       host: this.host,
       require_auth: this.requireAuth,
+      allow_insecure_auth: this.allowInsecureAuth,
       smtp: {
         enabled: this.smtpEnabled,
         configured_port: this.smtpPort,
@@ -1587,6 +1694,7 @@ export class LoomWireGateway {
         host: this.host,
         port: this.smtpPort,
         requireAuth: this.requireAuth,
+        allowInsecureAuth: this.allowInsecureAuth,
         maxMessageBytes: this.maxMessageBytes,
         startTlsEnabled: this.smtpStartTlsEnabled && this.tlsEnabled,
         tlsContext: this.tlsContext
@@ -1617,6 +1725,7 @@ export class LoomWireGateway {
         host: this.host,
         port: this.imapPort,
         requireAuth: this.requireAuth,
+        allowInsecureAuth: this.allowInsecureAuth,
         startTlsEnabled: this.imapStartTlsEnabled && this.tlsEnabled,
         tlsContext: this.tlsContext
       });
@@ -1696,6 +1805,14 @@ export function createWireGatewayFromEnv(options = {}) {
     ),
     imapPort: options.imapPort ?? process.env.LOOM_WIRE_IMAP_PORT ?? 1143,
     requireAuth: parseBoolean(options.requireAuth ?? process.env.LOOM_WIRE_GATEWAY_REQUIRE_AUTH, true),
+    allowInsecureAuth: parseBoolean(
+      options.allowInsecureAuth ?? process.env.LOOM_WIRE_ALLOW_INSECURE_AUTH,
+      false
+    ),
+    allowInsecureAuthOnPublicBind: parseBoolean(
+      options.allowInsecureAuthOnPublicBind ?? process.env.LOOM_WIRE_ALLOW_INSECURE_AUTH_ON_PUBLIC_BIND,
+      false
+    ),
     maxMessageBytes: options.maxMessageBytes ?? process.env.LOOM_WIRE_SMTP_MAX_MESSAGE_BYTES ?? 10 * 1024 * 1024,
     tlsEnabled,
     tlsKeyPem,
