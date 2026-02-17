@@ -990,6 +990,103 @@ test("thread_op requires capability token for non-owner and consumes single-use 
   assert.equal(listed.every((token) => token.spent === true), true);
 });
 
+test("federated non-owner thread_op rejects legacy presentation capability tokens", () => {
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_legacy_cap_1", public_key_pem: aliceKeys.publicKeyPem }]
+  });
+  store.registerIdentity({
+    id: "loom://bob@node.test",
+    display_name: "Bob",
+    signing_keys: [{ key_id: "k_sign_bob_legacy_cap_1", public_key_pem: bobKeys.publicKeyPem }]
+  });
+
+  const threadId = "thr_01ARZ3NDEKTSV4RRFFQ69G5FC9";
+  const root = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FC8",
+      thread_id: threadId,
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_legacy_cap_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:40:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "Initial thread", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    aliceKeys.privateKeyPem,
+    "k_sign_alice_legacy_cap_1"
+  );
+  store.ingestEnvelope(root);
+
+  const capability = store.issueCapabilityToken(
+    {
+      thread_id: threadId,
+      issued_to: "loom://bob@node.test",
+      grants: ["resolve"],
+      single_use: true
+    },
+    "loom://alice@node.test"
+  );
+
+  const op = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FCA",
+      thread_id: threadId,
+      parent_id: root.id,
+      type: "thread_op",
+      from: {
+        identity: "loom://bob@node.test",
+        display: "Bob",
+        key_id: "k_sign_bob_legacy_cap_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://alice@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:41:00Z",
+      priority: "normal",
+      content: {
+        structured: {
+          intent: "thread.resolve@v1",
+          parameters: {
+            capability_id: capability.id
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    bobKeys.privateKeyPem,
+    "k_sign_bob_legacy_cap_1"
+  );
+
+  assert.throws(
+    () =>
+      store.ingestEnvelope(op, {
+        actorIdentity: "loom://bob@node.test",
+        federated: true,
+        capabilityPresentationToken: capability.presentation_token
+      }),
+    (error) => error?.code === "CAPABILITY_DENIED"
+  );
+});
+
 test("identity and timestamp validators enforce canonical protocol format", () => {
   assert.equal(isLoomIdentity("loom://alice@node.test"), true);
   assert.equal(isLoomIdentity("loom://Alice@node.test"), false);

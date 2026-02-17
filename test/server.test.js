@@ -4417,6 +4417,83 @@ test("API enforces federation bootstrap host allowlist", async (t) => {
   assert.equal(bootstrap.body.error.code, "CAPABILITY_DENIED");
 });
 
+test("API requires admin token for insecure federation node transport settings when configured", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret-token"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const userKeys = generateSigningKeyPair();
+  const remoteNodeKeys = generateSigningKeyPair();
+
+  const registerUser = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_fed_admin_1", public_key_pem: userKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerUser.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_fed_admin_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_fed_admin_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(userKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const insecureNodePayload = {
+    node_id: "remote.test",
+    key_id: "k_node_sign_remote_admin_1",
+    public_key_pem: remoteNodeKeys.publicKeyPem,
+    deliver_url: "http://127.0.0.1:33445/v1/federation/deliver",
+    identity_resolve_url: "http://127.0.0.1:33445/v1/identity/{identity}",
+    allow_insecure_http: true,
+    allow_private_network: true
+  };
+
+  const denied = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify(insecureNodePayload)
+  });
+  assert.equal(denied.response.status, 403);
+  assert.equal(denied.body.error.code, "CAPABILITY_DENIED");
+
+  const allowed = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`,
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify(insecureNodePayload)
+  });
+  assert.equal(allowed.response.status, 201, JSON.stringify(allowed.body));
+  assert.equal(allowed.body.allow_insecure_http, true);
+  assert.equal(allowed.body.allow_private_network, true);
+});
+
 test("API rejects webhook private-network targets unless explicitly allowed", async (t) => {
   const { server } = createLoomServer({
     nodeId: "node.test",
@@ -5239,6 +5316,191 @@ test("API supports capability presentation token in header for thread operations
   assert.equal(thread.response.status, 200);
   assert.equal(thread.body.subject, "portable subject update");
   assert.equal(thread.body.state, "resolved");
+});
+
+test("API can require portable capability payloads for non-owner thread operations", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    requirePortableThreadOpCapability: true
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  async function registerAndLogin(identity, keyId, keys) {
+    const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+      method: "POST",
+      body: JSON.stringify({
+        id: identity,
+        display_name: identity,
+        signing_keys: [{ key_id: keyId, public_key_pem: keys.publicKeyPem }]
+      })
+    });
+    assert.equal(register.response.status, 201);
+
+    const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId
+      })
+    });
+    assert.equal(challenge.response.status, 200);
+
+    const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId,
+        challenge_id: challenge.body.challenge_id,
+        signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+      })
+    });
+    assert.equal(token.response.status, 200);
+    return token.body.access_token;
+  }
+
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const aliceToken = await registerAndLogin("loom://alice@node.test", "k_sign_alice_cap_portable_1", aliceKeys);
+  const bobToken = await registerAndLogin("loom://bob@node.test", "k_sign_bob_cap_portable_1", bobKeys);
+
+  const rootEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7MBB",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G7MBC",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_cap_portable_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T23:20:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "portable required test", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    aliceKeys.privateKeyPem,
+    "k_sign_alice_cap_portable_1"
+  );
+
+  const sendRoot = await jsonRequest(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    },
+    body: JSON.stringify(rootEnvelope)
+  });
+  assert.equal(sendRoot.response.status, 201, JSON.stringify(sendRoot.body));
+
+  const issueCapability = await jsonRequest(`${baseUrl}/v1/capabilities`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    },
+    body: JSON.stringify({
+      thread_id: rootEnvelope.thread_id,
+      issued_to: "loom://bob@node.test",
+      grants: ["resolve"],
+      single_use: true
+    })
+  });
+  assert.equal(issueCapability.response.status, 201);
+  assert.equal(typeof issueCapability.body.presentation_token, "string");
+  assert.equal(typeof issueCapability.body.portable_token, "object");
+
+  const headerOnlyOp = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7MBD",
+      thread_id: rootEnvelope.thread_id,
+      parent_id: rootEnvelope.id,
+      type: "thread_op",
+      from: {
+        identity: "loom://bob@node.test",
+        display: "Bob",
+        key_id: "k_sign_bob_cap_portable_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://alice@node.test", role: "primary" }],
+      created_at: "2026-02-16T23:21:00Z",
+      priority: "normal",
+      content: {
+        structured: {
+          intent: "thread.resolve@v1",
+          parameters: {
+            capability_id: issueCapability.body.id
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    bobKeys.privateKeyPem,
+    "k_sign_bob_cap_portable_1"
+  );
+
+  const deniedHeader = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}/ops`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bobToken}`,
+      "x-loom-capability-token": issueCapability.body.presentation_token
+    },
+    body: JSON.stringify(headerOnlyOp)
+  });
+  assert.equal(deniedHeader.response.status, 403);
+  assert.equal(deniedHeader.body.error.code, "CAPABILITY_DENIED");
+
+  const portableOp = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7MBE",
+      thread_id: rootEnvelope.thread_id,
+      parent_id: rootEnvelope.id,
+      type: "thread_op",
+      from: {
+        identity: "loom://bob@node.test",
+        display: "Bob",
+        key_id: "k_sign_bob_cap_portable_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://alice@node.test", role: "primary" }],
+      created_at: "2026-02-16T23:21:30Z",
+      priority: "normal",
+      content: {
+        structured: {
+          intent: "thread.resolve@v1",
+          parameters: {
+            capability_token: issueCapability.body.portable_token
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    bobKeys.privateKeyPem,
+    "k_sign_bob_cap_portable_1"
+  );
+
+  const acceptedPortable = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}/ops`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    },
+    body: JSON.stringify(portableOp)
+  });
+  assert.equal(acceptedPortable.response.status, 201, JSON.stringify(acceptedPortable.body));
 });
 
 test("API supports outbound email relay outbox queue and process", async (t) => {

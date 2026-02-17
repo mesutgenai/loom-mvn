@@ -111,7 +111,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 - Optional proof-of-key identity registration (`/v1/identity/challenge` + `registration_proof`)
 - Imported remote identities are stored in a read-only remote cache namespace with TTL-based expiry
 - Private-by-default mailbox reads: thread/envelope read endpoints require bearer auth unless explicit demo mode is enabled
-- Capability token hardening: one-time presentation secret, hashed-at-rest secret tracking, and header-based `thread_op` authorization
+- Capability token hardening: one-time presentation secret, hashed-at-rest secret tracking, signed portable capability tokens, and `thread_op` authorization via portable payload token or legacy header presentation token
 - `thread_op` authorization with owner/capability enforcement
 - Agent delegation-chain verification with signature/scope/revocation checks
 - Optional disk persistence (`LOOM_DATA_DIR`) with hash-chained audit log
@@ -291,10 +291,12 @@ Optional persistence:
   - Server refuses `LOOM_METRICS_PUBLIC=true` on public bind unless `LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true`.
   - Server refuses open outbound host fetch configuration on public bind unless `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true`.
     - Required by default on public bind: `LOOM_FEDERATION_HOST_ALLOWLIST`, `LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST`, `LOOM_WEBHOOK_HOST_ALLOWLIST`.
-    - If `LOOM_FEDERATION_RESOLVE_REMOTE_IDENTITIES=true` (default), `LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST` is also required.
+    - If `LOOM_FEDERATION_REMOTE_IDENTITY_RESOLVE_ENABLED=true` (default), `LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST` is also required.
 - For `thread_op` submissions by non-owner participants, authorize with either:
   - `content.structured.parameters.capability_token` (portable signed token; recommended for federation portability)
   - `x-loom-capability-token` (legacy/local presentation secret header)
+- Set `LOOM_REQUIRE_PORTABLE_THREAD_OP_CAPABILITY=true` to require portable payload capability tokens for non-owner `thread_op` requests.
+- If `LOOM_ADMIN_TOKEN` is configured, enabling `allow_insecure_http=true` or `allow_private_network=true` on federation node registration/bootstrap requests requires `x-loom-admin-token`.
 - Optional request logging:
   - `LOOM_REQUEST_LOG_ENABLED=true`
   - `LOOM_REQUEST_LOG_FORMAT=json|text` (default `json`)

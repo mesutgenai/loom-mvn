@@ -1112,6 +1112,10 @@ export function createLoomServer(options = {}) {
   const remoteIdentityHostAllowlist = parseHostAllowlist(
     options.remoteIdentityHostAllowlist ?? process.env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST
   );
+  const requirePortableThreadOpCapability = parseBoolean(
+    options.requirePortableThreadOpCapability ?? process.env.LOOM_REQUIRE_PORTABLE_THREAD_OP_CAPABILITY,
+    false
+  );
   const nativeTlsConfig = resolveNativeTlsConfig(options);
   const store =
     options.store ||
@@ -1607,7 +1611,8 @@ export function createLoomServer(options = {}) {
         const stored = store.ingestEnvelope(envelope, {
           actorIdentity,
           requiredActions,
-          capabilityPresentationToken
+          capabilityPresentationToken,
+          requirePortableThreadOpCapability
         });
         storeIdempotentResult(store, idempotency, 201, stored);
         sendJson(res, 201, stored);
@@ -1653,7 +1658,8 @@ export function createLoomServer(options = {}) {
         const stored = store.ingestEnvelope(envelope, {
           actorIdentity,
           requiredActions,
-          capabilityPresentationToken
+          capabilityPresentationToken,
+          requirePortableThreadOpCapability
         });
         storeIdempotentResult(store, idempotency, 201, stored);
         sendJson(res, 201, stored);
@@ -1771,6 +1777,18 @@ export function createLoomServer(options = {}) {
       if (methodIs(req, "POST") && path === "/v1/federation/nodes") {
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
+        const adminRequest = hasValidAdminToken(req, adminToken);
+        const requestedInsecureTransport = body?.allow_insecure_http === true || body?.allow_private_network === true;
+        if (requestedInsecureTransport && adminToken && !adminRequest) {
+          throw new LoomError(
+            "CAPABILITY_DENIED",
+            "Admin token required for allow_insecure_http or allow_private_network federation node settings",
+            403,
+            {
+              field: "x-loom-admin-token"
+            }
+          );
+        }
         const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, body);
         if (maybeSendIdempotentReplay(res, idempotency)) {
           return;
@@ -1790,6 +1808,18 @@ export function createLoomServer(options = {}) {
       if (methodIs(req, "POST") && path === "/v1/federation/nodes/bootstrap") {
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
+        const adminRequest = hasValidAdminToken(req, adminToken);
+        const requestedInsecureTransport = body?.allow_insecure_http === true || body?.allow_private_network === true;
+        if (requestedInsecureTransport && adminToken && !adminRequest) {
+          throw new LoomError(
+            "CAPABILITY_DENIED",
+            "Admin token required for allow_insecure_http or allow_private_network federation bootstrap settings",
+            403,
+            {
+              field: "x-loom-admin-token"
+            }
+          );
+        }
         const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, body);
         if (maybeSendIdempotentReplay(res, idempotency)) {
           return;

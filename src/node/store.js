@@ -7295,6 +7295,19 @@ export class LoomStore {
       });
     }
 
+    if (context?.federated === true) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Federated non-owner thread operations require portable signed capability_token payload",
+        403,
+        {
+          intent,
+          actor: actorIdentity,
+          field: "content.structured.parameters.capability_token"
+        }
+      );
+    }
+
     if (!capabilityTokenValue) {
       throw new LoomError("CAPABILITY_DENIED", "Capability presentation token required for thread operation", 403, {
         intent,
@@ -7545,6 +7558,23 @@ export class LoomStore {
       portableCapabilityToken: payloadPortableCapabilityToken,
       context
     });
+
+    if (
+      context?.requirePortableThreadOpCapability === true &&
+      !this.isThreadOwner(thread, actorIdentity) &&
+      validatedToken?.kind !== "portable"
+    ) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Portable signed capability_token payload is required for non-owner thread operations",
+        403,
+        {
+          intent,
+          actor: actorIdentity,
+          field: "content.structured.parameters.capability_token"
+        }
+      );
+    }
 
     return () => {
       switch (intent) {

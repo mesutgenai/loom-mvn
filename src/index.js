@@ -75,7 +75,14 @@ const allowOpenOutboundHostsOnPublicBind = parseBoolean(
   process.env.LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND,
   false
 );
-const federationResolveRemoteIdentities = parseBoolean(process.env.LOOM_FEDERATION_RESOLVE_REMOTE_IDENTITIES, true);
+const federationResolveRemoteIdentities = parseBoolean(
+  process.env.LOOM_FEDERATION_REMOTE_IDENTITY_RESOLVE_ENABLED,
+  true
+);
+const requirePortableThreadOpCapability = parseBoolean(
+  process.env.LOOM_REQUIRE_PORTABLE_THREAD_OP_CAPABILITY,
+  publicBind
+);
 const federationOutboundHostAllowlist = parseHostAllowlist(process.env.LOOM_FEDERATION_HOST_ALLOWLIST);
 const federationBootstrapHostAllowlist = parseHostAllowlist(process.env.LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST);
 const remoteIdentityHostAllowlist = parseHostAllowlist(process.env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST);
@@ -199,6 +206,7 @@ const { server, store } = createLoomServer({
   federationSigningKeyId: process.env.LOOM_NODE_SIGNING_KEY_ID || "k_node_sign_local_1",
   federationSigningPrivateKeyPem,
   identityRequireProof,
+  requirePortableThreadOpCapability,
   persistenceAdapter: postgresPersistence,
   emailRelay,
   runtimeStatusProvider
