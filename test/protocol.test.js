@@ -261,6 +261,44 @@ test("store persists federation nonce replay cache across restart", async () => 
   }
 });
 
+test("store signs audit entries with HMAC and rejects tampered audit chains", () => {
+  const keys = generateSigningKeyPair();
+  const store = new LoomStore({
+    nodeId: "node.test",
+    auditHmacKey: "test-audit-hmac-key",
+    auditRequireMacValidation: true
+  });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_hmac_1", public_key_pem: keys.publicKeyPem }]
+  });
+
+  assert.equal(store.auditEntries.length >= 1, true);
+  assert.equal(typeof store.auditEntries[0].mac, "string");
+
+  const tampered = store.auditEntries.map((entry) => ({ ...entry }));
+  tampered[0] = {
+    ...tampered[0],
+    payload: {
+      ...(tampered[0].payload || {}),
+      identity: "loom://mallory@node.test"
+    }
+  };
+
+  const verifier = new LoomStore({
+    nodeId: "node.test",
+    auditHmacKey: "test-audit-hmac-key",
+    auditRequireMacValidation: true
+  });
+
+  assert.throws(
+    () => verifier.loadAuditFromEntries(tampered),
+    (error) => error?.code === "AUDIT_TAMPERED"
+  );
+});
+
 test("store persists snapshots to external persistence adapter", async () => {
   const writes = [];
   const adapter = {

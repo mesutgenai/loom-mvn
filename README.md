@@ -215,6 +215,10 @@ Server defaults:
 Optional persistence:
 
 - Set `LOOM_DATA_DIR=/absolute/path` to persist state and audit log between restarts.
+- Optional keyed audit integrity:
+  - `LOOM_AUDIT_HMAC_KEY` signs each audit entry with HMAC-SHA256 (recommended for tamper evidence).
+  - `LOOM_AUDIT_REQUIRE_MAC_VALIDATION=true|false` (default `false`; when enabled, loading unsigned audit entries fails).
+  - `LOOM_AUDIT_VALIDATE_CHAIN=true|false` (default `true`; validates `prev_hash` + `hash` chain on load/import).
 - Set `LOOM_PG_URL` to enable PostgreSQL-backed state + audit persistence.
   - Optional: `LOOM_PG_STATE_KEY` (default `default`) for multi-tenant/state partitioning.
   - Optional pool/timing tuning: `LOOM_PG_POOL_MAX`, `LOOM_PG_IDLE_TIMEOUT_MS`, `LOOM_PG_CONNECT_TIMEOUT_MS`.
@@ -232,10 +236,12 @@ Optional persistence:
   - `LOOM_FEDERATION_REMOTE_IDENTITY_TIMEOUT_MS` (default `5000`)
   - `LOOM_FEDERATION_REMOTE_IDENTITY_MAX_RESPONSE_BYTES` (default `262144`)
 - Set `LOOM_DEMO_PUBLIC_READS=true` only for non-production demos that need unauthenticated thread/envelope reads (default `false`).
-- Public bind safety checks:
-  - `LOOM_REQUIRE_TLS_PROXY=true` (default) refuses non-loopback bind unless `LOOM_TLS_PROXY_CONFIRMED=true`.
+- Public service safety checks:
+  - Set `LOOM_PUBLIC_SERVICE=true` when this node is internet-facing (including reverse-proxy deployments on loopback).
+  - `LOOM_REQUIRE_TLS_PROXY=true` (default) refuses public service unless `LOOM_TLS_PROXY_CONFIRMED=true`.
     - Alternatively, set `LOOM_NATIVE_TLS_ENABLED=true` with native TLS material to serve HTTPS directly.
-  - `LOOM_DEMO_PUBLIC_READS=true` on public bind requires `LOOM_DEMO_PUBLIC_READS_CONFIRMED=true`.
+  - `LOOM_REQUIRE_HTTPS_FROM_PROXY=true` (default for public service without native TLS) requires trusted proxy headers and enforces `X-Forwarded-Proto=https`.
+  - `LOOM_DEMO_PUBLIC_READS=true` on public service requires `LOOM_DEMO_PUBLIC_READS_CONFIRMED=true`.
 - Optional native TLS/HTTP2 server mode:
   - `LOOM_NATIVE_TLS_ENABLED=true|false` (default `false`)
   - `LOOM_NATIVE_TLS_CERT_PEM` or `LOOM_NATIVE_TLS_CERT_FILE`
@@ -284,14 +290,16 @@ Optional persistence:
 - Set `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process webhook outbox.
 - Set `LOOM_ADMIN_TOKEN` to protect operational endpoints (`/metrics`, `/v1/admin/status`).
 - Set `LOOM_METRICS_PUBLIC=true` only if you intentionally want unauthenticated `/metrics`.
-- Set `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true` only if you intentionally want to disable strict outbound host allowlist startup guards on public bind.
+- Set `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true` only if you intentionally want to disable strict outbound host allowlist startup guards on public service.
 - Set `LOOM_IDENTITY_SIGNUP_ENABLED=false` to require admin token for `POST /v1/identity`.
-- Public-bind startup safeguards:
-  - Server refuses startup on public bind without `LOOM_ADMIN_TOKEN`.
-  - Server refuses `LOOM_METRICS_PUBLIC=true` on public bind unless `LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true`.
-  - Server refuses open outbound host fetch configuration on public bind unless `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true`.
-    - Required by default on public bind: `LOOM_FEDERATION_HOST_ALLOWLIST`, `LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST`, `LOOM_WEBHOOK_HOST_ALLOWLIST`.
+- Public-service startup safeguards:
+  - Server refuses startup on public service without `LOOM_ADMIN_TOKEN`.
+  - Server refuses `LOOM_METRICS_PUBLIC=true` on public service unless `LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true`.
+  - Server refuses open outbound host fetch configuration on public service unless `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true`.
+    - Required by default on public service: `LOOM_FEDERATION_HOST_ALLOWLIST`, `LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST`, `LOOM_WEBHOOK_HOST_ALLOWLIST`.
     - If `LOOM_FEDERATION_REMOTE_IDENTITY_RESOLVE_ENABLED=true` (default), `LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST` is also required.
+  - Server refuses public service with inbound bridge enabled unless `LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true`.
+  - Server refuses weak public inbound bridge auth policy unless `LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true`.
 - For `thread_op` submissions by non-owner participants, authorize with either:
   - `content.structured.parameters.capability_token` (portable signed token; recommended for federation portability)
   - `x-loom-capability-token` (legacy/local presentation secret header)
@@ -312,8 +320,22 @@ Optional persistence:
     - `LOOM_SMTP_DKIM_HEADER_FIELD_NAMES` (optional override)
 - Optional API send-surface kill switches:
   - `LOOM_BRIDGE_EMAIL_INBOUND_ENABLED=true|false` (default `true`)
+  - `LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true|false` (default `false`; required to keep inbound bridge enabled on public service)
+  - Inbound bridge authentication policy controls:
+    - `LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_ADMIN_TOKEN=true|false` (default `true` on public service, else `false`; requires `x-loom-admin-token` on inbound bridge requests)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_AUTH_RESULTS=true|false` (default `true` on public service, else `false`)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_DMARC_PASS=true|false` (default `true` on public service, else `false`)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_REJECT_ON_AUTH_FAILURE=true|false` (default `true` on public service, else `false`; if `false`, failures can be quarantined instead)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_QUARANTINE_ON_AUTH_FAILURE=true|false` (default `true`)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true|false` (default `false`; required only if you intentionally weaken public inbound auth policy defaults)
   - `LOOM_BRIDGE_EMAIL_SEND_ENABLED=true|false` (default `true`)
   - `LOOM_GATEWAY_SMTP_SUBMIT_ENABLED=true|false` (default `true`)
+- Outbound SSRF hardening:
+  - `LOOM_DENY_METADATA_HOSTS=true|false` (default `true`; blocks common cloud metadata endpoints even when private-network targets are otherwise allowed)
+  - `LOOM_FEDERATION_DELIVER_TIMEOUT_MS` (default `10000`)
+  - `LOOM_FEDERATION_DELIVER_MAX_RESPONSE_BYTES` (default `262144`)
+  - `LOOM_WEBHOOK_MAX_RESPONSE_BYTES` (default `262144`)
+  - Outbound HTTP requests pin DNS resolution per request (validated address is reused for the actual socket connect to reduce DNS rebinding/TOCTOU risk).
 - Optional wire-level legacy gateway daemon:
   - `LOOM_WIRE_GATEWAY_ENABLED=true|false` (default `false`)
   - `LOOM_WIRE_GATEWAY_HOST` (default `127.0.0.1`)
@@ -324,6 +346,14 @@ Optional persistence:
   - `LOOM_WIRE_SMTP_STARTTLS_ENABLED=true|false` (default `true`)
   - `LOOM_WIRE_SMTP_PORT` (default `2525`)
   - `LOOM_WIRE_SMTP_MAX_MESSAGE_BYTES` (default `10485760`)
+  - `LOOM_WIRE_LINE_MAX_BYTES` (default `32768`)
+  - `LOOM_WIRE_LINE_BUFFER_MAX_BYTES` (default `131072`)
+  - `LOOM_WIRE_IDLE_TIMEOUT_MS` (default `120000`)
+  - `LOOM_WIRE_AUTH_MAX_FAILURES` (default `5`)
+  - `LOOM_WIRE_MAX_CONNECTIONS` (default `500`)
+  - `LOOM_WIRE_SMTP_MAX_CONNECTIONS` (default inherits `LOOM_WIRE_MAX_CONNECTIONS`)
+  - `LOOM_WIRE_IMAP_MAX_CONNECTIONS` (default inherits `LOOM_WIRE_MAX_CONNECTIONS`)
+    - `LOOM_WIRE_MAX_CONNECTIONS` is enforced as a global active-connection cap across SMTP and IMAP combined.
   - `LOOM_WIRE_IMAP_ENABLED=true|false` (default `true` when wire gateway enabled)
   - `LOOM_WIRE_IMAP_STARTTLS_ENABLED=true|false` (default `true`)
   - `LOOM_WIRE_IMAP_PORT` (default `1143`)
@@ -337,7 +367,7 @@ Optional persistence:
 
 Production baseline:
 
-- Run behind a reverse proxy that enforces TLS 1.3 and HTTP/2 for public traffic (or enable native TLS/HTTP2 mode with TLSv1.3), and set `LOOM_TRUST_PROXY=true` only when that proxy is trusted and controlled by you.
+- Run behind a reverse proxy that enforces TLS 1.3 and HTTP/2 for public traffic (or enable native TLS/HTTP2 mode with TLSv1.3), set `LOOM_PUBLIC_SERVICE=true`, and keep `LOOM_REQUIRE_HTTPS_FROM_PROXY=true` when proxy-terminating TLS.
 - Use `LOOM_TRUST_PROXY_ALLOWLIST` so forwarded client IP headers are accepted only from trusted proxy source IP/CIDR ranges.
 - Keep `LOOM_DATA_DIR` and/or PostgreSQL storage on durable infrastructure with backups.
 - Run process under a supervisor (systemd/pm2/container orchestrator) for restart and lifecycle management.
@@ -356,6 +386,7 @@ npm test
 
 - This is a protocol-development scaffold, not production-ready.
 - Legacy compatibility now includes both API-level gateway behavior (`/v1/gateway/*` + bridge/relay) and an optional wire-level gateway daemon (SMTP + IMAP + optional STARTTLS + extended mailbox commands). Full parity with all enterprise IMAP/SMTP extensions is still a separate hardening track.
+- Inbound internet-email authentication (SPF/DKIM/DMARC verification and policy enforcement) is expected to run in an upstream MTA; the MVN inbound bridge route should remain private unless explicitly confirmed.
 - Current wire IMAP limitation: `COPY`/`UID COPY` are intentionally rejected because LOOM mailbox state currently models a single effective folder per thread participant.
 - Federation abuse/rate-policy hardening is implemented for baseline operations; deeper interoperability coverage can be extended.
 - Production hardening included in this MVP baseline: payload-size guard, sensitive-route rate limiting, and automatic outbox worker loop.

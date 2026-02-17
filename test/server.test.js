@@ -1157,6 +1157,215 @@ test("API rejects invalid trusted proxy allowlist configuration", () => {
   );
 });
 
+test("API enforces HTTPS via trusted proxy headers when configured", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    publicService: true,
+    requireHttpsFromProxy: true,
+    trustProxy: true,
+    trustProxyAllowlist: "127.0.0.1/32",
+    bridgeInboundEnabled: false
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const missingHeader = await jsonRequest(`${baseUrl}/health`);
+  assert.equal(missingHeader.response.status, 403);
+  assert.equal(missingHeader.body.error.code, "CAPABILITY_DENIED");
+
+  const insecureHeader = await jsonRequest(`${baseUrl}/health`, {
+    headers: {
+      "x-forwarded-proto": "http"
+    }
+  });
+  assert.equal(insecureHeader.response.status, 403);
+  assert.equal(insecureHeader.body.error.code, "CAPABILITY_DENIED");
+
+  const secureHeader = await jsonRequest(`${baseUrl}/health`, {
+    headers: {
+      "x-forwarded-proto": "https"
+    }
+  });
+  assert.equal(secureHeader.response.status, 200);
+  assert.equal(secureHeader.body.ok, true);
+});
+
+test("API requires trusted proxy configuration for strict proxy HTTPS mode", () => {
+  assert.throws(
+    () =>
+      createLoomServer({
+        nodeId: "node.test",
+        domain: "127.0.0.1",
+        publicService: true,
+        requireHttpsFromProxy: true,
+        trustProxy: false
+      }),
+    /LOOM_REQUIRE_HTTPS_FROM_PROXY requires trusted proxy headers/
+  );
+});
+
+test("API rejects metadata webhook targets even when private network access is enabled", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret-token"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const webhookCreate = await jsonRequest(`${baseUrl}/v1/webhooks`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      url: "http://169.254.169.254/latest/meta-data",
+      allow_private_network: true,
+      events: ["*"]
+    })
+  });
+
+  assert.equal(webhookCreate.response.status, 403);
+  assert.equal(webhookCreate.body.error.code, "CAPABILITY_DENIED");
+});
+
+test("API refuses public inbound bridge exposure without explicit confirmation", () => {
+  assert.throws(
+    () =>
+      createLoomServer({
+        nodeId: "node.test",
+        domain: "127.0.0.1",
+        publicService: true,
+        trustProxy: true,
+        bridgeInboundEnabled: true
+      }),
+    /LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true/
+  );
+});
+
+test("API rejects inbound bridge admin requirement without configured admin token", () => {
+  assert.throws(
+    () =>
+      createLoomServer({
+        nodeId: "node.test",
+        domain: "127.0.0.1",
+        bridgeInboundRequireAdminToken: true
+      }),
+    /LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_ADMIN_TOKEN=true requires LOOM_ADMIN_TOKEN/
+  );
+});
+
+test("API applies strict inbound bridge auth defaults on public service", () => {
+  assert.doesNotThrow(() =>
+    createLoomServer({
+      nodeId: "node.test",
+      domain: "127.0.0.1",
+      publicService: true,
+      trustProxy: true,
+      adminToken: "admin-secret-token",
+      bridgeInboundEnabled: true,
+      bridgeInboundPublicConfirmed: true
+    })
+  );
+});
+
+test("API refuses weak inbound bridge auth policy on public service without explicit confirmation", () => {
+  assert.throws(
+    () =>
+      createLoomServer({
+        nodeId: "node.test",
+        domain: "127.0.0.1",
+        publicService: true,
+        trustProxy: true,
+        adminToken: "admin-secret-token",
+        bridgeInboundEnabled: true,
+        bridgeInboundPublicConfirmed: true,
+        bridgeInboundRequireDmarcPass: false
+      }),
+    /LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true/
+  );
+});
+
+test("API requires admin token for inbound bridged email when configured", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret-token",
+    bridgeInboundRequireAdminToken: true
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const aliceKeys = generateSigningKeyPair();
+
+  const registerAlice = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_bridge_admin_1", public_key_pem: aliceKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAlice.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_bridge_admin_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_bridge_admin_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(aliceKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const deniedInbound = await jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      smtp_from: "Sender <sender@example.net>",
+      rcpt_to: ["alice@node.test"],
+      text: "inbound bridge admin-gated message"
+    })
+  });
+  assert.equal(deniedInbound.response.status, 403);
+  assert.equal(deniedInbound.body.error.code, "CAPABILITY_DENIED");
+  assert.equal(deniedInbound.body.error.details?.field, "x-loom-admin-token");
+
+  const acceptedInbound = await jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`,
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      smtp_from: "Sender <sender@example.net>",
+      rcpt_to: ["alice@node.test"],
+      text: "inbound bridge admin-gated message"
+    })
+  });
+  assert.equal(acceptedInbound.response.status, 201, JSON.stringify(acceptedInbound.body));
+});
+
 test("API exposes readiness and protects admin operational endpoints", async (t) => {
   const { server } = createLoomServer({
     nodeId: "node.test",
@@ -4694,6 +4903,155 @@ test("API supports bridge and gateway email surfaces", async (t) => {
     sentMessages.body.messages.some((message) => message.envelope_id === smtpSubmit.body.envelope_id),
     true
   );
+});
+
+test("API quarantines inbound bridged email when auth policy marks message as unverified", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    bridgeInboundRequireAuthResults: true,
+    bridgeInboundQuarantineOnAuthFailure: true,
+    bridgeInboundRejectOnAuthFailure: false
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const aliceKeys = generateSigningKeyPair();
+
+  const registerAlice = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_auth_policy_1", public_key_pem: aliceKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAlice.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_auth_policy_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_auth_policy_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(aliceKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const inbound = await jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      smtp_from: "External Sender <sender@example.net>",
+      rcpt_to: ["alice@node.test"],
+      text: "suspicious inbound",
+      headers: {
+        "Authentication-Results":
+          "mx.example.net; spf=fail smtp.mailfrom=example.net; dkim=fail header.d=example.net; dmarc=fail"
+      }
+    })
+  });
+  assert.equal(inbound.response.status, 201, JSON.stringify(inbound.body));
+  assert.equal(inbound.body.quarantined, true);
+
+  const thread = await jsonRequest(`${baseUrl}/v1/threads/${inbound.body.thread_id}`, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
+  assert.equal(thread.response.status, 200);
+  assert.equal(thread.body.labels.includes("sys.quarantine"), true);
+
+  const envelope = await jsonRequest(`${baseUrl}/v1/envelopes/${inbound.body.envelope_id}`, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
+  assert.equal(envelope.response.status, 200);
+  assert.equal(envelope.body.meta.bridge.auth_results.spf, "fail");
+  assert.equal(envelope.body.meta.bridge.auth_results.dkim, "fail");
+  assert.equal(envelope.body.meta.bridge.auth_results.dmarc, "fail");
+  assert.equal(envelope.body.meta.bridge.auth_results.source, "authentication-results-header");
+});
+
+test("API can reject inbound bridged email when auth failure rejection is enabled", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    bridgeInboundRequireAuthResults: true,
+    bridgeInboundRejectOnAuthFailure: true
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const aliceKeys = generateSigningKeyPair();
+
+  const registerAlice = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_auth_policy_reject_1", public_key_pem: aliceKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAlice.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_auth_policy_reject_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_auth_policy_reject_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(aliceKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const inbound = await jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      smtp_from: "External Sender <sender@example.net>",
+      rcpt_to: ["alice@node.test"],
+      text: "reject inbound auth failure",
+      auth_results: {
+        spf: "fail",
+        dkim: "fail",
+        dmarc: "fail"
+      }
+    })
+  });
+  assert.equal(inbound.response.status, 403);
+  assert.equal(inbound.body.error.code, "CAPABILITY_DENIED");
 });
 
 test("API hardens SMTP and IMAP parsing for edge-case address and header formats", async (t) => {

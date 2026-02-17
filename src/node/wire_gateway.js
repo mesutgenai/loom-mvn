@@ -535,17 +535,43 @@ async function upgradeSocketToTls(socket, secureContext) {
   return tlsSocket;
 }
 
-function createLineSocket(socket, onLine) {
+function createLineSocket(socket, onLine, options = {}) {
+  const maxBufferBytes = parsePositiveInt(options.maxBufferBytes, 128 * 1024);
+  const maxLineBytes = parsePositiveInt(options.maxLineBytes, 32 * 1024);
+  const onBufferOverflow = typeof options.onBufferOverflow === "function" ? options.onBufferOverflow : null;
+  const onLineTooLong = typeof options.onLineTooLong === "function" ? options.onLineTooLong : null;
   let buffer = "";
   socket.setEncoding("utf-8");
   const onData = (chunk) => {
     buffer += chunk;
+    if (Buffer.byteLength(buffer, "utf-8") > maxBufferBytes && buffer.indexOf("\n") === -1) {
+      onBufferOverflow?.();
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+      return;
+    }
+
     let index = buffer.indexOf("\n");
     while (index >= 0) {
       const rawLine = buffer.slice(0, index).replace(/\r$/, "");
       buffer = buffer.slice(index + 1);
+      if (Buffer.byteLength(rawLine, "utf-8") > maxLineBytes) {
+        onLineTooLong?.();
+        if (!socket.destroyed) {
+          socket.destroy();
+        }
+        return;
+      }
       Promise.resolve(onLine(rawLine)).catch(() => {});
       index = buffer.indexOf("\n");
+    }
+
+    if (Buffer.byteLength(buffer, "utf-8") > maxBufferBytes) {
+      onBufferOverflow?.();
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
     }
   };
   socket.on("data", onData);
@@ -563,6 +589,10 @@ function createSmtpGatewayServer(options) {
     requireAuth = true,
     allowInsecureAuth = false,
     maxMessageBytes = 10 * 1024 * 1024,
+    lineMaxBytes = 32 * 1024,
+    lineBufferMaxBytes = 128 * 1024,
+    idleTimeoutMs = 2 * 60 * 1000,
+    maxAuthFailures = 5,
     startTlsEnabled = false,
     tlsContext = null
   } = options;
@@ -579,15 +609,38 @@ function createSmtpGatewayServer(options) {
       },
       dataMode: false,
       dataLines: [],
+      dataBytes: 0,
       authLoginStage: null,
-      authLoginUser: null
+      authLoginUser: null,
+      authFailures: 0
     };
     let activeSocket = socket;
     let detachLineReader = () => {};
 
+    const configureSocketTimeout = () => {
+      if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+        activeSocket.setTimeout(0);
+        return;
+      }
+      activeSocket.setTimeout(idleTimeoutMs);
+      activeSocket.once("timeout", () => {
+        writeLine("421 4.4.2 idle timeout");
+        activeSocket.end();
+      });
+    };
+
     const attachLineReader = () => {
       detachLineReader();
-      detachLineReader = createLineSocket(activeSocket, handleLine);
+      detachLineReader = createLineSocket(activeSocket, handleLine, {
+        maxBufferBytes: lineBufferMaxBytes,
+        maxLineBytes: lineMaxBytes,
+        onBufferOverflow: () => {
+          writeLine("500 5.5.2 line buffer limit exceeded");
+        },
+        onLineTooLong: () => {
+          writeLine("500 5.5.2 line too long");
+        }
+      });
     };
 
     const writeLine = (line) => {
@@ -601,6 +654,15 @@ function createSmtpGatewayServer(options) {
       };
       state.dataMode = false;
       state.dataLines = [];
+      state.dataBytes = 0;
+    };
+
+    const recordAuthFailure = () => {
+      state.authFailures += 1;
+      if (state.authFailures >= Math.max(1, maxAuthFailures)) {
+        writeLine("421 4.7.0 too many authentication failures");
+        activeSocket.end();
+      }
     };
 
     const advertiseEhlo = () => {
@@ -695,9 +757,11 @@ function createSmtpGatewayServer(options) {
         const identity = authenticateGatewayToken(store, token, expectedIdentity);
         if (!identity) {
           writeLine("535 5.7.8 authentication failed");
+          recordAuthFailure();
           return;
         }
         state.authIdentity = identity;
+        state.authFailures = 0;
         writeLine("235 2.7.0 authentication successful");
         return;
       }
@@ -725,9 +789,11 @@ function createSmtpGatewayServer(options) {
         const identity = authenticateGatewayToken(store, payload.token, expectedIdentity);
         if (!identity) {
           writeLine("535 5.7.8 authentication failed");
+          recordAuthFailure();
           return;
         }
         state.authIdentity = identity;
+        state.authFailures = 0;
         writeLine("235 2.7.0 authentication successful");
         return;
       }
@@ -753,6 +819,7 @@ function createSmtpGatewayServer(options) {
       detachLineReader();
       try {
         activeSocket = await upgradeSocketToTls(activeSocket, tlsContext);
+        configureSocketTimeout();
         state.secure = true;
         state.helo = false;
         state.authIdentity = null;
@@ -771,7 +838,14 @@ function createSmtpGatewayServer(options) {
           completeData();
           return;
         }
-        state.dataLines.push(line.startsWith("..") ? line.slice(1) : line);
+        const nextLine = line.startsWith("..") ? line.slice(1) : line;
+        state.dataBytes += Buffer.byteLength(nextLine, "utf-8") + 2;
+        if (state.dataBytes > maxMessageBytes) {
+          resetTransaction();
+          writeLine("552 Message exceeds maximum configured size");
+          return;
+        }
+        state.dataLines.push(nextLine);
         return;
       }
 
@@ -814,9 +888,11 @@ function createSmtpGatewayServer(options) {
         state.authLoginUser = null;
         if (!identity) {
           writeLine("535 5.7.8 authentication failed");
+          recordAuthFailure();
           return;
         }
         state.authIdentity = identity;
+        state.authFailures = 0;
         writeLine("235 2.7.0 authentication successful");
         return;
       }
@@ -921,6 +997,7 @@ function createSmtpGatewayServer(options) {
         }
         state.dataMode = true;
         state.dataLines = [];
+        state.dataBytes = 0;
         writeLine("354 End data with <CR><LF>.<CR><LF>");
         return;
       }
@@ -929,6 +1006,7 @@ function createSmtpGatewayServer(options) {
     };
 
     writeLine("220 LOOM SMTP Gateway ready");
+    configureSocketTimeout();
     attachLineReader();
   });
 
@@ -947,6 +1025,10 @@ function createImapGatewayServer(options) {
     port,
     requireAuth = true,
     allowInsecureAuth = false,
+    lineMaxBytes = 32 * 1024,
+    lineBufferMaxBytes = 128 * 1024,
+    idleTimeoutMs = 2 * 60 * 1000,
+    maxAuthFailures = 5,
     startTlsEnabled = false,
     tlsContext = null
   } = options;
@@ -959,10 +1041,23 @@ function createImapGatewayServer(options) {
       selectedFolder: null,
       selectedMessages: [],
       readOnly: false,
-      idleTag: null
+      idleTag: null,
+      authFailures: 0
     };
     let activeSocket = socket;
     let detachLineReader = () => {};
+
+    const configureSocketTimeout = () => {
+      if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+        activeSocket.setTimeout(0);
+        return;
+      }
+      activeSocket.setTimeout(idleTimeoutMs);
+      activeSocket.once("timeout", () => {
+        writeLine("* BYE idle timeout");
+        activeSocket.end();
+      });
+    };
 
     const writeLine = (line) => {
       activeSocket.write(`${line}\r\n`);
@@ -970,7 +1065,24 @@ function createImapGatewayServer(options) {
 
     const attachLineReader = () => {
       detachLineReader();
-      detachLineReader = createLineSocket(activeSocket, handleLine);
+      detachLineReader = createLineSocket(activeSocket, handleLine, {
+        maxBufferBytes: lineBufferMaxBytes,
+        maxLineBytes: lineMaxBytes,
+        onBufferOverflow: () => {
+          writeLine("* BAD line buffer limit exceeded");
+        },
+        onLineTooLong: () => {
+          writeLine("* BAD line too long");
+        }
+      });
+    };
+
+    const recordAuthFailure = () => {
+      state.authFailures += 1;
+      if (state.authFailures >= Math.max(1, maxAuthFailures)) {
+        writeLine("* BYE too many authentication failures");
+        activeSocket.end();
+      }
     };
 
     const capabilityTokens = () => {
@@ -1155,6 +1267,7 @@ function createImapGatewayServer(options) {
       try {
         activeSocket = await upgradeSocketToTls(activeSocket, tlsContext);
         state.secure = true;
+        configureSocketTimeout();
         attachLineReader();
       } catch {
         activeSocket.destroy();
@@ -1230,9 +1343,11 @@ function createImapGatewayServer(options) {
         const identity = authenticateGatewayToken(store, token, expectedIdentity);
         if (!identity) {
           writeLine(`${tag} NO Authentication failed`);
+          recordAuthFailure();
           return;
         }
         state.authIdentity = identity;
+        state.authFailures = 0;
         writeLine(`${tag} OK LOGIN completed`);
         return;
       }
@@ -1255,9 +1370,11 @@ function createImapGatewayServer(options) {
           const identity = authenticateGatewayToken(store, token, expectedIdentity);
           if (!identity) {
             writeLine(`${tag} NO Authentication failed`);
+            recordAuthFailure();
             return;
           }
           state.authIdentity = identity;
+          state.authFailures = 0;
           writeLine(`${tag} OK AUTHENTICATE completed`);
           return;
         }
@@ -1574,6 +1691,7 @@ function createImapGatewayServer(options) {
     };
 
     writeLine("* OK LOOM IMAP Gateway ready");
+    configureSocketTimeout();
     attachLineReader();
   });
 
@@ -1595,6 +1713,13 @@ export class LoomWireGateway {
     this.allowInsecureAuth = options.allowInsecureAuth === true;
     this.allowInsecureAuthOnPublicBind = options.allowInsecureAuthOnPublicBind === true;
     this.maxMessageBytes = parsePositiveInt(options.maxMessageBytes, 10 * 1024 * 1024);
+    this.lineMaxBytes = parsePositiveInt(options.lineMaxBytes, 32 * 1024);
+    this.lineBufferMaxBytes = parsePositiveInt(options.lineBufferMaxBytes, 128 * 1024);
+    this.idleTimeoutMs = parsePositiveInt(options.idleTimeoutMs, 2 * 60 * 1000);
+    this.maxAuthFailures = parsePositiveInt(options.maxAuthFailures, 5);
+    this.maxConnections = parsePositiveInt(options.maxConnections, 500);
+    this.smtpMaxConnections = parsePositiveInt(options.smtpMaxConnections, this.maxConnections);
+    this.imapMaxConnections = parsePositiveInt(options.imapMaxConnections, this.maxConnections);
     this.smtpEnabled = this.enabled && options.smtpEnabled !== false;
     this.imapEnabled = this.enabled && options.imapEnabled !== false;
     this.smtpStartTlsEnabled = options.smtpStartTlsEnabled !== false;
@@ -1666,6 +1791,17 @@ export class LoomWireGateway {
       host: this.host,
       require_auth: this.requireAuth,
       allow_insecure_auth: this.allowInsecureAuth,
+      max_connections: {
+        total: this.maxConnections,
+        smtp: this.smtpMaxConnections,
+        imap: this.imapMaxConnections
+      },
+      active_connections: {
+        total: this.smtpSockets.size + this.imapSockets.size,
+        smtp: this.smtpSockets.size,
+        imap: this.imapSockets.size
+      },
+      idle_timeout_ms: this.idleTimeoutMs,
       smtp: {
         enabled: this.smtpEnabled,
         configured_port: this.smtpPort,
@@ -1688,6 +1824,23 @@ export class LoomWireGateway {
       return;
     }
 
+    const registerSocket = (socket, protocolSockets, protocolMaxConnections) => {
+      const totalConnections = this.smtpSockets.size + this.imapSockets.size;
+      if (totalConnections >= this.maxConnections) {
+        socket.destroy();
+        return false;
+      }
+      if (protocolSockets.size >= protocolMaxConnections) {
+        socket.destroy();
+        return false;
+      }
+      protocolSockets.add(socket);
+      socket.once("close", () => {
+        protocolSockets.delete(socket);
+      });
+      return true;
+    };
+
     if (this.smtpEnabled && !this.smtpServer) {
       const gateway = createSmtpGatewayServer({
         store: this.store,
@@ -1696,15 +1849,17 @@ export class LoomWireGateway {
         requireAuth: this.requireAuth,
         allowInsecureAuth: this.allowInsecureAuth,
         maxMessageBytes: this.maxMessageBytes,
+        lineMaxBytes: this.lineMaxBytes,
+        lineBufferMaxBytes: this.lineBufferMaxBytes,
+        idleTimeoutMs: this.idleTimeoutMs,
+        maxAuthFailures: this.maxAuthFailures,
         startTlsEnabled: this.smtpStartTlsEnabled && this.tlsEnabled,
         tlsContext: this.tlsContext
       });
       this.smtpServer = gateway.server;
+      this.smtpServer.maxConnections = this.smtpMaxConnections;
       this.smtpServer.on("connection", (socket) => {
-        this.smtpSockets.add(socket);
-        socket.on("close", () => {
-          this.smtpSockets.delete(socket);
-        });
+        registerSocket(socket, this.smtpSockets, this.smtpMaxConnections);
       });
       await new Promise((resolve, reject) => {
         const onError = (error) => {
@@ -1726,15 +1881,17 @@ export class LoomWireGateway {
         port: this.imapPort,
         requireAuth: this.requireAuth,
         allowInsecureAuth: this.allowInsecureAuth,
+        lineMaxBytes: this.lineMaxBytes,
+        lineBufferMaxBytes: this.lineBufferMaxBytes,
+        idleTimeoutMs: this.idleTimeoutMs,
+        maxAuthFailures: this.maxAuthFailures,
         startTlsEnabled: this.imapStartTlsEnabled && this.tlsEnabled,
         tlsContext: this.tlsContext
       });
       this.imapServer = gateway.server;
+      this.imapServer.maxConnections = this.imapMaxConnections;
       this.imapServer.on("connection", (socket) => {
-        this.imapSockets.add(socket);
-        socket.on("close", () => {
-          this.imapSockets.delete(socket);
-        });
+        registerSocket(socket, this.imapSockets, this.imapMaxConnections);
       });
       await new Promise((resolve, reject) => {
         const onError = (error) => {
@@ -1814,6 +1971,13 @@ export function createWireGatewayFromEnv(options = {}) {
       false
     ),
     maxMessageBytes: options.maxMessageBytes ?? process.env.LOOM_WIRE_SMTP_MAX_MESSAGE_BYTES ?? 10 * 1024 * 1024,
+    lineMaxBytes: options.lineMaxBytes ?? process.env.LOOM_WIRE_LINE_MAX_BYTES ?? 32 * 1024,
+    lineBufferMaxBytes: options.lineBufferMaxBytes ?? process.env.LOOM_WIRE_LINE_BUFFER_MAX_BYTES ?? 128 * 1024,
+    idleTimeoutMs: options.idleTimeoutMs ?? process.env.LOOM_WIRE_IDLE_TIMEOUT_MS ?? 2 * 60 * 1000,
+    maxAuthFailures: options.maxAuthFailures ?? process.env.LOOM_WIRE_AUTH_MAX_FAILURES ?? 5,
+    maxConnections: options.maxConnections ?? process.env.LOOM_WIRE_MAX_CONNECTIONS ?? 500,
+    smtpMaxConnections: options.smtpMaxConnections ?? process.env.LOOM_WIRE_SMTP_MAX_CONNECTIONS ?? null,
+    imapMaxConnections: options.imapMaxConnections ?? process.env.LOOM_WIRE_IMAP_MAX_CONNECTIONS ?? null,
     tlsEnabled,
     tlsKeyPem,
     tlsCertPem

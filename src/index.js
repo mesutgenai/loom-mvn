@@ -67,10 +67,6 @@ const tlsProxyConfirmed = parseBoolean(process.env.LOOM_TLS_PROXY_CONFIRMED, fal
 const nativeTlsEnabled = parseBoolean(process.env.LOOM_NATIVE_TLS_ENABLED, false);
 const demoPublicReads = parseBoolean(process.env.LOOM_DEMO_PUBLIC_READS, false);
 const demoPublicReadsConfirmed = parseBoolean(process.env.LOOM_DEMO_PUBLIC_READS_CONFIRMED, false);
-const identityRequireProof = parseBoolean(
-  process.env.LOOM_IDENTITY_REQUIRE_PROOF,
-  isPublicBindHost(process.env.HOST || "127.0.0.1")
-);
 const allowOpenOutboundHostsOnPublicBind = parseBoolean(
   process.env.LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND,
   false
@@ -79,58 +75,75 @@ const federationResolveRemoteIdentities = parseBoolean(
   process.env.LOOM_FEDERATION_REMOTE_IDENTITY_RESOLVE_ENABLED,
   true
 );
+const publicBind = isPublicBindHost(host);
+const publicService = parseBoolean(process.env.LOOM_PUBLIC_SERVICE, publicBind);
+const identityRequireProof = parseBoolean(process.env.LOOM_IDENTITY_REQUIRE_PROOF, publicService);
+const requireHttpsFromProxy = parseBoolean(
+  process.env.LOOM_REQUIRE_HTTPS_FROM_PROXY,
+  publicService && !nativeTlsEnabled
+);
+const trustProxyConfigured =
+  parseBoolean(process.env.LOOM_TRUST_PROXY, false) ||
+  String(process.env.LOOM_TRUST_PROXY_ALLOWLIST || "").trim().length > 0;
 const requirePortableThreadOpCapability = parseBoolean(
   process.env.LOOM_REQUIRE_PORTABLE_THREAD_OP_CAPABILITY,
-  publicBind
+  publicService
 );
 const federationOutboundHostAllowlist = parseHostAllowlist(process.env.LOOM_FEDERATION_HOST_ALLOWLIST);
 const federationBootstrapHostAllowlist = parseHostAllowlist(process.env.LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST);
 const remoteIdentityHostAllowlist = parseHostAllowlist(process.env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST);
 const webhookHostAllowlist = parseHostAllowlist(process.env.LOOM_WEBHOOK_HOST_ALLOWLIST);
-const publicBind = isPublicBindHost(host);
 
-if (publicBind && !adminToken) {
-  throw new Error("Refusing public bind without LOOM_ADMIN_TOKEN");
+if (publicService && !adminToken) {
+  throw new Error("Refusing public service without LOOM_ADMIN_TOKEN");
 }
 
-if (publicBind && metricsPublic && !allowPublicMetricsOnPublicBind) {
+if (publicService && metricsPublic && !allowPublicMetricsOnPublicBind) {
   throw new Error(
-    "Refusing LOOM_METRICS_PUBLIC=true on public bind without LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true"
+    "Refusing LOOM_METRICS_PUBLIC=true on public service without LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true"
   );
 }
 
-if (publicBind && requireTlsProxyOnPublicBind && !tlsProxyConfirmed && !nativeTlsEnabled) {
+if (publicService && requireTlsProxyOnPublicBind && !tlsProxyConfirmed && !nativeTlsEnabled) {
   throw new Error(
-    "Refusing public bind without LOOM_TLS_PROXY_CONFIRMED=true when LOOM_REQUIRE_TLS_PROXY=true (or enable LOOM_NATIVE_TLS_ENABLED=true)"
+    "Refusing public service without LOOM_TLS_PROXY_CONFIRMED=true when LOOM_REQUIRE_TLS_PROXY=true (or enable LOOM_NATIVE_TLS_ENABLED=true)"
   );
 }
 
-if (publicBind && demoPublicReads && !demoPublicReadsConfirmed) {
-  throw new Error("Refusing LOOM_DEMO_PUBLIC_READS=true on public bind without LOOM_DEMO_PUBLIC_READS_CONFIRMED=true");
+if (publicService && demoPublicReads && !demoPublicReadsConfirmed) {
+  throw new Error(
+    "Refusing LOOM_DEMO_PUBLIC_READS=true on public service without LOOM_DEMO_PUBLIC_READS_CONFIRMED=true"
+  );
 }
 
-if (publicBind && !allowOpenOutboundHostsOnPublicBind) {
+if (publicService && requireHttpsFromProxy && !nativeTlsEnabled && !trustProxyConfigured) {
+  throw new Error(
+    "Refusing public service without trusted proxy headers; set LOOM_TRUST_PROXY=true or configure LOOM_TRUST_PROXY_ALLOWLIST"
+  );
+}
+
+if (publicService && !allowOpenOutboundHostsOnPublicBind) {
   if (federationOutboundHostAllowlist.length === 0) {
     throw new Error(
-      "Refusing public bind without LOOM_FEDERATION_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+      "Refusing public service without LOOM_FEDERATION_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
     );
   }
 
   if (federationBootstrapHostAllowlist.length === 0) {
     throw new Error(
-      "Refusing public bind without LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+      "Refusing public service without LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
     );
   }
 
   if (webhookHostAllowlist.length === 0) {
     throw new Error(
-      "Refusing public bind without LOOM_WEBHOOK_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+      "Refusing public service without LOOM_WEBHOOK_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
     );
   }
 
   if (federationResolveRemoteIdentities && remoteIdentityHostAllowlist.length === 0) {
     throw new Error(
-      "Refusing public bind with remote identity resolution enabled and no LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+      "Refusing public service with remote identity resolution enabled and no LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
     );
   }
 }
@@ -207,6 +220,8 @@ const { server, store } = createLoomServer({
   federationSigningPrivateKeyPem,
   identityRequireProof,
   requirePortableThreadOpCapability,
+  publicService,
+  requireHttpsFromProxy,
   persistenceAdapter: postgresPersistence,
   emailRelay,
   runtimeStatusProvider

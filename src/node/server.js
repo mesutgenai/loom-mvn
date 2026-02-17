@@ -458,6 +458,60 @@ function resolveClientIp(req, options = {}) {
   return forwardedIp || directIp;
 }
 
+function normalizeForwardedProto(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === "https" || normalized === "http") {
+    return normalized;
+  }
+  return null;
+}
+
+function extractForwardedProto(req) {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  if (Array.isArray(forwardedProto) && forwardedProto.length > 0) {
+    const [first] = String(forwardedProto[0] || "").split(",");
+    return normalizeForwardedProto(first);
+  }
+  if (typeof forwardedProto === "string" && forwardedProto.trim()) {
+    const [first] = forwardedProto.split(",");
+    return normalizeForwardedProto(first);
+  }
+
+  const forwarded = req.headers.forwarded;
+  if (typeof forwarded !== "string" || !forwarded.trim()) {
+    return null;
+  }
+  const firstSegment = forwarded.split(",")[0] || "";
+  const protoMatch = firstSegment.match(/(?:^|;)\s*proto=([^;]+)/i);
+  if (!protoMatch) {
+    return null;
+  }
+  const cleaned = String(protoMatch[1] || "")
+    .trim()
+    .replace(/^"|"$/g, "");
+  return normalizeForwardedProto(cleaned);
+}
+
+function isRequestSecure(req, options = {}) {
+  const requireHttpsFromProxy = options.requireHttpsFromProxy === true;
+  const trustProxyConfig = options.trustProxyConfig || null;
+  if (req.socket?.encrypted === true) {
+    return true;
+  }
+  if (!requireHttpsFromProxy) {
+    return false;
+  }
+  if (!canTrustProxyHeaders(req, trustProxyConfig)) {
+    return false;
+  }
+  return extractForwardedProto(req) === "https";
+}
+
 function constantTimeEqual(left, right) {
   if (typeof left !== "string" || typeof right !== "string") {
     return false;
@@ -1100,6 +1154,33 @@ export function createLoomServer(options = {}) {
     options.federationRemoteIdentityMaxResponseBytes ?? process.env.LOOM_FEDERATION_REMOTE_IDENTITY_MAX_RESPONSE_BYTES,
     256 * 1024
   );
+  const federationDeliverTimeoutMs = parsePositiveNumber(
+    options.federationDeliverTimeoutMs ?? process.env.LOOM_FEDERATION_DELIVER_TIMEOUT_MS,
+    10 * 1000
+  );
+  const federationDeliverMaxResponseBytes = parsePositiveNumber(
+    options.federationDeliverMaxResponseBytes ?? process.env.LOOM_FEDERATION_DELIVER_MAX_RESPONSE_BYTES,
+    256 * 1024
+  );
+  const webhookMaxResponseBytes = parsePositiveNumber(
+    options.webhookMaxResponseBytes ?? process.env.LOOM_WEBHOOK_MAX_RESPONSE_BYTES,
+    256 * 1024
+  );
+  const auditHmacKeyRaw = options.auditHmacKey ?? process.env.LOOM_AUDIT_HMAC_KEY ?? null;
+  const auditHmacKey =
+    typeof auditHmacKeyRaw === "string" && auditHmacKeyRaw.trim().length > 0 ? auditHmacKeyRaw.trim() : null;
+  const auditRequireMacValidation = parseBoolean(
+    options.auditRequireMacValidation ?? process.env.LOOM_AUDIT_REQUIRE_MAC_VALIDATION,
+    false
+  );
+  const auditValidateChain = parseBoolean(
+    options.auditValidateChain ?? process.env.LOOM_AUDIT_VALIDATE_CHAIN,
+    true
+  );
+  const denyMetadataHosts = parseBoolean(
+    options.denyMetadataHosts ?? process.env.LOOM_DENY_METADATA_HOSTS,
+    true
+  );
   const federationOutboundHostAllowlist = parseHostAllowlist(
     options.federationOutboundHostAllowlist ?? process.env.LOOM_FEDERATION_HOST_ALLOWLIST
   );
@@ -1157,6 +1238,13 @@ export function createLoomServer(options = {}) {
       federationRequireSignedRemoteIdentity,
       federationRemoteIdentityFetchTimeoutMs,
       federationRemoteIdentityMaxResponseBytes,
+      federationDeliverTimeoutMs,
+      federationDeliverMaxResponseBytes,
+      webhookMaxResponseBytes,
+      denyMetadataHosts,
+      auditHmacKey,
+      auditRequireMacValidation,
+      auditValidateChain,
       federationOutboundHostAllowlist,
       federationBootstrapHostAllowlist,
       webhookOutboundHostAllowlist,
@@ -1172,6 +1260,19 @@ export function createLoomServer(options = {}) {
     trustProxyAllowlist:
       options.trustProxyAllowlist ?? process.env.LOOM_TRUST_PROXY_ALLOWLIST ?? null
   });
+  const publicService = parseBoolean(
+    options.publicService ?? process.env.LOOM_PUBLIC_SERVICE,
+    false
+  );
+  const requireHttpsFromProxy = parseBoolean(
+    options.requireHttpsFromProxy ?? process.env.LOOM_REQUIRE_HTTPS_FROM_PROXY,
+    publicService && !nativeTlsConfig.enabled
+  );
+  if (requireHttpsFromProxy && !nativeTlsConfig.enabled && !trustProxyConfig.enabled) {
+    throw new Error(
+      "LOOM_REQUIRE_HTTPS_FROM_PROXY requires trusted proxy headers; set LOOM_TRUST_PROXY=true or LOOM_TRUST_PROXY_ALLOWLIST"
+    );
+  }
   const blobMaxBytes = parsePositiveNumber(options.blobMaxBytes ?? process.env.LOOM_BLOB_MAX_BYTES, 25 * 1024 * 1024);
   const blobMaxPartBytes = parsePositiveNumber(
     options.blobMaxPartBytes ?? process.env.LOOM_BLOB_MAX_PART_BYTES,
@@ -1190,6 +1291,10 @@ export function createLoomServer(options = {}) {
   store.federationRequireSignedRemoteIdentity = federationRequireSignedRemoteIdentity;
   store.federationRemoteIdentityFetchTimeoutMs = Math.max(500, Math.floor(federationRemoteIdentityFetchTimeoutMs));
   store.federationRemoteIdentityMaxResponseBytes = Math.max(1024, Math.floor(federationRemoteIdentityMaxResponseBytes));
+  store.federationDeliverTimeoutMs = Math.max(500, Math.floor(federationDeliverTimeoutMs));
+  store.federationDeliverMaxResponseBytes = Math.max(1024, Math.floor(federationDeliverMaxResponseBytes));
+  store.webhookMaxResponseBytes = Math.max(1024, Math.floor(webhookMaxResponseBytes));
+  store.denyMetadataHosts = denyMetadataHosts;
   store.federationOutboundHostAllowlist = federationOutboundHostAllowlist;
   store.federationBootstrapHostAllowlist = federationBootstrapHostAllowlist;
   store.webhookOutboundHostAllowlist = webhookOutboundHostAllowlist;
@@ -1211,6 +1316,59 @@ export function createLoomServer(options = {}) {
     options.bridgeInboundEnabled ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_ENABLED,
     true
   );
+  const bridgeInboundPublicConfirmed = parseBoolean(
+    options.bridgeInboundPublicConfirmed ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED,
+    false
+  );
+  const bridgeInboundRequireAuthResults = parseBoolean(
+    options.bridgeInboundRequireAuthResults ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_AUTH_RESULTS,
+    publicService && bridgeInboundEnabled
+  );
+  const bridgeInboundRequireDmarcPass = parseBoolean(
+    options.bridgeInboundRequireDmarcPass ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_DMARC_PASS,
+    publicService && bridgeInboundEnabled
+  );
+  const bridgeInboundRequireAdminToken = parseBoolean(
+    options.bridgeInboundRequireAdminToken ??
+      process.env.LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_ADMIN_TOKEN,
+    publicService && bridgeInboundEnabled
+  );
+  const bridgeInboundRejectOnAuthFailure = parseBoolean(
+    options.bridgeInboundRejectOnAuthFailure ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_REJECT_ON_AUTH_FAILURE,
+    publicService && bridgeInboundEnabled
+  );
+  const bridgeInboundWeakAuthPolicyConfirmed = parseBoolean(
+    options.bridgeInboundWeakAuthPolicyConfirmed ??
+      process.env.LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED,
+    false
+  );
+  const bridgeInboundQuarantineOnAuthFailure = parseBoolean(
+    options.bridgeInboundQuarantineOnAuthFailure ??
+      process.env.LOOM_BRIDGE_EMAIL_INBOUND_QUARANTINE_ON_AUTH_FAILURE,
+    true
+  );
+  if (publicService && bridgeInboundEnabled && !bridgeInboundPublicConfirmed) {
+    throw new Error(
+      "Refusing public service with LOOM_BRIDGE_EMAIL_INBOUND_ENABLED=true without LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true"
+    );
+  }
+  if (bridgeInboundEnabled && bridgeInboundRequireAdminToken && !adminToken) {
+    throw new Error(
+      "LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_ADMIN_TOKEN=true requires LOOM_ADMIN_TOKEN"
+    );
+  }
+  if (publicService && bridgeInboundEnabled) {
+    const strictPublicInboundPolicyEnabled =
+      bridgeInboundRequireAdminToken &&
+      bridgeInboundRequireAuthResults &&
+      bridgeInboundRequireDmarcPass &&
+      bridgeInboundRejectOnAuthFailure;
+    if (!strictPublicInboundPolicyEnabled && !bridgeInboundWeakAuthPolicyConfirmed) {
+      throw new Error(
+        "Refusing weak public inbound bridge auth policy; enable strict policy or set LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true"
+      );
+    }
+  }
   const bridgeSendEnabled = parseBoolean(options.bridgeSendEnabled ?? process.env.LOOM_BRIDGE_EMAIL_SEND_ENABLED, true);
   const gatewaySmtpSubmitEnabled = parseBoolean(
     options.gatewaySmtpSubmitEnabled ?? process.env.LOOM_GATEWAY_SMTP_SUBMIT_ENABLED,
@@ -1224,6 +1382,10 @@ export function createLoomServer(options = {}) {
     options.demoPublicReads ?? process.env.LOOM_DEMO_PUBLIC_READS,
     false
   );
+  store.bridgeInboundRequireAuthResults = bridgeInboundRequireAuthResults;
+  store.bridgeInboundRequireDmarcPass = bridgeInboundRequireDmarcPass;
+  store.bridgeInboundRejectOnAuthFailure = bridgeInboundRejectOnAuthFailure;
+  store.bridgeInboundQuarantineOnAuthFailure = bridgeInboundQuarantineOnAuthFailure;
   const runtimeStatusProvider = typeof options.runtimeStatusProvider === "function" ? options.runtimeStatusProvider : null;
   const emailRelay = options.emailRelay || null;
 
@@ -1271,6 +1433,11 @@ export function createLoomServer(options = {}) {
     try {
       path = requestPath(req);
       rateLimiter.enforce(req, path);
+      if (requireHttpsFromProxy && !isRequestSecure(req, { requireHttpsFromProxy, trustProxyConfig })) {
+        throw new LoomError("CAPABILITY_DENIED", "HTTPS is required for this service", 403, {
+          field: "x-forwarded-proto"
+        });
+      }
 
       if (methodIs(req, "GET") && path === "/") {
         sendHtml(res, 200, renderDashboardHtml());
@@ -2079,13 +2246,21 @@ export function createLoomServer(options = {}) {
 
       if (methodIs(req, "POST") && path === "/v1/bridge/email/inbound") {
         assertRouteEnabled(bridgeInboundEnabled, req, path);
+        if (bridgeInboundRequireAdminToken) {
+          requireAdminToken(req, adminToken);
+        }
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
         const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, body);
         if (maybeSendIdempotentReplay(res, idempotency)) {
           return;
         }
-        const accepted = store.createBridgeInboundEnvelope(body, actorIdentity);
+        const accepted = store.createBridgeInboundEnvelope(body, actorIdentity, {
+          requireAuthResults: bridgeInboundRequireAuthResults,
+          requireDmarcPass: bridgeInboundRequireDmarcPass,
+          rejectOnAuthFailure: bridgeInboundRejectOnAuthFailure,
+          quarantineOnAuthFailure: bridgeInboundQuarantineOnAuthFailure
+        });
         storeIdempotentResult(store, idempotency, 201, accepted);
         sendJson(res, 201, accepted);
         return;

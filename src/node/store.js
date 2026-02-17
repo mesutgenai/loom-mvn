@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
@@ -6,6 +6,8 @@ import {
   readFileSync,
   writeFileSync
 } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { join } from "node:path";
@@ -211,10 +213,42 @@ function hostnameMatchesAllowlist(hostname, allowlist = []) {
   return false;
 }
 
+const METADATA_HOST_DENYLIST = new Set([
+  "metadata",
+  "metadata.aws.internal",
+  "metadata.google.internal",
+  "instance-data",
+  "instance-data.ec2.internal"
+]);
+
+function isMetadataHostname(hostname) {
+  const normalized = normalizeHostname(hostname);
+  if (!normalized) {
+    return false;
+  }
+  if (METADATA_HOST_DENYLIST.has(normalized)) {
+    return true;
+  }
+  return normalized.endsWith(".metadata.google.internal");
+}
+
+function isMetadataServiceAddress(value) {
+  const normalized = normalizeIpForChecks(value);
+  if (!normalized) {
+    return false;
+  }
+  if (normalized === "169.254.169.254" || normalized === "169.254.170.2" || normalized === "100.100.100.200") {
+    return true;
+  }
+  return normalized === "fd00:ec2::254";
+}
+
 async function assertOutboundUrlHostAllowed(url, options = {}) {
   const allowPrivateNetwork = options.allowPrivateNetwork === true;
+  const denyMetadataHosts = options.denyMetadataHosts !== false;
   const allowedHosts = normalizeHostnameAllowlist(options.allowedHosts || []);
   const target = url instanceof URL ? url : new URL(String(url || ""));
+  const resolvedAddresses = [];
 
   if (target.username || target.password) {
     throw new LoomError("ENVELOPE_INVALID", "URL credentials are not allowed", 400, {
@@ -229,18 +263,36 @@ async function assertOutboundUrlHostAllowed(url, options = {}) {
     });
   }
 
-  if (!allowPrivateNetwork) {
-    const hostname = target.hostname;
-    const ipVersion = isIP(hostname);
-    if (ipVersion > 0) {
-      if (isPrivateOrLocalIp(hostname)) {
-        throw new LoomError("CAPABILITY_DENIED", "Private or local network URL targets are not allowed", 403, {
-          host: hostname
-        });
-      }
-      return;
-    }
+  const hostname = target.hostname;
+  if (denyMetadataHosts && isMetadataHostname(hostname)) {
+    throw new LoomError("CAPABILITY_DENIED", "Metadata service targets are blocked", 403, {
+      host: hostname
+    });
+  }
 
+  const ipVersion = isIP(hostname);
+  if (ipVersion > 0) {
+    if (denyMetadataHosts && isMetadataServiceAddress(hostname)) {
+      throw new LoomError("CAPABILITY_DENIED", "Metadata service targets are blocked", 403, {
+        host: hostname
+      });
+    }
+    if (!allowPrivateNetwork && isPrivateOrLocalIp(hostname)) {
+      throw new LoomError("CAPABILITY_DENIED", "Private or local network URL targets are not allowed", 403, {
+        host: hostname
+      });
+    }
+    resolvedAddresses.push({
+      address: hostname,
+      family: ipVersion
+    });
+    return {
+      target,
+      resolvedAddresses
+    };
+  }
+
+  if (!allowPrivateNetwork || denyMetadataHosts) {
     let resolved;
     try {
       resolved = await lookup(hostname, { all: true, verbatim: true });
@@ -256,14 +308,187 @@ async function assertOutboundUrlHostAllowed(url, options = {}) {
       });
     }
 
-    const privateAddress = resolved.find((entry) => isPrivateOrLocalIp(entry?.address));
-    if (privateAddress) {
-      throw new LoomError("CAPABILITY_DENIED", "Resolved URL host points to private or local network", 403, {
-        host: hostname,
-        address: privateAddress.address
+    if (denyMetadataHosts) {
+      const metadataAddress = resolved.find((entry) => isMetadataServiceAddress(entry?.address));
+      if (metadataAddress) {
+        throw new LoomError("CAPABILITY_DENIED", "Resolved URL host points to metadata service", 403, {
+          host: hostname,
+          address: metadataAddress.address
+        });
+      }
+    }
+
+    if (!allowPrivateNetwork) {
+      const privateAddress = resolved.find((entry) => isPrivateOrLocalIp(entry?.address));
+      if (privateAddress) {
+        throw new LoomError("CAPABILITY_DENIED", "Resolved URL host points to private or local network", 403, {
+          host: hostname,
+          address: privateAddress.address
+        });
+      }
+    }
+
+    for (const entry of resolved) {
+      const address = normalizeIpForChecks(entry?.address);
+      const family = Number(entry?.family) || isIP(address);
+      if (!address || family <= 0) {
+        continue;
+      }
+      resolvedAddresses.push({
+        address,
+        family
       });
     }
   }
+
+  if (resolvedAddresses.length === 0) {
+    throw new LoomError("NODE_UNREACHABLE", "URL host did not resolve to any usable address", 502, {
+      host: hostname
+    });
+  }
+
+  return {
+    target,
+    resolvedAddresses
+  };
+}
+
+function createPinnedLookup(hostname, resolvedAddresses) {
+  const expectedHost = normalizeHostname(hostname);
+  const pins = Array.from(
+    new Set(
+      (Array.isArray(resolvedAddresses) ? resolvedAddresses : [])
+        .map((entry) => {
+          if (typeof entry === "string") {
+            return normalizeIpForChecks(entry);
+          }
+          return normalizeIpForChecks(entry?.address);
+        })
+        .filter((address) => isIP(address) > 0)
+    )
+  ).map((address) => ({
+    address,
+    family: isIP(address)
+  }));
+
+  if (!expectedHost || pins.length === 0) {
+    return null;
+  }
+
+  let index = 0;
+  return (requestedHost, options, callback) => {
+    const normalizedRequestedHost = normalizeHostname(requestedHost);
+    if (normalizedRequestedHost !== expectedHost) {
+      callback(new Error("Outbound request host mismatch during DNS pinning"));
+      return;
+    }
+
+    if (options?.all === true) {
+      callback(null, pins);
+      return;
+    }
+
+    const selected = pins[index % pins.length];
+    index += 1;
+    callback(null, selected.address, selected.family);
+  };
+}
+
+async function performPinnedOutboundHttpRequest(url, options = {}) {
+  const target = url instanceof URL ? url : new URL(String(url || ""));
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = options.headers && typeof options.headers === "object" ? options.headers : {};
+  const body = options.body == null ? null : Buffer.from(String(options.body), "utf-8");
+  const timeoutMs = Math.max(1, parsePositiveInteger(options.timeoutMs, 10 * 1000));
+  const maxResponseBytes = Math.max(
+    1024,
+    parsePositiveInteger(options.maxResponseBytes, 256 * 1024)
+  );
+  const responseSizeContext =
+    options.responseSizeContext && typeof options.responseSizeContext === "object"
+      ? options.responseSizeContext
+      : {};
+  const rejectRedirects = options.rejectRedirects !== false;
+  const pinnedLookup = createPinnedLookup(target.hostname, options.resolvedAddresses);
+
+  return await new Promise((resolve, reject) => {
+    const requestImpl = target.protocol === "https:" ? httpsRequest : httpRequest;
+    const requestOptions = {
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || undefined,
+      method,
+      path: `${target.pathname}${target.search}`,
+      headers,
+      lookup: pinnedLookup || undefined
+    };
+
+    if (target.protocol === "https:") {
+      requestOptions.servername = target.hostname;
+    }
+
+    const request = requestImpl(requestOptions, (response) => {
+      const chunks = [];
+      let totalBytes = 0;
+
+      response.on("data", (chunk) => {
+        const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        totalBytes += next.length;
+        if (totalBytes > maxResponseBytes) {
+          request.destroy(
+            new LoomError("PAYLOAD_TOO_LARGE", "Response body exceeds configured size limit", 413, {
+              max_response_bytes: maxResponseBytes,
+              ...responseSizeContext
+            })
+          );
+          return;
+        }
+        chunks.push(next);
+      });
+
+      response.on("end", () => {
+        const status = Number(response.statusCode || 0);
+        const locationHeader = response.headers.location;
+        const location = Array.isArray(locationHeader) ? locationHeader[0] : locationHeader;
+        if (rejectRedirects && status >= 300 && status < 400 && location) {
+          reject(
+            new Error(
+              `Outbound request received redirect (${status}) which is disallowed`
+            )
+          );
+          return;
+        }
+
+        resolve({
+          status,
+          ok: status >= 200 && status < 300,
+          headers: response.headers,
+          bodyText: Buffer.concat(chunks, totalBytes).toString("utf-8")
+        });
+      });
+    });
+
+    const timeoutHandle = setTimeout(() => {
+      const timeoutError = new Error(`Outbound request timed out after ${timeoutMs}ms`);
+      timeoutError.name = "AbortError";
+      request.destroy(timeoutError);
+    }, timeoutMs);
+    timeoutHandle.unref?.();
+
+    request.on("error", (error) => {
+      clearTimeout(timeoutHandle);
+      reject(error);
+    });
+
+    request.on("close", () => {
+      clearTimeout(timeoutHandle);
+    });
+
+    if (body != null) {
+      request.write(body);
+    }
+    request.end();
+  });
 }
 
 function normalizeFederationDeliverUrl(value, options = {}) {
@@ -681,6 +906,32 @@ export class LoomStore {
       1024,
       parsePositiveInteger(options.federationRemoteIdentityMaxResponseBytes, 256 * 1024)
     );
+    this.federationDeliverTimeoutMs = Math.max(
+      500,
+      parsePositiveInteger(options.federationDeliverTimeoutMs, 10 * 1000)
+    );
+    this.federationDeliverMaxResponseBytes = Math.max(
+      1024,
+      parsePositiveInteger(options.federationDeliverMaxResponseBytes, 256 * 1024)
+    );
+    this.webhookMaxResponseBytes = Math.max(
+      1024,
+      parsePositiveInteger(options.webhookMaxResponseBytes, 256 * 1024)
+    );
+    this.denyMetadataHosts = options.denyMetadataHosts !== false;
+    this.bridgeInboundRequireAuthResults = options.bridgeInboundRequireAuthResults === true;
+    this.bridgeInboundRequireDmarcPass = options.bridgeInboundRequireDmarcPass === true;
+    this.bridgeInboundRejectOnAuthFailure = options.bridgeInboundRejectOnAuthFailure === true;
+    this.bridgeInboundQuarantineOnAuthFailure = options.bridgeInboundQuarantineOnAuthFailure !== false;
+    this.auditHmacKey =
+      typeof options.auditHmacKey === "string" && options.auditHmacKey.trim().length > 0
+        ? options.auditHmacKey.trim()
+        : null;
+    this.auditRequireMacValidation = options.auditRequireMacValidation === true;
+    this.auditValidateChain = options.auditValidateChain !== false;
+    if (this.auditRequireMacValidation && !this.auditHmacKey) {
+      throw new Error("Audit MAC validation requires an audit HMAC key");
+    }
     this.localIdentityDomain =
       typeof options.localIdentityDomain === "string" && options.localIdentityDomain.trim()
         ? options.localIdentityDomain.trim().toLowerCase()
@@ -1361,10 +1612,100 @@ export class LoomStore {
     this.rebuildIdentityQuotaIndexes();
   }
 
+  buildAuditHashInput(entry) {
+    return JSON.stringify({
+      event_id: entry.event_id,
+      timestamp: entry.timestamp,
+      action: entry.action,
+      payload: entry.payload ?? null,
+      prev_hash: entry.prev_hash ?? null
+    });
+  }
+
+  computeAuditHash(entry) {
+    return createHash("sha256").update(this.buildAuditHashInput(entry), "utf-8").digest("hex");
+  }
+
+  buildAuditMacInput(entry) {
+    return JSON.stringify({
+      event_id: entry.event_id,
+      timestamp: entry.timestamp,
+      action: entry.action,
+      payload: entry.payload ?? null,
+      prev_hash: entry.prev_hash ?? null,
+      hash: entry.hash
+    });
+  }
+
+  computeAuditMac(entry) {
+    if (!this.auditHmacKey) {
+      return null;
+    }
+    return createHmac("sha256", this.auditHmacKey).update(this.buildAuditMacInput(entry), "utf-8").digest("hex");
+  }
+
+  validateAuditEntryOrThrow(entry, expectedPrevHash, index) {
+    const prevHash = entry?.prev_hash ?? null;
+    if ((expectedPrevHash ?? null) !== prevHash) {
+      throw new LoomError("AUDIT_TAMPERED", "Audit chain continuity check failed", 500, {
+        index,
+        expected_prev_hash: expectedPrevHash ?? null,
+        actual_prev_hash: prevHash
+      });
+    }
+
+    const expectedHash = this.computeAuditHash(entry);
+    if (String(entry?.hash || "") !== expectedHash) {
+      throw new LoomError("AUDIT_TAMPERED", "Audit entry hash mismatch", 500, {
+        index
+      });
+    }
+
+    if (!this.auditHmacKey) {
+      return;
+    }
+
+    const mac = String(entry?.mac || "").trim();
+    if (!mac) {
+      if (this.auditRequireMacValidation) {
+        throw new LoomError("AUDIT_TAMPERED", "Audit entry is missing required MAC signature", 500, {
+          index
+        });
+      }
+      return;
+    }
+
+    const expectedMac = this.computeAuditMac(entry);
+    if (mac !== expectedMac) {
+      throw new LoomError("AUDIT_TAMPERED", "Audit entry MAC verification failed", 500, {
+        index
+      });
+    }
+  }
+
   loadAuditFromEntries(entries) {
     const list = Array.isArray(entries) ? entries : [];
-    this.auditEntries = list.map((entry) => ({ ...entry }));
-    this.auditHeadHash = this.auditEntries.length > 0 ? this.auditEntries[this.auditEntries.length - 1].hash : null;
+    let expectedPrevHash = null;
+    const normalized = [];
+
+    for (let index = 0; index < list.length; index += 1) {
+      const raw = list[index];
+      if (!raw || typeof raw !== "object") {
+        throw new LoomError("AUDIT_TAMPERED", "Audit entry is malformed", 500, {
+          index
+        });
+      }
+
+      const entry = { ...raw };
+      if (this.auditValidateChain) {
+        this.validateAuditEntryOrThrow(entry, expectedPrevHash, index);
+      }
+      expectedPrevHash = entry.hash ?? null;
+      normalized.push(entry);
+    }
+
+    this.auditEntries = normalized;
+    this.auditHeadHash = expectedPrevHash;
   }
 
   loadStateFromDisk() {
@@ -1438,8 +1779,11 @@ export class LoomStore {
       prev_hash: this.auditHeadHash
     };
 
-    const hash = createHash("sha256").update(JSON.stringify(entry)).digest("hex");
+    const hash = this.computeAuditHash(entry);
     entry.hash = hash;
+    if (this.auditHmacKey) {
+      entry.mac = this.computeAuditMac(entry);
+    }
     this.auditHeadHash = hash;
     this.auditEntries.push(entry);
 
@@ -1746,6 +2090,17 @@ export class LoomStore {
       });
     }
 
+    if (
+      this.denyMetadataHosts &&
+      (isMetadataHostname(parsedUrl.hostname) ||
+        (isIP(parsedUrl.hostname) > 0 && isMetadataServiceAddress(parsedUrl.hostname)))
+    ) {
+      throw new LoomError("CAPABILITY_DENIED", "Webhook url cannot target metadata services", 403, {
+        field: "url",
+        host: parsedUrl.hostname
+      });
+    }
+
     const allowPrivateNetwork = parseBoolean(payload.allow_private_network, false);
     if (!allowPrivateNetwork && isIP(parsedUrl.hostname) > 0 && isPrivateOrLocalIp(parsedUrl.hostname)) {
       throw new LoomError("CAPABILITY_DENIED", "Webhook url cannot target private or local network", 403, {
@@ -2004,18 +2359,18 @@ export class LoomStore {
     const nonce = `wh_${generateUlid()}`;
     const webhookUrl = webhook.url;
     const parsedUrl = new URL(webhookUrl);
-    await assertOutboundUrlHostAllowed(parsedUrl, {
+    const outboundHostPolicy = await assertOutboundUrlHostAllowed(parsedUrl, {
       allowPrivateNetwork: webhook.allow_private_network === true,
-      allowedHosts: this.webhookOutboundHostAllowlist
+      allowedHosts: this.webhookOutboundHostAllowlist,
+      denyMetadataHosts: this.denyMetadataHosts
     });
     const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
     const signature = signUtf8Message(this.systemSigningPrivateKeyPem, canonical);
 
     try {
       const timeoutMs = Math.max(250, Math.min(parsePositiveInteger(item.timeout_ms, webhook.timeout_ms), 60000));
-      const response = await fetch(webhookUrl, {
+      const response = await performPinnedOutboundHttpRequest(webhookUrl, {
         method: "POST",
-        redirect: "error",
         headers: {
           "content-type": "application/json",
           "x-loom-event-id": item.event_id,
@@ -2027,11 +2382,18 @@ export class LoomStore {
           "x-loom-signature": signature
         },
         body: rawBody,
-        signal: AbortSignal.timeout(timeoutMs)
+        timeoutMs,
+        maxResponseBytes: this.webhookMaxResponseBytes,
+        responseSizeContext: {
+          webhook_id: webhook.id,
+          outbox_id: item.id
+        },
+        resolvedAddresses: outboundHostPolicy.resolvedAddresses,
+        rejectRedirects: true
       });
 
       if (!response.ok) {
-        const responseText = await response.text();
+        const responseText = response.bodyText;
         this.markWebhookOutboxFailure(item, `Webhook response ${response.status}: ${responseText}`, response.status);
         this.persistAndAudit("webhook.outbox.process.failed", {
           outbox_id: item.id,
@@ -2416,27 +2778,31 @@ export class LoomStore {
       });
     }
 
-    await assertOutboundUrlHostAllowed(nodeDocumentUrl, {
+    const outboundHostPolicy = await assertOutboundUrlHostAllowed(nodeDocumentUrl, {
       allowPrivateNetwork,
-      allowedHosts: this.federationBootstrapHostAllowlist
+      allowedHosts: this.federationBootstrapHostAllowlist,
+      denyMetadataHosts: this.denyMetadataHosts
     });
-
-    const abortController = new AbortController();
-    const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
-    timeoutHandle.unref?.();
 
     let response;
     try {
-      response = await fetch(nodeDocumentUrl, {
+      response = await performPinnedOutboundHttpRequest(nodeDocumentUrl, {
         method: "GET",
-        redirect: "error",
         headers: {
           accept: "application/json"
         },
-        signal: abortController.signal
+        timeoutMs,
+        maxResponseBytes,
+        responseSizeContext: {
+          node_document_url: nodeDocumentUrl.toString()
+        },
+        resolvedAddresses: outboundHostPolicy.resolvedAddresses,
+        rejectRedirects: true
       });
     } catch (error) {
-      clearTimeout(timeoutHandle);
+      if (error instanceof LoomError) {
+        throw error;
+      }
       if (error?.name === "AbortError") {
         throw new LoomError("DELIVERY_TIMEOUT", "Federation node discovery timed out", 504, {
           node_document_url: nodeDocumentUrl.toString(),
@@ -2448,7 +2814,6 @@ export class LoomStore {
         reason: error?.message || String(error)
       });
     }
-    clearTimeout(timeoutHandle);
 
     if (!response.ok) {
       throw new LoomError("NODE_UNREACHABLE", `Federation node discovery returned ${response.status}`, 502, {
@@ -2459,14 +2824,7 @@ export class LoomStore {
 
     let nodeDocument;
     try {
-      const rawNodeDocument = await response.text();
-      if (Buffer.byteLength(rawNodeDocument, "utf-8") > maxResponseBytes) {
-        throw new LoomError("PAYLOAD_TOO_LARGE", "Federation node document exceeds allowed size", 413, {
-          node_document_url: nodeDocumentUrl.toString(),
-          max_response_bytes: maxResponseBytes
-        });
-      }
-      nodeDocument = JSON.parse(rawNodeDocument);
+      nodeDocument = JSON.parse(response.bodyText);
     } catch (error) {
       if (error instanceof LoomError) {
         throw error;
@@ -2545,7 +2903,8 @@ export class LoomStore {
 
     await assertOutboundUrlHostAllowed(deliverUrl, {
       allowPrivateNetwork,
-      allowedHosts: this.federationOutboundHostAllowlist
+      allowedHosts: this.federationOutboundHostAllowlist,
+      denyMetadataHosts: this.denyMetadataHosts
     });
 
     const discoveredIdentityResolveUrl = String(
@@ -2568,7 +2927,8 @@ export class LoomStore {
           : this.federationOutboundHostAllowlist;
       await assertOutboundUrlHostAllowed(identityProbeUrl, {
         allowPrivateNetwork,
-        allowedHosts: identityAllowedHosts
+        allowedHosts: identityAllowedHosts,
+        denyMetadataHosts: this.denyMetadataHosts
       });
     }
 
@@ -3795,10 +4155,12 @@ export class LoomStore {
       return item;
     }
 
+    let outboundHostPolicy;
     try {
-      await assertOutboundUrlHostAllowed(parsedUrl, {
+      outboundHostPolicy = await assertOutboundUrlHostAllowed(parsedUrl, {
         allowPrivateNetwork: node.allow_private_network === true,
-        allowedHosts: this.federationOutboundHostAllowlist
+        allowedHosts: this.federationOutboundHostAllowlist,
+        denyMetadataHosts: this.denyMetadataHosts
       });
     } catch (error) {
       this.markOutboxFailure(item, error?.message || "Federation deliver_url host denied");
@@ -3815,9 +4177,8 @@ export class LoomStore {
     const signature = signUtf8Message(this.federationSigningPrivateKeyPem, canonical);
 
     try {
-      const response = await fetch(parsedUrl.toString(), {
+      const response = await performPinnedOutboundHttpRequest(parsedUrl.toString(), {
         method: "POST",
-        redirect: "error",
         headers: {
           "content-type": "application/json",
           "x-loom-node": this.nodeId,
@@ -3826,11 +4187,19 @@ export class LoomStore {
           "x-loom-key-id": this.federationSigningKeyId,
           "x-loom-signature": signature
         },
-        body: rawBody
+        body: rawBody,
+        timeoutMs: this.federationDeliverTimeoutMs,
+        maxResponseBytes: this.federationDeliverMaxResponseBytes,
+        responseSizeContext: {
+          outbox_id: item.id,
+          recipient_node: item.recipient_node
+        },
+        resolvedAddresses: outboundHostPolicy.resolvedAddresses,
+        rejectRedirects: true
       });
 
       if (!response.ok) {
-        const responseText = await response.text();
+        const responseText = response.bodyText;
         this.markOutboxFailure(item, `Remote response ${response.status}: ${responseText}`, response.status);
         this.persistAndAudit("federation.outbox.process.failed", {
           outbox_id: item.id,
@@ -3843,7 +4212,7 @@ export class LoomStore {
 
       let responseJson = null;
       try {
-        responseJson = await response.json();
+        responseJson = response.bodyText ? JSON.parse(response.bodyText) : null;
       } catch {
         responseJson = null;
       }
@@ -3893,7 +4262,14 @@ export class LoomStore {
 
       return item;
     } catch (error) {
-      this.markOutboxFailure(item, error?.message || "Network error");
+      if (error?.name === "AbortError") {
+        this.markOutboxFailure(
+          item,
+          `Federation delivery timed out after ${this.federationDeliverTimeoutMs}ms`
+        );
+      } else {
+        this.markOutboxFailure(item, error?.message || "Network error");
+      }
       this.persistAndAudit("federation.outbox.process.failed", {
         outbox_id: item.id,
         recipient_node: item.recipient_node,
@@ -4279,7 +4655,122 @@ export class LoomStore {
     return false;
   }
 
-  createBridgeInboundEnvelope(payload, actorIdentity) {
+  normalizeBridgeAuthStatus(value, fallback = "none") {
+    const normalized = String(value || "")
+      .trim()
+      .toLowerCase();
+    if (!normalized) {
+      return fallback;
+    }
+
+    if (
+      normalized === "pass" ||
+      normalized === "fail" ||
+      normalized === "softfail" ||
+      normalized === "neutral" ||
+      normalized === "temperror" ||
+      normalized === "permerror" ||
+      normalized === "policy" ||
+      normalized === "none"
+    ) {
+      return normalized;
+    }
+
+    return fallback;
+  }
+
+  parseAuthenticationResultsHeader(value) {
+    const text = String(value || "");
+    if (!text.trim()) {
+      return null;
+    }
+
+    const extract = (name) => {
+      const match = text.match(new RegExp(`(?:^|[;\\s])${name}\\s*=\\s*([a-zA-Z_-]+)`, "i"));
+      return match?.[1] ? this.normalizeBridgeAuthStatus(match[1], "none") : "none";
+    };
+
+    return {
+      spf: extract("spf"),
+      dkim: extract("dkim"),
+      dmarc: extract("dmarc"),
+      source: "authentication-results-header"
+    };
+  }
+
+  resolveBridgeInboundAuthResults(payload, headers) {
+    const fromPayload = payload?.auth_results;
+    if (fromPayload && typeof fromPayload === "object") {
+      return {
+        spf: this.normalizeBridgeAuthStatus(fromPayload.spf, "none"),
+        dkim: this.normalizeBridgeAuthStatus(fromPayload.dkim, "none"),
+        dmarc: this.normalizeBridgeAuthStatus(fromPayload.dmarc, "none"),
+        source: "payload"
+      };
+    }
+
+    const headerValue =
+      payload?.authentication_results ||
+      this.resolveHeaderValue(headers, "authentication-results") ||
+      this.resolveHeaderValue(headers, "x-authentication-results");
+    const parsedHeader = this.parseAuthenticationResultsHeader(headerValue);
+    if (parsedHeader) {
+      return parsedHeader;
+    }
+
+    return {
+      spf: "none",
+      dkim: "none",
+      dmarc: "none",
+      source: "none"
+    };
+  }
+
+  evaluateBridgeInboundAuthPolicy(authResults, options = {}) {
+    const requireAuthResults = options.requireAuthResults === true;
+    const requireDmarcPass = options.requireDmarcPass === true;
+    const rejectOnAuthFailure = options.rejectOnAuthFailure === true;
+    const quarantineOnAuthFailure = options.quarantineOnAuthFailure !== false;
+
+    const spf = this.normalizeBridgeAuthStatus(authResults?.spf, "none");
+    const dkim = this.normalizeBridgeAuthStatus(authResults?.dkim, "none");
+    const dmarc = this.normalizeBridgeAuthStatus(authResults?.dmarc, "none");
+    const source = String(authResults?.source || "none").trim() || "none";
+    const missingAuthResults =
+      source === "none" || (spf === "none" && dkim === "none" && dmarc === "none");
+    const hasPass = spf === "pass" || dkim === "pass" || dmarc === "pass";
+    const failureStatus = new Set(["fail", "softfail", "temperror", "permerror", "policy"]);
+    const authSignalProvided = !missingAuthResults;
+    const authFailed = failureStatus.has(dmarc) || (authSignalProvided && !hasPass);
+    const dmarcRequiredFailed = requireDmarcPass && dmarc !== "pass";
+    const reject = rejectOnAuthFailure && (authFailed || dmarcRequiredFailed || (requireAuthResults && missingAuthResults));
+    const quarantine =
+      quarantineOnAuthFailure && (authFailed || dmarcRequiredFailed || (requireAuthResults && missingAuthResults));
+    const reason = reject || quarantine
+      ? requireAuthResults && missingAuthResults
+        ? "missing_auth_results"
+        : dmarcRequiredFailed
+          ? "dmarc_required_failed"
+          : !hasPass
+            ? "email_auth_unverified"
+            : "email_auth_failed"
+      : null;
+
+    return {
+      normalized: {
+        spf,
+        dkim,
+        dmarc,
+        source
+      },
+      missingAuthResults,
+      reject,
+      quarantine,
+      reason
+    };
+  }
+
+  createBridgeInboundEnvelope(payload, actorIdentity, options = {}) {
     if (!payload || typeof payload !== "object") {
       throw new LoomError("ENVELOPE_INVALID", "Email inbound payload must be an object", 400, {
         field: "payload"
@@ -4317,6 +4808,30 @@ export class LoomStore {
     const envelopeId = `env_${generateUlid()}`;
     const incomingMessageId = this.parseMessageId(payload.message_id || this.resolveHeaderValue(headers, "message-id"));
     const canonicalMessageId = incomingMessageId || `${envelopeId}@${this.nodeId}`;
+    const inboundAuthPolicy = {
+      requireAuthResults:
+        options.requireAuthResults === true ||
+        (options.requireAuthResults == null && this.bridgeInboundRequireAuthResults),
+      requireDmarcPass:
+        options.requireDmarcPass === true ||
+        (options.requireDmarcPass == null && this.bridgeInboundRequireDmarcPass),
+      rejectOnAuthFailure:
+        options.rejectOnAuthFailure === true ||
+        (options.rejectOnAuthFailure == null && this.bridgeInboundRejectOnAuthFailure),
+      quarantineOnAuthFailure:
+        options.quarantineOnAuthFailure == null
+          ? this.bridgeInboundQuarantineOnAuthFailure
+          : options.quarantineOnAuthFailure !== false
+    };
+    const authResults = this.resolveBridgeInboundAuthResults(payload, headers);
+    const authEvaluation = this.evaluateBridgeInboundAuthPolicy(authResults, inboundAuthPolicy);
+    if (authEvaluation.reject) {
+      throw new LoomError("CAPABILITY_DENIED", "Inbound email authentication policy rejected message", 403, {
+        field: "auth_results",
+        reason: authEvaluation.reason,
+        auth_results: authEvaluation.normalized
+      });
+    }
 
     const humanText =
       typeof payload.text === "string" && payload.text.trim().length > 0
@@ -4374,10 +4889,13 @@ export class LoomStore {
           source: "email",
           original_message_id: canonicalMessageId,
           original_headers: headers,
-          auth_results: payload.auth_results || {
-            spf: "none",
-            dkim: "none",
-            dmarc: "none"
+          auth_results: authEvaluation.normalized,
+          auth_policy: {
+            require_auth_results: inboundAuthPolicy.requireAuthResults,
+            require_dmarc_pass: inboundAuthPolicy.requireDmarcPass,
+            reject_on_auth_failure: inboundAuthPolicy.rejectOnAuthFailure,
+            quarantine_on_auth_failure: inboundAuthPolicy.quarantineOnAuthFailure,
+            reason: authEvaluation.reason
           },
           extraction_confidence:
             typeof payload.extraction_confidence === "number" ? payload.extraction_confidence : 0.25
@@ -4398,8 +4916,9 @@ export class LoomStore {
     this.recordEmailMessageIndex(canonicalMessageId, stored.id, stored.thread_id);
     this.recordEmailMessageIndex(`${stored.id}@${this.nodeId}`, stored.id, stored.thread_id);
 
+    const shouldQuarantine = payload.quarantine === true || authEvaluation.quarantine;
     let quarantined = false;
-    if (payload.quarantine === true) {
+    if (shouldQuarantine) {
       quarantined = this.ensureThreadLabel(stored.thread_id, "sys.quarantine");
     } else {
       this.ensureThreadLabel(stored.thread_id, "sys.inbox");
@@ -4409,7 +4928,10 @@ export class LoomStore {
       envelope_id: stored.id,
       thread_id: stored.thread_id,
       message_id: canonicalMessageId,
-      actor: actorIdentity
+      actor: actorIdentity,
+      auth_results: authEvaluation.normalized,
+      quarantined,
+      quarantine_reason: authEvaluation.reason
     });
 
     return {
@@ -6084,22 +6606,32 @@ export class LoomStore {
       this.remoteIdentityHostAllowlist.length > 0
         ? this.remoteIdentityHostAllowlist
         : this.federationOutboundHostAllowlist;
-    await assertOutboundUrlHostAllowed(identityUrl, {
+    const outboundHostPolicy = await assertOutboundUrlHostAllowed(identityUrl, {
       allowPrivateNetwork: node?.allow_private_network === true,
-      allowedHosts
+      allowedHosts,
+      denyMetadataHosts: this.denyMetadataHosts
     });
 
     let response;
     try {
-      response = await fetch(identityUrl, {
+      response = await performPinnedOutboundHttpRequest(identityUrl, {
         method: "GET",
-        redirect: "error",
         headers: {
           accept: "application/json"
         },
-        signal: AbortSignal.timeout(this.federationRemoteIdentityFetchTimeoutMs)
+        timeoutMs: this.federationRemoteIdentityFetchTimeoutMs,
+        maxResponseBytes: this.federationRemoteIdentityMaxResponseBytes,
+        responseSizeContext: {
+          identity: identityUri,
+          node_id: node?.node_id || null
+        },
+        resolvedAddresses: outboundHostPolicy.resolvedAddresses,
+        rejectRedirects: true
       });
     } catch (error) {
+      if (error instanceof LoomError) {
+        throw error;
+      }
       if (error?.name === "AbortError") {
         throw new LoomError("DELIVERY_TIMEOUT", "Remote identity fetch timed out", 504, {
           identity: identityUri,
@@ -6125,15 +6657,7 @@ export class LoomStore {
 
     let payload;
     try {
-      const rawBody = await response.text();
-      if (Buffer.byteLength(rawBody, "utf-8") > this.federationRemoteIdentityMaxResponseBytes) {
-        throw new LoomError("PAYLOAD_TOO_LARGE", "Remote identity response exceeds allowed size", 413, {
-          identity: identityUri,
-          node_id: node?.node_id || null,
-          max_response_bytes: this.federationRemoteIdentityMaxResponseBytes
-        });
-      }
-      payload = JSON.parse(rawBody);
+      payload = JSON.parse(response.bodyText);
     } catch (error) {
       if (error instanceof LoomError) {
         throw error;

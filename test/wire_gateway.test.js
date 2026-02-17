@@ -74,6 +74,36 @@ function createLineWaiter(socket) {
   };
 }
 
+function waitForSocketTermination(socket, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    if (socket.destroyed) {
+      resolve();
+      return;
+    }
+    socket.resume();
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for socket to close"));
+    }, timeoutMs);
+    const onClose = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("close", onClose);
+      socket.off("error", onError);
+    };
+    socket.once("close", onClose);
+    socket.once("error", onError);
+  });
+}
+
 function createIdentityAndToken(store, identity, keyId, keys) {
   store.registerIdentity({
     id: identity,
@@ -524,4 +554,143 @@ test("wire IMAP gateway supports STARTTLS and extended mailbox commands", async 
   tlsSocket.write("a11 LOGOUT\r\n");
   await waitForTls((line) => line.startsWith("* BYE"));
   await waitForTls((line) => line.startsWith("a11 OK"));
+});
+
+test("wire gateway enforces global connection cap across SMTP and IMAP", async (t) => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  const gateway = new LoomWireGateway({
+    store,
+    enabled: true,
+    host: "127.0.0.1",
+    smtpEnabled: true,
+    smtpPort: 0,
+    imapEnabled: true,
+    imapPort: 0,
+    requireAuth: false,
+    allowInsecureAuth: true,
+    maxConnections: 1,
+    smtpMaxConnections: 10,
+    imapMaxConnections: 10
+  });
+  await gateway.start();
+  t.after(async () => {
+    await gateway.stop();
+  });
+
+  const status = gateway.getStatus();
+  const smtpSocket = connectTcp(status.smtp.bound_port, "127.0.0.1");
+  await once(smtpSocket, "connect");
+  t.after(() => {
+    smtpSocket.destroy();
+  });
+  const waitForSmtp = createLineWaiter(smtpSocket);
+  await waitForSmtp((line) => line.startsWith("220 "));
+
+  const imapSocket = connectTcp(status.imap.bound_port, "127.0.0.1");
+  t.after(() => {
+    imapSocket.destroy();
+  });
+  await waitForSocketTermination(imapSocket);
+
+  assert.equal(status.max_connections.total, 1);
+  const refreshedStatus = gateway.getStatus();
+  assert.equal(refreshedStatus.active_connections.total, 1);
+  assert.equal(refreshedStatus.active_connections.smtp, 1);
+  assert.equal(refreshedStatus.active_connections.imap, 0);
+});
+
+test("wire SMTP gateway enforces message size during DATA streaming", async (t) => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  const keys = generateSigningKeyPair();
+  const token = createIdentityAndToken(store, "loom://alice@node.test", "k_sign_alice_1", keys);
+
+  const gateway = new LoomWireGateway({
+    store,
+    enabled: true,
+    host: "127.0.0.1",
+    smtpEnabled: true,
+    smtpPort: 0,
+    imapEnabled: false,
+    requireAuth: true,
+    allowInsecureAuth: true,
+    maxMessageBytes: 64
+  });
+  await gateway.start();
+  t.after(async () => {
+    await gateway.stop();
+  });
+
+  const status = gateway.getStatus();
+  const socket = connectTcp(status.smtp.bound_port, "127.0.0.1");
+  await once(socket, "connect");
+  t.after(() => {
+    socket.destroy();
+  });
+
+  const waitFor = createLineWaiter(socket);
+  await waitFor((line) => line.startsWith("220 "));
+  socket.write("EHLO localhost\r\n");
+  await waitFor((line) => line.startsWith("250 SIZE "));
+
+  const plain = Buffer.from(`\u0000loom://alice@node.test\u0000${token}`, "utf-8").toString("base64");
+  socket.write(`AUTH PLAIN ${plain}\r\n`);
+  await waitFor((line) => line.startsWith("235 "));
+
+  socket.write("MAIL FROM:<alice@node.test>\r\n");
+  await waitFor((line) => line.startsWith("250 "));
+  socket.write("RCPT TO:<bob@node.test>\r\n");
+  await waitFor((line) => line.startsWith("250 "));
+  socket.write("DATA\r\n");
+  await waitFor((line) => line.startsWith("354 "));
+
+  socket.write(`${"x".repeat(256)}\r\n`);
+  await waitFor((line) => line.startsWith("552 "));
+
+  socket.write("QUIT\r\n");
+  await waitFor((line) => line.startsWith("221 "));
+  assert.equal(store.listThreads().length, 0);
+});
+
+test("wire gateway closes oversized unterminated SMTP line buffers", async (t) => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  const gateway = new LoomWireGateway({
+    store,
+    enabled: true,
+    host: "127.0.0.1",
+    smtpEnabled: true,
+    smtpPort: 0,
+    imapEnabled: false,
+    requireAuth: false,
+    allowInsecureAuth: true,
+    lineBufferMaxBytes: 64,
+    lineMaxBytes: 64
+  });
+  await gateway.start();
+  t.after(async () => {
+    await gateway.stop();
+  });
+
+  const status = gateway.getStatus();
+  const socket = connectTcp(status.smtp.bound_port, "127.0.0.1");
+  await once(socket, "connect");
+  t.after(() => {
+    socket.destroy();
+  });
+
+  const waitFor = createLineWaiter(socket);
+  await waitFor((line) => line.startsWith("220 "));
+
+  const closed = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("Expected wire gateway to close oversized socket"));
+    }, 2500);
+    socket.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+
+  socket.write("EHLO ");
+  socket.write("x".repeat(1024));
+  await closed;
 });
