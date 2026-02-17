@@ -1,35 +1,71 @@
-function compareUtf8Lexicographically(left, right) {
-  const leftBuffer = Buffer.from(String(left), "utf-8");
-  const rightBuffer = Buffer.from(String(right), "utf-8");
-  const length = Math.min(leftBuffer.length, rightBuffer.length);
-
-  for (let index = 0; index < length; index += 1) {
-    if (leftBuffer[index] !== rightBuffer[index]) {
-      return leftBuffer[index] - rightBuffer[index];
-    }
+function compareMemberNames(left, right) {
+  if (left === right) {
+    return 0;
   }
-
-  return leftBuffer.length - rightBuffer.length;
+  return left < right ? -1 : 1;
 }
 
-function sortValue(value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => sortValue(item));
-  }
-  if (value && typeof value === "object") {
-    const sorted = {};
-    const keys = Object.keys(value).sort(compareUtf8Lexicographically);
-    for (const key of keys) {
-      sorted[key] = sortValue(value[key]);
+function assertSupportedPrimitive(value, path) {
+  const valueType = typeof value;
+  if (valueType === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`Canonical JSON only supports finite numbers (${path})`);
     }
-    return sorted;
+    return;
   }
-  return value;
+
+  if (valueType === "string" || valueType === "boolean") {
+    return;
+  }
+
+  if (valueType === "bigint" || valueType === "function" || valueType === "symbol" || valueType === "undefined") {
+    throw new TypeError(`Canonical JSON value is not supported (${path})`);
+  }
+}
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function serializeCanonicalJson(value, path = "$") {
+  if (value == null) {
+    return "null";
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value.map((item, index) => serializeCanonicalJson(item, `${path}[${index}]`));
+    return `[${parts.join(",")}]`;
+  }
+
+  const valueType = typeof value;
+  if (valueType !== "object") {
+    assertSupportedPrimitive(value, path);
+    return JSON.stringify(value);
+  }
+
+  if (!isPlainObject(value)) {
+    throw new TypeError(`Canonical JSON requires plain objects (${path})`);
+  }
+
+  const keys = Object.keys(value).sort(compareMemberNames);
+  const members = keys.map((key) => {
+    const memberValue = value[key];
+    const memberPath = `${path}.${key}`;
+    if (memberValue === undefined) {
+      throw new TypeError(`Canonical JSON does not allow undefined values (${memberPath})`);
+    }
+    return `${JSON.stringify(key)}:${serializeCanonicalJson(memberValue, memberPath)}`;
+  });
+  return `{${members.join(",")}}`;
 }
 
 export function canonicalizeJson(value) {
-  const sorted = sortValue(value);
-  return JSON.stringify(sorted);
+  return serializeCanonicalJson(value);
 }
 
 export function canonicalizeEnvelope(envelope, options = {}) {

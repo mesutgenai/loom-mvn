@@ -1,10 +1,59 @@
 import { createLoomServer } from "./node/server.js";
 import { createEmailRelayFromEnv } from "./node/email_relay.js";
 import { createPostgresPersistenceFromEnv } from "./node/persistence_postgres.js";
+import { createWireGatewayFromEnv } from "./node/wire_gateway.js";
+
+function parseBoolean(value, fallback = false) {
+  if (value == null) {
+    return fallback;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function isPublicBindHost(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1") {
+    return false;
+  }
+
+  if (normalized.startsWith("127.")) {
+    return false;
+  }
+
+  return true;
+}
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
 const domain = process.env.LOOM_DOMAIN || `${host}:${port}`;
+const adminToken = process.env.LOOM_ADMIN_TOKEN || null;
+const metricsPublic = parseBoolean(process.env.LOOM_METRICS_PUBLIC, false);
+const allowPublicMetricsOnPublicBind = parseBoolean(process.env.LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND, false);
+const publicBind = isPublicBindHost(host);
+
+if (publicBind && !adminToken) {
+  throw new Error("Refusing public bind without LOOM_ADMIN_TOKEN");
+}
+
+if (publicBind && metricsPublic && !allowPublicMetricsOnPublicBind) {
+  throw new Error(
+    "Refusing LOOM_METRICS_PUBLIC=true on public bind without LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true"
+  );
+}
+
 const federationOutboxAutoProcessIntervalMs = Number(process.env.LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
 const federationOutboxAutoProcessBatchSize = Number(process.env.LOOM_OUTBOX_AUTO_PROCESS_BATCH_SIZE || 20);
 const emailOutboxAutoProcessIntervalMs = Number(process.env.LOOM_EMAIL_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
@@ -55,11 +104,13 @@ const runtimeStatus = {
 };
 
 let storeRef = null;
+let wireGatewayRef = null;
 
 function runtimeStatusProvider() {
   return {
     ...runtimeStatus,
     email_relay: typeof emailRelay.getStatus === "function" ? emailRelay.getStatus() : null,
+    wire_gateway: typeof wireGatewayRef?.getStatus === "function" ? wireGatewayRef.getStatus() : null,
     postgres: typeof postgresPersistence?.getStatus === "function" ? postgresPersistence.getStatus() : null,
     persistence: storeRef?.getPersistenceStatus?.() || null
   };
@@ -69,6 +120,8 @@ const { server, store } = createLoomServer({
   nodeId: process.env.LOOM_NODE_ID || "loom-node.local",
   domain,
   dataDir: process.env.LOOM_DATA_DIR || null,
+  adminToken,
+  metricsPublic,
   federationSigningKeyId: process.env.LOOM_NODE_SIGNING_KEY_ID || "k_node_sign_local_1",
   federationSigningPrivateKeyPem,
   persistenceAdapter: postgresPersistence,
@@ -76,6 +129,8 @@ const { server, store } = createLoomServer({
   runtimeStatusProvider
 });
 storeRef = store;
+const wireGateway = createWireGatewayFromEnv({ store });
+wireGatewayRef = wireGateway;
 
 let federationOutboxTimer = null;
 let isFederationOutboxProcessing = false;
@@ -305,6 +360,12 @@ async function shutdown(signal, exitCode = 0) {
   stopFederationOutboxWorker();
   stopEmailOutboxWorker();
   stopWebhookOutboxWorker();
+  try {
+    await wireGateway.stop();
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("LOOM wire gateway shutdown failed", error);
+  }
   // eslint-disable-next-line no-console
   console.log(`Received ${signal}, shutting down LOOM MVN...`);
 
@@ -348,6 +409,18 @@ async function start() {
   const boundPort = typeof address === "object" && address ? address.port : port;
   // eslint-disable-next-line no-console
   console.log(`LOOM MVN listening at http://${host}:${boundPort}`);
+  if (wireGateway.isEnabled()) {
+    await wireGateway.start();
+    const wireStatus = wireGateway.getStatus();
+    if (wireStatus.smtp.listening) {
+      // eslint-disable-next-line no-console
+      console.log(`LOOM wire SMTP gateway listening at ${wireStatus.host}:${wireStatus.smtp.bound_port}`);
+    }
+    if (wireStatus.imap.listening) {
+      // eslint-disable-next-line no-console
+      console.log(`LOOM wire IMAP gateway listening at ${wireStatus.host}:${wireStatus.imap.bound_port}`);
+    }
+  }
   startFederationOutboxWorker();
   startEmailOutboxWorker();
   startWebhookOutboxWorker();

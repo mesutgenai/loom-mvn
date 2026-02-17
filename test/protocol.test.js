@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { canonicalizeEnvelope } from "../src/protocol/canonical.js";
+import { canonicalizeEnvelope, canonicalizeJson } from "../src/protocol/canonical.js";
 import {
   generateSigningKeyPair,
   signEnvelope,
@@ -76,6 +77,33 @@ test("canonical envelope excludes signature and meta", () => {
   assert.equal(canonical.includes("signature"), false);
   assert.equal(canonical.includes("meta"), false);
   assert.equal(canonical.includes("\"loom\":\"1.1\""), true);
+});
+
+test("canonical JSON uses deterministic member ordering and rejects unsupported values", () => {
+  const canonical = canonicalizeJson({
+    z: 1,
+    a: {
+      d: false,
+      c: [3, 2, 1]
+    }
+  });
+  assert.equal(canonical, "{\"a\":{\"c\":[3,2,1],\"d\":false},\"z\":1}");
+
+  assert.throws(
+    () =>
+      canonicalizeJson({
+        bad: Number.NaN
+      }),
+    /finite numbers/
+  );
+
+  assert.throws(
+    () =>
+      canonicalizeJson({
+        bad: undefined
+      }),
+    /undefined/
+  );
 });
 
 test("signed envelope verifies; tampered envelope fails verification", () => {
@@ -159,6 +187,67 @@ test("store persists state to disk when dataDir is configured", () => {
     const threads = storeB.listThreads();
     assert.equal(threads.length, 1);
     assert.equal(threads[0].id, envelope.thread_id);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("store persists federation nonce replay cache across restart", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "loom-federation-nonce-"));
+  try {
+    const remoteNodeKeys = generateSigningKeyPair();
+    const nodeId = "remote.test";
+    const keyId = "k_node_sign_remote_1";
+    const method = "POST";
+    const path = "/v1/federation/deliver";
+    const rawBody = JSON.stringify({ loom: "1.1", envelopes: [] });
+    const timestamp = new Date().toISOString();
+    const nonce = `nonce_${Date.now()}`;
+    const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+    const canonical = `${method}\n${path}\n${bodyHash}\n${timestamp}\n${nonce}`;
+    const signature = signUtf8Message(remoteNodeKeys.privateKeyPem, canonical);
+
+    const headers = {
+      "x-loom-node": nodeId,
+      "x-loom-timestamp": timestamp,
+      "x-loom-nonce": nonce,
+      "x-loom-key-id": keyId,
+      "x-loom-signature": signature
+    };
+
+    const storeA = new LoomStore({ nodeId: "local.test", dataDir });
+    storeA.registerFederationNode({
+      node_id: nodeId,
+      key_id: keyId,
+      public_key_pem: remoteNodeKeys.publicKeyPem
+    });
+
+    await storeA.verifyFederationRequest({
+      method,
+      path,
+      headers,
+      rawBody,
+      bypassChallenge: true
+    });
+
+    const storeB = new LoomStore({ nodeId: "local.test", dataDir });
+    storeB.registerFederationNode({
+      node_id: nodeId,
+      key_id: keyId,
+      public_key_pem: remoteNodeKeys.publicKeyPem
+    });
+
+    await assert.rejects(
+      () =>
+        storeB.verifyFederationRequest({
+          method,
+          path,
+          headers,
+          rawBody,
+          bypassChallenge: true
+        }),
+      (error) => error?.code === "SIGNATURE_INVALID"
+    );
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
   }
@@ -590,11 +679,14 @@ test("thread_op requires capability token for non-owner and consumes single-use 
     },
     "loom://alice@node.test"
   );
+  assert.equal(typeof capability.presentation_token, "string");
+  const listedBefore = store.listCapabilities(threadId, "loom://alice@node.test");
+  assert.equal(listedBefore[0].presentation_token, undefined);
 
-  const resolveWithCapability = signEnvelope(
+  const resolveWithPayloadCapabilityToken = signEnvelope(
     {
       loom: "1.1",
-      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FC3",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FC4",
       thread_id: threadId,
       parent_id: root.id,
       type: "thread_op",
@@ -619,8 +711,43 @@ test("thread_op requires capability token for non-owner and consumes single-use 
     bobKeys.privateKeyPem,
     "k_sign_bob_1"
   );
+  assert.throws(
+    () => store.ingestEnvelope(resolveWithPayloadCapabilityToken),
+    (error) => error?.code === "ENVELOPE_INVALID"
+  );
 
-  store.ingestEnvelope(resolveWithCapability);
+  const resolveWithCapability = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FC3",
+      thread_id: threadId,
+      parent_id: root.id,
+      type: "thread_op",
+      from: {
+        identity: "loom://bob@node.test",
+        display: "Bob",
+        key_id: "k_sign_bob_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://alice@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:12:30Z",
+      priority: "normal",
+      content: {
+        structured: {
+          intent: "thread.resolve@v1",
+          parameters: {}
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    bobKeys.privateKeyPem,
+    "k_sign_bob_1"
+  );
+
+  store.ingestEnvelope(resolveWithCapability, {
+    capabilityPresentationToken: capability.presentation_token
+  });
 
   const thread = store.getThread(threadId);
   assert.equal(thread.state, "resolved");
@@ -774,9 +901,7 @@ test("delegation authorization uses server-required action context", () => {
       content: {
         structured: {
           intent: "thread.resolve@v1",
-          parameters: {
-            capability_token: capability.id
-          }
+          parameters: {}
         },
         encrypted: false
       },
@@ -789,7 +914,8 @@ test("delegation authorization uses server-required action context", () => {
   assert.throws(
     () =>
       store.ingestEnvelope(threadOp, {
-        requiredActions: ["thread.op.execute@v1"]
+        requiredActions: ["thread.op.execute@v1"],
+        capabilityPresentationToken: capability.presentation_token
       }),
     (error) => error?.code === "DELEGATION_INVALID"
   );

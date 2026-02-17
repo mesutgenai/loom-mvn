@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { BlockList, isIP } from "node:net";
 
 import { toErrorResponse, LoomError } from "../protocol/errors.js";
 import { LoomStore } from "./store.js";
@@ -193,16 +194,182 @@ function resolveDelegationRequiredActionsForRoute(path, envelope) {
   return [];
 }
 
-function resolveClientIp(req) {
+function normalizeIpLiteral(value) {
+  const raw = String(value || "")
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .split("%")[0]
+    .trim()
+    .toLowerCase();
+  if (!raw) {
+    return "";
+  }
+  if (raw.startsWith("::ffff:")) {
+    const mapped = raw.slice("::ffff:".length);
+    if (isIP(mapped) === 4) {
+      return mapped;
+    }
+  }
+  return raw;
+}
+
+function parseTrustedProxyAllowlist(value) {
+  if (value == null) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean);
+  }
+
+  return String(value)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function buildTrustedProxyBlockList(entries) {
+  const blockList = new BlockList();
+
+  for (const entry of entries) {
+    const [rawAddress, rawPrefix] = entry.split("/");
+    const address = normalizeIpLiteral(rawAddress);
+    const family = isIP(address);
+
+    if (!family) {
+      throw new Error(`Invalid LOOM_TRUST_PROXY_ALLOWLIST entry: ${entry}`);
+    }
+
+    const type = family === 6 ? "ipv6" : "ipv4";
+    if (rawPrefix != null && rawPrefix !== "") {
+      const prefix = Number(rawPrefix);
+      const maxPrefix = family === 6 ? 128 : 32;
+      if (!Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
+        throw new Error(`Invalid LOOM_TRUST_PROXY_ALLOWLIST CIDR prefix: ${entry}`);
+      }
+      blockList.addSubnet(address, prefix, type);
+      continue;
+    }
+
+    blockList.addAddress(address, type);
+  }
+
+  return blockList;
+}
+
+function resolveTrustedProxyConfig(options = {}) {
+  const rawTrustProxy = options.trustProxy;
+  const rawAllowlist = options.trustProxyAllowlist;
+  const allowlistFromTrustProxy =
+    typeof rawTrustProxy === "string" && !["1", "true", "yes", "on", "0", "false", "no", "off"].includes(rawTrustProxy.trim().toLowerCase())
+      ? rawTrustProxy
+      : null;
+  const enabled = parseBoolean(rawTrustProxy, false) || Boolean(allowlistFromTrustProxy);
+  const allowlist = [
+    ...parseTrustedProxyAllowlist(allowlistFromTrustProxy),
+    ...parseTrustedProxyAllowlist(rawAllowlist)
+  ];
+
+  if (!enabled) {
+    return {
+      enabled: false,
+      trustAll: false,
+      allowlist: [],
+      blockList: null
+    };
+  }
+
+  if (allowlist.length === 0) {
+    return {
+      enabled: true,
+      trustAll: true,
+      allowlist: [],
+      blockList: null
+    };
+  }
+
+  return {
+    enabled: true,
+    trustAll: false,
+    allowlist,
+    blockList: buildTrustedProxyBlockList(allowlist)
+  };
+}
+
+function canTrustProxyHeaders(req, trustProxyConfig) {
+  if (!trustProxyConfig?.enabled) {
+    return false;
+  }
+
+  if (trustProxyConfig.trustAll) {
+    return true;
+  }
+
+  const remoteAddress = normalizeIpLiteral(req.socket?.remoteAddress || "");
+  const family = isIP(remoteAddress);
+  if (!family) {
+    return false;
+  }
+
+  return trustProxyConfig.blockList.check(remoteAddress, family === 6 ? "ipv6" : "ipv4");
+}
+
+function extractForwardedClientIp(req) {
   const forwardedFor = req.headers["x-forwarded-for"];
-  if (typeof forwardedFor === "string" && forwardedFor.trim()) {
-    const [first] = forwardedFor.split(",");
-    if (first && first.trim()) {
-      return first.trim();
+  if (typeof forwardedFor !== "string" || !forwardedFor.trim()) {
+    return null;
+  }
+
+  const [first] = forwardedFor.split(",");
+  if (!first || !first.trim()) {
+    return null;
+  }
+
+  let candidate = first.trim().replace(/^for=/i, "");
+  if (candidate.startsWith('"') && candidate.endsWith('"')) {
+    candidate = candidate.slice(1, -1);
+  }
+
+  if (candidate.startsWith("[") && candidate.includes("]")) {
+    const closing = candidate.indexOf("]");
+    candidate = candidate.slice(1, closing);
+  } else {
+    const maybeIpv4Port = candidate.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/);
+    if (maybeIpv4Port) {
+      candidate = maybeIpv4Port[1];
     }
   }
 
-  return req.socket?.remoteAddress || "unknown";
+  const normalized = normalizeIpLiteral(candidate);
+  return isIP(normalized) > 0 ? normalized : null;
+}
+
+function resolveClientIp(req, options = {}) {
+  const directIp = normalizeIpLiteral(req.socket?.remoteAddress || "") || "unknown";
+  const trustProxy = options.trustProxyConfig || null;
+
+  if (!canTrustProxyHeaders(req, trustProxy)) {
+    return directIp;
+  }
+
+  const forwardedIp = extractForwardedClientIp(req);
+  return forwardedIp || directIp;
+}
+
+function constantTimeEqual(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") {
+    return false;
+  }
+
+  const leftBuffer = Buffer.from(left, "utf-8");
+  const rightBuffer = Buffer.from(right, "utf-8");
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function isSensitiveRoute(method, path) {
@@ -211,6 +378,7 @@ function isSensitiveRoute(method, path) {
   }
 
   if (
+    path === "/v1/identity" ||
     path === "/v1/auth/challenge" ||
     path === "/v1/auth/token" ||
     path === "/v1/auth/refresh" ||
@@ -227,6 +395,7 @@ function isSensitiveRoute(method, path) {
     path === "/v1/federation/challenge" ||
     path === "/v1/federation/outbox/process" ||
     path === "/v1/federation/nodes/bootstrap" ||
+    path.startsWith("/v1/mailbox/threads/") ||
     path === "/v1/envelopes"
   ) {
     return true;
@@ -258,6 +427,12 @@ function createRateLimiter(config) {
   const windowMs = parsePositiveNumber(config.windowMs, DEFAULT_RATE_LIMIT_WINDOW_MS);
   const defaultMax = parsePositiveNumber(config.defaultMax, DEFAULT_RATE_LIMIT_DEFAULT_MAX);
   const sensitiveMax = parsePositiveNumber(config.sensitiveMax, DEFAULT_RATE_LIMIT_SENSITIVE_MAX);
+  const trustProxyConfig = config.trustProxyConfig || {
+    enabled: false,
+    trustAll: false,
+    allowlist: [],
+    blockList: null
+  };
   const enabled = windowMs > 0 && (defaultMax > 0 || sensitiveMax > 0);
 
   function sweep(nowMs) {
@@ -283,7 +458,7 @@ function createRateLimiter(config) {
         return;
       }
 
-      const ip = resolveClientIp(req);
+      const ip = resolveClientIp(req, { trustProxyConfig });
       const bucket = sensitive ? "sensitive" : "default";
       const key = `${bucket}:${ip}`;
       const now = Date.now();
@@ -328,6 +503,18 @@ function getBearerToken(req) {
   return token;
 }
 
+function getCapabilityPresentationToken(req) {
+  const raw = req.headers["x-loom-capability-token"];
+  if (Array.isArray(raw)) {
+    return raw[0] || null;
+  }
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function requireActorIdentity(req, store) {
   const token = getBearerToken(req);
   const session = store.authenticateAccessToken(token);
@@ -364,11 +551,22 @@ function requireAdminToken(req, adminToken) {
   }
 
   const provided = getAdminToken(req);
-  if (!provided || provided !== adminToken) {
+  if (!provided || !constantTimeEqual(provided, adminToken)) {
     throw new LoomError("CAPABILITY_DENIED", "Admin token required", 403, {
       field: "x-loom-admin-token"
     });
   }
+}
+
+function assertRouteEnabled(enabled, req, path) {
+  if (enabled) {
+    return;
+  }
+
+  throw new LoomError("ENVELOPE_NOT_FOUND", "Route not found", 404, {
+    method: req.method,
+    path
+  });
 }
 
 function statusClass(status) {
@@ -722,14 +920,42 @@ export function createLoomServer(options = {}) {
     options.maxBodyBytes ?? process.env.LOOM_MAX_BODY_BYTES,
     DEFAULT_MAX_BODY_BYTES
   );
+  const trustProxyConfig = resolveTrustedProxyConfig({
+    trustProxy: options.trustProxy ?? process.env.LOOM_TRUST_PROXY,
+    trustProxyAllowlist:
+      options.trustProxyAllowlist ?? process.env.LOOM_TRUST_PROXY_ALLOWLIST ?? null
+  });
+  const blobMaxBytes = parsePositiveNumber(options.blobMaxBytes ?? process.env.LOOM_BLOB_MAX_BYTES, 25 * 1024 * 1024);
+  const blobMaxPartBytes = parsePositiveNumber(
+    options.blobMaxPartBytes ?? process.env.LOOM_BLOB_MAX_PART_BYTES,
+    2 * 1024 * 1024
+  );
+  const blobMaxParts = parsePositiveNumber(options.blobMaxParts ?? process.env.LOOM_BLOB_MAX_PARTS, 64);
+  store.blobMaxBytes = blobMaxBytes;
+  store.blobMaxPartBytes = blobMaxPartBytes;
+  store.blobMaxParts = blobMaxParts;
   const rateLimiter = createRateLimiter({
     windowMs: options.rateLimitWindowMs ?? process.env.LOOM_RATE_LIMIT_WINDOW_MS,
     defaultMax: options.rateLimitDefaultMax ?? process.env.LOOM_RATE_LIMIT_DEFAULT_MAX,
-    sensitiveMax: options.rateLimitSensitiveMax ?? process.env.LOOM_RATE_LIMIT_SENSITIVE_MAX
+    sensitiveMax: options.rateLimitSensitiveMax ?? process.env.LOOM_RATE_LIMIT_SENSITIVE_MAX,
+    trustProxyConfig
   });
   const metrics = createOperationalMetrics();
   const adminToken = options.adminToken ?? process.env.LOOM_ADMIN_TOKEN ?? null;
   const metricsPublic = parseBoolean(options.metricsPublic ?? process.env.LOOM_METRICS_PUBLIC, false);
+  const identitySignupEnabled = parseBoolean(
+    options.identitySignupEnabled ?? process.env.LOOM_IDENTITY_SIGNUP_ENABLED,
+    true
+  );
+  const bridgeInboundEnabled = parseBoolean(
+    options.bridgeInboundEnabled ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_ENABLED,
+    true
+  );
+  const bridgeSendEnabled = parseBoolean(options.bridgeSendEnabled ?? process.env.LOOM_BRIDGE_EMAIL_SEND_ENABLED, true);
+  const gatewaySmtpSubmitEnabled = parseBoolean(
+    options.gatewaySmtpSubmitEnabled ?? process.env.LOOM_GATEWAY_SMTP_SUBMIT_ENABLED,
+    true
+  );
   const requestLogEnabled = parseBoolean(options.requestLogEnabled ?? process.env.LOOM_REQUEST_LOG_ENABLED, false);
   const requestLogFormat = normalizeLogFormat(
     options.requestLogFormat ?? process.env.LOOM_REQUEST_LOG_FORMAT ?? "json"
@@ -741,7 +967,7 @@ export function createLoomServer(options = {}) {
     const reqId = `req_${randomUUID()}`;
     const startedAt = Date.now();
     const method = String(req.method || "GET").toUpperCase();
-    const clientIp = resolveClientIp(req);
+    const clientIp = resolveClientIp(req, { trustProxyConfig });
     let path = "unknown";
     let errorCode = null;
     metrics.onRequestStart();
@@ -1021,6 +1247,9 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "POST") && path === "/v1/identity") {
+        if (!identitySignupEnabled) {
+          requireAdminToken(req, adminToken);
+        }
         const body = await readJson(req, maxBodyBytes);
         const identity = store.registerIdentity(body);
         sendJson(res, 201, identity);
@@ -1063,6 +1292,7 @@ export function createLoomServer(options = {}) {
 
       if (methodIs(req, "POST") && path === "/v1/envelopes") {
         const actorIdentity = requireActorIdentity(req, store);
+        const capabilityPresentationToken = getCapabilityPresentationToken(req);
         const envelope = await readJson(req, maxBodyBytes);
         const requiredActions = Array.from(
           new Set([
@@ -1076,7 +1306,8 @@ export function createLoomServer(options = {}) {
         }
         const stored = store.ingestEnvelope(envelope, {
           actorIdentity,
-          requiredActions
+          requiredActions,
+          capabilityPresentationToken
         });
         storeIdempotentResult(store, idempotency, 201, stored);
         sendJson(res, 201, stored);
@@ -1085,6 +1316,7 @@ export function createLoomServer(options = {}) {
 
       if (methodIs(req, "POST") && path.startsWith("/v1/threads/") && path.endsWith("/ops")) {
         const actorIdentity = requireActorIdentity(req, store);
+        const capabilityPresentationToken = getCapabilityPresentationToken(req);
         const threadId = path.slice("/v1/threads/".length, -"/ops".length);
         const envelope = await readJson(req, maxBodyBytes);
         const requiredActions = Array.from(
@@ -1120,7 +1352,8 @@ export function createLoomServer(options = {}) {
         }
         const stored = store.ingestEnvelope(envelope, {
           actorIdentity,
-          requiredActions
+          requiredActions,
+          capabilityPresentationToken
         });
         storeIdempotentResult(store, idempotency, 201, stored);
         sendJson(res, 201, stored);
@@ -1160,10 +1393,10 @@ export function createLoomServer(options = {}) {
           });
         }
 
-        if (store.requiresRecipientDeliveryWrapper(envelope)) {
+        if (store.requiresRecipientDeliveryWrapper(envelope) || store.envelopeContainsCapabilitySecret(envelope)) {
           const actorIdentity = resolveOptionalActorIdentity(req, store);
           if (!actorIdentity) {
-            throw new LoomError("CAPABILITY_DENIED", "Authentication required for recipient-view envelope", 403, {
+            throw new LoomError("CAPABILITY_DENIED", "Authentication required for protected envelope view", 403, {
               envelope_id: envelopeId
             });
           }
@@ -1439,6 +1672,24 @@ export function createLoomServer(options = {}) {
         return;
       }
 
+      if (path.startsWith("/v1/mailbox/threads/") && path.endsWith("/state")) {
+        const actorIdentity = requireActorIdentity(req, store);
+        const threadId = path.slice("/v1/mailbox/threads/".length, -"/state".length);
+
+        if (methodIs(req, "GET")) {
+          const state = store.getThreadMailboxState(threadId, actorIdentity);
+          sendJson(res, 200, state);
+          return;
+        }
+
+        if (methodIs(req, "PATCH")) {
+          const body = await readJson(req, maxBodyBytes);
+          const updated = store.updateThreadMailboxState(threadId, actorIdentity, body);
+          sendJson(res, 200, updated);
+          return;
+        }
+      }
+
       if (methodIs(req, "GET") && path === "/v1/threads") {
         sendJson(res, 200, { threads: store.listThreads() });
         return;
@@ -1473,6 +1724,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "POST") && path === "/v1/bridge/email/inbound") {
+        assertRouteEnabled(bridgeInboundEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
         const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, body);
@@ -1494,6 +1746,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "POST") && path === "/v1/bridge/email/send") {
+        assertRouteEnabled(bridgeSendEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
         const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, body);
@@ -1568,6 +1821,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "POST") && path === "/v1/gateway/smtp/submit") {
+        assertRouteEnabled(gatewaySmtpSubmitEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
         const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, body);
@@ -1589,8 +1843,10 @@ export function createLoomServer(options = {}) {
           });
         }
 
-        const requiresRecipientView = envelopes.some((envelope) => store.requiresRecipientDeliveryWrapper(envelope));
-        if (requiresRecipientView) {
+        const requiresProtectedView = envelopes.some(
+          (envelope) => store.requiresRecipientDeliveryWrapper(envelope) || store.envelopeContainsCapabilitySecret(envelope)
+        );
+        if (requiresProtectedView) {
           const actorIdentity = requireActorIdentity(req, store);
           const views = store.getThreadEnvelopesForIdentity(threadId, actorIdentity);
           sendJson(res, 200, {

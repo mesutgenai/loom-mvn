@@ -104,27 +104,31 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 ## MVN features implemented
 
 - Envelope shape validation (`loom: "1.1"`, ids, recipients, content checks)
-- Canonical JSON serialization (excludes `signature` and `meta`)
+- RFC8785-style canonical JSON serialization (excludes `signature` and `meta`, deterministic member ordering, rejects unsupported/non-finite values)
 - Ed25519 envelope signing and verification
 - Thread DAG validation and canonical rendering order
 - Proof-of-key auth (`challenge` -> signed nonce -> bearer token)
-- Basic capability token issuance/revocation with thread epoch checks
+- Capability token hardening: one-time presentation secret, hashed-at-rest secret tracking, and header-based `thread_op` authorization
 - `thread_op` authorization with owner/capability enforcement
 - Agent delegation-chain verification with signature/scope/revocation checks
 - Optional disk persistence (`LOOM_DATA_DIR`) with hash-chained audit log
 - Signed inbound federation verification with replay protection
+- Federation replay nonce persistence in node snapshots (prevents nonce replay after restart when persistence is enabled)
 - Federation node policies: `trusted`, `quarantine`, `deny`
 - Federation node key rotation support (`signing_keys` + `active_key_id`)
-- Federation node auto-discovery bootstrap from `/.well-known/loom.json`
+- Federation node auto-discovery bootstrap from `/.well-known/loom.json` with SSRF guards (HTTPS by default, no redirects, response-size cap, private-network block by default)
 - Federation inbound abuse controls: per-node rate limit + max envelopes per delivery
 - Federation reputation automation: auto-quarantine/auto-deny for repeatedly failing nodes
 - Federation distributed guard support: global inbound rate controls and shared abuse/challenge state via persistence adapter
 - Federation challenge escalation + challenge token flow (`/v1/federation/challenge`)
 - Signed federation delivery receipts with optional strict verification
-- Outbound federation outbox with retry-based store-and-forward processing
+- Outbound federation outbox with retry-based store-and-forward processing and per-node deliver URL safety enforcement
 - SMTP/IMAP gateway interoperability hardening (address-list parsing, case-insensitive headers, folder aliases)
+- Optional wire-level legacy gateway daemon (SMTP submission + IMAP mailbox access) for legacy clients, with optional STARTTLS support and extended IMAP commands (`STATUS`, `SEARCH`, `FETCH`, `STORE`, `APPEND`, `IDLE`, `MOVE`, `UID SEARCH`, `UID FETCH`, `UID STORE`, `UID MOVE`)
 - Recipient-view delivery wrappers for BCC privacy (`delivery.wrapper@v1`) with per-recipient visible roster
+- Per-user mailbox state (`seen`, `flagged`, `archived`, `deleted`) without mutating other participants
 - Idempotency-key replay protection for key POST mutations
+- Webhook destination hardening (private-network block by default with per-webhook override)
 - Admin persistence operations: schema status, backup export, and restore
 - In-memory node API:
   - `GET /.well-known/loom.json`
@@ -154,6 +158,8 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `GET /v1/gateway/imap/folders`
   - `GET /v1/gateway/imap/folders/{folder}/messages?limit=...`
   - `POST /v1/gateway/smtp/submit`
+  - `GET /v1/mailbox/threads/{id}/state`
+  - `PATCH /v1/mailbox/threads/{id}/state`
   - `POST /v1/blobs`
   - `PUT /v1/blobs/{id}/parts/{n}`
   - `POST /v1/blobs/{id}/complete`
@@ -210,7 +216,13 @@ Optional persistence:
   - On startup, node hydrates from Postgres first when configured.
 - Set `LOOM_NODE_SIGNING_PRIVATE_KEY_PEM` and `LOOM_NODE_SIGNING_KEY_ID` to enable outbound signed federation delivery.
 - Set `LOOM_MAX_BODY_BYTES` to cap request payload size (default `2097152`).
+- Set blob limits to control attachment abuse ceilings:
+  - `LOOM_BLOB_MAX_BYTES` (default `26214400`)
+  - `LOOM_BLOB_MAX_PART_BYTES` (default `2097152`)
+  - `LOOM_BLOB_MAX_PARTS` (default `64`)
 - Set `LOOM_RATE_LIMIT_WINDOW_MS`, `LOOM_RATE_LIMIT_DEFAULT_MAX`, and `LOOM_RATE_LIMIT_SENSITIVE_MAX` for API rate limits.
+- Set `LOOM_TRUST_PROXY=true` only when the node is behind a trusted reverse proxy that sets `X-Forwarded-For`.
+- Prefer explicit trusted proxy allowlist with `LOOM_TRUST_PROXY_ALLOWLIST` (comma-separated IP/CIDR values).
 - Set `LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process federation outbox.
 - Set `LOOM_FEDERATION_NODE_RATE_WINDOW_MS` (default `60000`) and `LOOM_FEDERATION_NODE_RATE_MAX` (default `120`) for per-node inbound federation rate limiting.
 - Set `LOOM_FEDERATION_GLOBAL_RATE_WINDOW_MS` (default `60000`) and `LOOM_FEDERATION_GLOBAL_RATE_MAX` (default `1000`) for global inbound federation rate limiting.
@@ -231,6 +243,11 @@ Optional persistence:
 - Set `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process webhook outbox.
 - Set `LOOM_ADMIN_TOKEN` to protect operational endpoints (`/metrics`, `/v1/admin/status`).
 - Set `LOOM_METRICS_PUBLIC=true` only if you intentionally want unauthenticated `/metrics`.
+- Set `LOOM_IDENTITY_SIGNUP_ENABLED=false` to require admin token for `POST /v1/identity`.
+- Public-bind startup safeguards:
+  - Server refuses startup on public bind without `LOOM_ADMIN_TOKEN`.
+  - Server refuses `LOOM_METRICS_PUBLIC=true` on public bind unless `LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true`.
+- For `thread_op` submissions by non-owner participants, send capability secret via `x-loom-capability-token` header (not `content.structured.parameters.capability_token`).
 - Optional request logging:
   - `LOOM_REQUEST_LOG_ENABLED=true`
   - `LOOM_REQUEST_LOG_FORMAT=json|text` (default `json`)
@@ -239,10 +256,30 @@ Optional persistence:
   - `LOOM_SMTP_DEFAULT_FROM`
   - `LOOM_SMTP_URL` or (`LOOM_SMTP_HOST`, `LOOM_SMTP_PORT`, `LOOM_SMTP_SECURE`, `LOOM_SMTP_USER`, `LOOM_SMTP_PASS`)
   - Optional TLS tuning: `LOOM_SMTP_REQUIRE_TLS`, `LOOM_SMTP_REJECT_UNAUTHORIZED`
+- Optional API send-surface kill switches:
+  - `LOOM_BRIDGE_EMAIL_INBOUND_ENABLED=true|false` (default `true`)
+  - `LOOM_BRIDGE_EMAIL_SEND_ENABLED=true|false` (default `true`)
+  - `LOOM_GATEWAY_SMTP_SUBMIT_ENABLED=true|false` (default `true`)
+- Optional wire-level legacy gateway daemon:
+  - `LOOM_WIRE_GATEWAY_ENABLED=true|false` (default `false`)
+  - `LOOM_WIRE_GATEWAY_HOST` (default `127.0.0.1`)
+  - `LOOM_WIRE_GATEWAY_REQUIRE_AUTH=true|false` (default `true`)
+  - `LOOM_WIRE_SMTP_ENABLED=true|false` (default `true` when wire gateway enabled)
+  - `LOOM_WIRE_SMTP_STARTTLS_ENABLED=true|false` (default `true`)
+  - `LOOM_WIRE_SMTP_PORT` (default `2525`)
+  - `LOOM_WIRE_SMTP_MAX_MESSAGE_BYTES` (default `10485760`)
+  - `LOOM_WIRE_IMAP_ENABLED=true|false` (default `true` when wire gateway enabled)
+  - `LOOM_WIRE_IMAP_STARTTLS_ENABLED=true|false` (default `true`)
+  - `LOOM_WIRE_IMAP_PORT` (default `1143`)
+  - `LOOM_WIRE_TLS_ENABLED=true|false` (default `false`)
+  - TLS material (required when wire TLS is enabled):
+    - inline PEMs: `LOOM_WIRE_TLS_CERT_PEM`, `LOOM_WIRE_TLS_KEY_PEM`
+    - or file paths: `LOOM_WIRE_TLS_CERT_FILE`, `LOOM_WIRE_TLS_KEY_FILE`
 
 Production baseline:
 
-- Run behind TLS/reverse proxy and forward client IP (`X-Forwarded-For`) for accurate rate limiting.
+- Run behind TLS/reverse proxy, and set `LOOM_TRUST_PROXY=true` only when that proxy is trusted and controlled by you.
+- Use `LOOM_TRUST_PROXY_ALLOWLIST` so forwarded client IP headers are accepted only from trusted proxy source IP/CIDR ranges.
 - Keep `LOOM_DATA_DIR` and/or PostgreSQL storage on durable infrastructure with backups.
 - Run process under a supervisor (systemd/pm2/container orchestrator) for restart and lifecycle management.
 - Set `LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS=0` only if another worker is responsible for outbox processing.
@@ -259,6 +296,8 @@ npm test
 ## Notes
 
 - This is a protocol-development scaffold, not production-ready.
+- Legacy compatibility now includes both API-level gateway behavior (`/v1/gateway/*` + bridge/relay) and an optional wire-level gateway daemon (SMTP + IMAP + optional STARTTLS + extended mailbox commands). Full parity with all enterprise IMAP/SMTP extensions is still a separate hardening track.
+- Current wire IMAP limitation: `COPY`/`UID COPY` are intentionally rejected because LOOM mailbox state currently models a single effective folder per thread participant.
 - Federation abuse/rate-policy hardening is implemented for baseline operations; deeper interoperability coverage can be extended.
 - Production hardening included in this MVP baseline: payload-size guard, sensitive-route rate limiting, and automatic outbox worker loop.
 - Operational surfaces included: `/ready`, Prometheus `/metrics`, `/v1/admin/status`, outbound email relay outbox with worker automation.

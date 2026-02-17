@@ -6,6 +6,8 @@ import {
   readFileSync,
   writeFileSync
 } from "node:fs";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { join } from "node:path";
 
 import {
@@ -43,6 +45,195 @@ function parseTime(value) {
 function parsePositiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (value == null) {
+    return fallback;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function containsHeaderUnsafeChars(value) {
+  return /[\r\n\0]/.test(String(value || ""));
+}
+
+function normalizeIpForChecks(ip) {
+  return String(ip || "")
+    .trim()
+    .toLowerCase()
+    .split("%")[0];
+}
+
+function isPrivateOrLocalIpv4(ip) {
+  const parts = String(ip || "")
+    .split(".")
+    .map((value) => Number(value));
+  if (parts.length !== 4 || parts.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) {
+    return true;
+  }
+
+  const [a, b] = parts;
+  if (a === 10 || a === 127 || a === 0) {
+    return true;
+  }
+  if (a === 169 && b === 254) {
+    return true;
+  }
+  if (a === 172 && b >= 16 && b <= 31) {
+    return true;
+  }
+  if (a === 192 && b === 168) {
+    return true;
+  }
+  if (a === 100 && b >= 64 && b <= 127) {
+    return true;
+  }
+  if (a === 198 && (b === 18 || b === 19)) {
+    return true;
+  }
+  return a >= 224;
+}
+
+function isPrivateOrLocalIpv6(ip) {
+  const normalized = normalizeIpForChecks(ip);
+  if (!normalized) {
+    return true;
+  }
+
+  if (normalized === "::1" || normalized === "::") {
+    return true;
+  }
+
+  if (normalized.startsWith("fc") || normalized.startsWith("fd")) {
+    return true;
+  }
+
+  if (
+    normalized.startsWith("fe8") ||
+    normalized.startsWith("fe9") ||
+    normalized.startsWith("fea") ||
+    normalized.startsWith("feb")
+  ) {
+    return true;
+  }
+
+  if (normalized.startsWith("::ffff:")) {
+    const mappedIpv4 = normalized.slice("::ffff:".length);
+    if (isIP(mappedIpv4) === 4) {
+      return isPrivateOrLocalIpv4(mappedIpv4);
+    }
+  }
+
+  return false;
+}
+
+function isPrivateOrLocalIp(ip) {
+  const normalized = normalizeIpForChecks(ip);
+  const version = isIP(normalized);
+  if (version === 4) {
+    return isPrivateOrLocalIpv4(normalized);
+  }
+  if (version === 6) {
+    return isPrivateOrLocalIpv6(normalized);
+  }
+  return true;
+}
+
+async function assertOutboundUrlHostAllowed(url, options = {}) {
+  const allowPrivateNetwork = options.allowPrivateNetwork === true;
+  const target = url instanceof URL ? url : new URL(String(url || ""));
+
+  if (target.username || target.password) {
+    throw new LoomError("ENVELOPE_INVALID", "URL credentials are not allowed", 400, {
+      field: "url"
+    });
+  }
+
+  if (!allowPrivateNetwork) {
+    const hostname = target.hostname;
+    const ipVersion = isIP(hostname);
+    if (ipVersion > 0) {
+      if (isPrivateOrLocalIp(hostname)) {
+        throw new LoomError("CAPABILITY_DENIED", "Private or local network URL targets are not allowed", 403, {
+          host: hostname
+        });
+      }
+      return;
+    }
+
+    let resolved;
+    try {
+      resolved = await lookup(hostname, { all: true, verbatim: true });
+    } catch {
+      throw new LoomError("NODE_UNREACHABLE", "Failed to resolve URL host", 502, {
+        host: hostname
+      });
+    }
+
+    if (!Array.isArray(resolved) || resolved.length === 0) {
+      throw new LoomError("NODE_UNREACHABLE", "URL host did not resolve to any address", 502, {
+        host: hostname
+      });
+    }
+
+    const privateAddress = resolved.find((entry) => isPrivateOrLocalIp(entry?.address));
+    if (privateAddress) {
+      throw new LoomError("CAPABILITY_DENIED", "Resolved URL host points to private or local network", 403, {
+        host: hostname,
+        address: privateAddress.address
+      });
+    }
+  }
+}
+
+function normalizeFederationDeliverUrl(value, options = {}) {
+  if (value == null || String(value).trim().length === 0) {
+    return null;
+  }
+
+  let target;
+  try {
+    target = new URL(String(value));
+  } catch {
+    throw new LoomError("ENVELOPE_INVALID", "deliver_url must be a valid absolute URL", 400, {
+      field: "deliver_url"
+    });
+  }
+
+  if (target.username || target.password) {
+    throw new LoomError("ENVELOPE_INVALID", "deliver_url must not include credentials", 400, {
+      field: "deliver_url"
+    });
+  }
+
+  const allowInsecureHttp = options.allowInsecureHttp === true;
+  if (target.protocol !== "https:" && !(allowInsecureHttp && target.protocol === "http:")) {
+    throw new LoomError("ENVELOPE_INVALID", "deliver_url must use https unless allow_insecure_http=true", 400, {
+      field: "deliver_url",
+      protocol: target.protocol
+    });
+  }
+
+  if (options.allowPrivateNetwork !== true) {
+    const hostname = target.hostname;
+    if (isIP(hostname) > 0 && isPrivateOrLocalIp(hostname)) {
+      throw new LoomError("CAPABILITY_DENIED", "deliver_url cannot target private or local IPs", 403, {
+        field: "deliver_url",
+        host: hostname
+      });
+    }
+  }
+
+  return target.toString();
 }
 
 function isExpiredIso(value) {
@@ -128,6 +319,12 @@ function canonicalizeDeliveryWrapper(wrapper) {
 
 function deliveryWrapperKey(envelopeId, recipientIdentity) {
   return `${String(envelopeId || "").trim()}:${String(recipientIdentity || "").trim()}`;
+}
+
+function hashCapabilityPresentationToken(tokenValue) {
+  return createHash("sha256")
+    .update(`loom.capability.v1\n${String(tokenValue || "").trim()}`, "utf-8")
+    .digest("hex");
 }
 
 function mergeFederationSigningKeys(baseKeys = [], nextKeys = []) {
@@ -268,6 +465,7 @@ export class LoomStore {
     this.accessTokens = new Map();
     this.refreshTokens = new Map();
     this.capabilitiesById = new Map();
+    this.capabilityIdBySecretHash = new Map();
     this.delegationsById = new Map();
     this.revokedDelegationIds = new Set();
     this.blobsById = new Map();
@@ -284,6 +482,9 @@ export class LoomStore {
     this.idempotencyByKey = new Map();
     this.idempotencyTtlMs = Math.max(1000, parsePositiveInteger(options.idempotencyTtlMs, 24 * 60 * 60 * 1000));
     this.idempotencyMaxEntries = Math.max(100, parsePositiveInteger(options.idempotencyMaxEntries, 10000));
+    this.blobMaxBytes = Math.max(1024, parsePositiveInteger(options.blobMaxBytes, 25 * 1024 * 1024));
+    this.blobMaxPartBytes = Math.max(1024, parsePositiveInteger(options.blobMaxPartBytes, 2 * 1024 * 1024));
+    this.blobMaxParts = Math.max(1, parsePositiveInteger(options.blobMaxParts, 64));
     this.federationInboundRateWindowMs = Math.max(
       1000,
       parsePositiveInteger(options.federationNodeRateWindowMs, 60 * 1000)
@@ -394,6 +595,9 @@ export class LoomStore {
     this.envelopesById = new Map((state.envelopes || []).map((item) => [item.id, item]));
     this.threadsById = new Map((state.threads || []).map((item) => [item.id, item]));
     for (const thread of this.threadsById.values()) {
+      if (!thread.mailbox_state || typeof thread.mailbox_state !== "object") {
+        thread.mailbox_state = {};
+      }
       if (Number.isFinite(Number(thread.pending_parent_count))) {
         thread.pending_parent_count = Math.max(0, Number(thread.pending_parent_count || 0));
         continue;
@@ -408,6 +612,24 @@ export class LoomStore {
       thread.pending_parent_count = pendingCount;
     }
     this.capabilitiesById = new Map((state.capabilities || []).map((item) => [item.id, item]));
+    this.capabilityIdBySecretHash = new Map();
+    for (const capability of this.capabilitiesById.values()) {
+      if (!capability.secret_hash) {
+        capability.secret_hash = hashCapabilityPresentationToken(`legacy-revoked:${capability.id || "unknown"}`);
+        capability.secret_hint = null;
+        capability.revoked = true;
+        capability.revoked_at = capability.revoked_at || nowIso();
+      }
+      if (capability.secret_hash) {
+        this.capabilityIdBySecretHash.set(capability.secret_hash, capability.id);
+      }
+      if (!capability.created_at) {
+        capability.created_at = nowIso();
+      }
+      if (capability.secret_last_used_at == null) {
+        capability.secret_last_used_at = null;
+      }
+    }
     this.delegationsById = new Map((state.delegations || []).map((item) => [item.id, item]));
     this.revokedDelegationIds = new Set(state.revoked_delegation_ids || []);
     this.blobsById = new Map((state.blobs || []).map((item) => [item.id, item]));
@@ -419,6 +641,17 @@ export class LoomStore {
         const activeKey = signingKeys.find((key) => key.key_id === node.key_id) || signingKeys[0];
         node.key_id = activeKey.key_id;
         node.public_key_pem = activeKey.public_key_pem;
+      }
+
+      node.allow_insecure_http = node.allow_insecure_http === true;
+      node.allow_private_network = node.allow_private_network === true;
+      try {
+        node.deliver_url = normalizeFederationDeliverUrl(node.deliver_url, {
+          allowInsecureHttp: node.allow_insecure_http,
+          allowPrivateNetwork: node.allow_private_network
+        });
+      } catch {
+        node.deliver_url = null;
       }
 
       node.reputation_score = Math.max(0, Number(node.reputation_score || 0));
@@ -449,6 +682,21 @@ export class LoomStore {
     this.webhooksById = new Map((state.webhooks || []).map((item) => [item.id, item]));
     this.webhookOutboxById = new Map((state.webhook_outbox || []).map((item) => [item.id, item]));
     this.emailMessageIndexById = new Map((state.email_message_index || []).map((item) => [item.message_id, item]));
+    const persistedNonces = Array.isArray(state.federation_nonces) ? state.federation_nonces : [];
+    this.federationNonceCache = new Map(
+      persistedNonces
+        .map((entry) => {
+          if (Array.isArray(entry) && entry.length === 2) {
+            return [String(entry[0] || ""), Number(entry[1])];
+          }
+          if (entry && typeof entry === "object") {
+            return [String(entry.key || entry.nonce || ""), Number(entry.seen_at_ms || entry.seen_at || 0)];
+          }
+          return ["", Number.NaN];
+        })
+        .filter(([key, seenAt]) => key.length > 0 && Number.isFinite(seenAt))
+    );
+    this.cleanupFederationNonces();
   }
 
   loadAuditFromEntries(entries) {
@@ -485,6 +733,7 @@ export class LoomStore {
   }
 
   toSerializableState() {
+    this.cleanupFederationNonces();
     return {
       loom_version: "1.1",
       node_id: this.nodeId,
@@ -503,7 +752,8 @@ export class LoomStore {
       delivery_wrappers: Array.from(this.deliveryWrappersByEnvelopeAndIdentity.values()),
       webhooks: Array.from(this.webhooksById.values()),
       webhook_outbox: Array.from(this.webhookOutboxById.values()),
-      email_message_index: Array.from(this.emailMessageIndexById.values())
+      email_message_index: Array.from(this.emailMessageIndexById.values()),
+      federation_nonces: Array.from(this.federationNonceCache.entries())
     };
   }
 
@@ -807,9 +1057,33 @@ export class LoomStore {
       });
     }
 
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      throw new LoomError("ENVELOPE_INVALID", "Webhook url must be a valid http(s) URL", 400, {
+        field: "url"
+      });
+    }
+
+    if (parsedUrl.username || parsedUrl.password) {
+      throw new LoomError("ENVELOPE_INVALID", "Webhook url must not include credentials", 400, {
+        field: "url"
+      });
+    }
+
+    const allowPrivateNetwork = parseBoolean(payload.allow_private_network, false);
+    if (!allowPrivateNetwork && isIP(parsedUrl.hostname) > 0 && isPrivateOrLocalIp(parsedUrl.hostname)) {
+      throw new LoomError("CAPABILITY_DENIED", "Webhook url cannot target private or local network", 403, {
+        field: "url",
+        host: parsedUrl.hostname
+      });
+    }
+
     const webhook = {
       id: `wh_${generateUlid()}`,
       url,
+      allow_private_network: allowPrivateNetwork,
       events: this.normalizeWebhookEvents(payload.events),
       active: payload.active !== false,
       max_attempts: Math.max(1, Math.min(parsePositiveInteger(payload.max_attempts, 8), 20)),
@@ -1056,6 +1330,9 @@ export class LoomStore {
     const nonce = `wh_${generateUlid()}`;
     const webhookUrl = webhook.url;
     const parsedUrl = new URL(webhookUrl);
+    await assertOutboundUrlHostAllowed(parsedUrl, {
+      allowPrivateNetwork: webhook.allow_private_network === true
+    });
     const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
     const signature = signUtf8Message(this.systemSigningPrivateKeyPem, canonical);
 
@@ -1063,6 +1340,7 @@ export class LoomStore {
       const timeoutMs = Math.max(250, Math.min(parsePositiveInteger(item.timeout_ms, webhook.timeout_ms), 60000));
       const response = await fetch(webhookUrl, {
         method: "POST",
+        redirect: "error",
         headers: {
           "content-type": "application/json",
           "x-loom-event-id": item.event_id,
@@ -1325,6 +1603,14 @@ export class LoomStore {
     const signingKeys = replaceSigningKeys
       ? payloadSigningKeys
       : mergeFederationSigningKeys(existingSigningKeys, payloadSigningKeys);
+    const hasAllowInsecureHttp = Object.prototype.hasOwnProperty.call(payload, "allow_insecure_http");
+    const hasAllowPrivateNetwork = Object.prototype.hasOwnProperty.call(payload, "allow_private_network");
+    const allowInsecureHttp = hasAllowInsecureHttp
+      ? parseBoolean(payload.allow_insecure_http, false)
+      : existing?.allow_insecure_http === true;
+    const allowPrivateNetwork = hasAllowPrivateNetwork
+      ? parseBoolean(payload.allow_private_network, false)
+      : existing?.allow_private_network === true;
 
     if (signingKeys.length === 0) {
       throw new LoomError("ENVELOPE_INVALID", "At least one federation signing key is required", 400, {
@@ -1341,13 +1627,19 @@ export class LoomStore {
     const configuredPolicy = hasExplicitPolicy
       ? String(payload.policy || "trusted")
       : existing?.configured_policy || existing?.policy || "trusted";
+    const deliverUrl = normalizeFederationDeliverUrl(payload.deliver_url || existing?.deliver_url || null, {
+      allowInsecureHttp,
+      allowPrivateNetwork
+    });
 
     const node = {
       node_id: nodeId,
       key_id: activeKey.key_id,
       public_key_pem: activeKey.public_key_pem,
       signing_keys: signingKeys,
-      deliver_url: payload.deliver_url || existing?.deliver_url || null,
+      deliver_url: deliverUrl,
+      allow_insecure_http: allowInsecureHttp,
+      allow_private_network: allowPrivateNetwork,
       configured_policy: configuredPolicy,
       policy: configuredPolicy,
       auto_policy: hasExplicitPolicy ? null : existing?.auto_policy || null,
@@ -1412,7 +1704,10 @@ export class LoomStore {
     }
 
     const allowInsecureHttp = payload.allow_insecure_http === true;
+    const allowPrivateNetwork = payload.allow_private_network === true;
+    const allowCrossHostDeliverUrl = payload.allow_cross_host_deliver_url === true;
     const timeoutMs = Math.max(500, Math.min(parsePositiveInteger(payload.timeout_ms, 5000), 20000));
+    const maxResponseBytes = Math.max(1024, Math.min(parsePositiveInteger(payload.max_response_bytes, 256 * 1024), 1024 * 1024));
 
     const nodeDocumentUrlRaw = this.resolveFederationBootstrapNodeDocumentUrl(payload);
     let nodeDocumentUrl;
@@ -1424,12 +1719,22 @@ export class LoomStore {
       });
     }
 
+    if (nodeDocumentUrl.username || nodeDocumentUrl.password) {
+      throw new LoomError("ENVELOPE_INVALID", "node_document_url must not include credentials", 400, {
+        field: "node_document_url"
+      });
+    }
+
     if (nodeDocumentUrl.protocol !== "https:" && !(allowInsecureHttp && nodeDocumentUrl.protocol === "http:")) {
       throw new LoomError("ENVELOPE_INVALID", "node_document_url must use https unless allow_insecure_http=true", 400, {
         field: "node_document_url",
         protocol: nodeDocumentUrl.protocol
       });
     }
+
+    await assertOutboundUrlHostAllowed(nodeDocumentUrl, {
+      allowPrivateNetwork
+    });
 
     const abortController = new AbortController();
     const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
@@ -1439,6 +1744,7 @@ export class LoomStore {
     try {
       response = await fetch(nodeDocumentUrl, {
         method: "GET",
+        redirect: "error",
         headers: {
           accept: "application/json"
         },
@@ -1468,8 +1774,18 @@ export class LoomStore {
 
     let nodeDocument;
     try {
-      nodeDocument = await response.json();
-    } catch {
+      const rawNodeDocument = await response.text();
+      if (Buffer.byteLength(rawNodeDocument, "utf-8") > maxResponseBytes) {
+        throw new LoomError("PAYLOAD_TOO_LARGE", "Federation node document exceeds allowed size", 413, {
+          node_document_url: nodeDocumentUrl.toString(),
+          max_response_bytes: maxResponseBytes
+        });
+      }
+      nodeDocument = JSON.parse(rawNodeDocument);
+    } catch (error) {
+      if (error instanceof LoomError) {
+        throw error;
+      }
       throw new LoomError("ENVELOPE_INVALID", "Federation node discovery response must be JSON", 400, {
         field: "node_document"
       });
@@ -1521,12 +1837,30 @@ export class LoomStore {
       });
     }
 
+    if (deliverUrl.username || deliverUrl.password) {
+      throw new LoomError("ENVELOPE_INVALID", "Federation deliver_url must not include credentials", 400, {
+        field: "deliver_url"
+      });
+    }
+
     if (deliverUrl.protocol !== "https:" && !(allowInsecureHttp && deliverUrl.protocol === "http:")) {
       throw new LoomError("ENVELOPE_INVALID", "deliver_url must use https unless allow_insecure_http=true", 400, {
         field: "deliver_url",
         protocol: deliverUrl.protocol
       });
     }
+
+    if (!allowCrossHostDeliverUrl && deliverUrl.hostname !== nodeDocumentUrl.hostname) {
+      throw new LoomError("ENVELOPE_INVALID", "deliver_url host must match node_document_url host", 400, {
+        field: "deliver_url",
+        node_document_host: nodeDocumentUrl.hostname,
+        deliver_host: deliverUrl.hostname
+      });
+    }
+
+    await assertOutboundUrlHostAllowed(deliverUrl, {
+      allowPrivateNetwork
+    });
 
     const node = this.registerFederationNode(
       {
@@ -1537,6 +1871,8 @@ export class LoomStore {
         active_key_id: activeKey.key_id,
         replace_signing_keys: payload.replace_signing_keys === true,
         deliver_url: deliverUrl.toString(),
+        allow_insecure_http: allowInsecureHttp,
+        allow_private_network: allowPrivateNetwork,
         policy: Object.prototype.hasOwnProperty.call(payload, "policy") ? payload.policy : undefined
       },
       actorIdentity
@@ -2245,8 +2581,10 @@ export class LoomStore {
     }
 
     this.cleanupFederationNonces();
-    if (this.federationNonceCache.has(nonce)) {
+    const nonceKey = `${nodeId}:${nonce}`;
+    if (this.federationNonceCache.has(nonceKey)) {
       throw new LoomError("SIGNATURE_INVALID", "Federation request nonce replay detected", 401, {
+        node_id: nodeId,
         nonce
       });
     }
@@ -2285,7 +2623,11 @@ export class LoomStore {
       }
     }
 
-    this.federationNonceCache.set(nonce, nowMs());
+    this.federationNonceCache.set(nonceKey, nowMs());
+    this.persistAndAudit("federation.nonce.accepted", {
+      node_id: nodeId,
+      nonce
+    });
     return node;
   }
 
@@ -2702,13 +3044,65 @@ export class LoomStore {
     const nonce = `nonce_${generateUlid()}`;
 
     const deliverUrl = item.deliver_url || this.resolveFederationDeliverUrl(node);
-    const parsedUrl = new URL(deliverUrl);
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(deliverUrl);
+    } catch {
+      this.markOutboxFailure(item, "Invalid federation deliver_url");
+      this.persistAndAudit("federation.outbox.process.failed", {
+        outbox_id: item.id,
+        recipient_node: item.recipient_node,
+        reason: item.last_error,
+        actor: actorIdentity
+      });
+      return item;
+    }
+
+    if (parsedUrl.username || parsedUrl.password) {
+      this.markOutboxFailure(item, "Federation deliver_url must not include credentials");
+      this.persistAndAudit("federation.outbox.process.failed", {
+        outbox_id: item.id,
+        recipient_node: item.recipient_node,
+        reason: item.last_error,
+        actor: actorIdentity
+      });
+      return item;
+    }
+
+    const allowInsecureHttp = node.allow_insecure_http === true;
+    if (parsedUrl.protocol !== "https:" && !(allowInsecureHttp && parsedUrl.protocol === "http:")) {
+      this.markOutboxFailure(item, "Federation deliver_url must use https unless allow_insecure_http=true");
+      this.persistAndAudit("federation.outbox.process.failed", {
+        outbox_id: item.id,
+        recipient_node: item.recipient_node,
+        reason: item.last_error,
+        actor: actorIdentity
+      });
+      return item;
+    }
+
+    try {
+      await assertOutboundUrlHostAllowed(parsedUrl, {
+        allowPrivateNetwork: node.allow_private_network === true
+      });
+    } catch (error) {
+      this.markOutboxFailure(item, error?.message || "Federation deliver_url host denied");
+      this.persistAndAudit("federation.outbox.process.failed", {
+        outbox_id: item.id,
+        recipient_node: item.recipient_node,
+        reason: item.last_error,
+        actor: actorIdentity
+      });
+      return item;
+    }
+
     const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
     const signature = signUtf8Message(this.federationSigningPrivateKeyPem, canonical);
 
     try {
-      const response = await fetch(deliverUrl, {
+      const response = await fetch(parsedUrl.toString(), {
         method: "POST",
+        redirect: "error",
         headers: {
           "content-type": "application/json",
           "x-loom-node": this.nodeId,
@@ -2831,11 +3225,17 @@ export class LoomStore {
     if (!trimmed) {
       return null;
     }
+    if (containsHeaderUnsafeChars(trimmed)) {
+      return null;
+    }
 
     const angleMatch = trimmed.match(/<([^>]+)>/);
     const candidate = angleMatch ? angleMatch[1].trim() : trimmed.replace(/^<|>$/g, "").trim();
 
     if (!candidate.includes("@")) {
+      return null;
+    }
+    if (containsHeaderUnsafeChars(candidate)) {
       return null;
     }
 
@@ -3348,6 +3748,18 @@ export class LoomStore {
       thread?.subject ||
       envelope.content?.structured?.intent ||
       `LOOM ${envelope.type}`;
+    if (containsHeaderUnsafeChars(subject)) {
+      throw new LoomError("ENVELOPE_INVALID", "subject contains invalid header characters", 400, {
+        field: "subject"
+      });
+    }
+
+    const smtpFrom = payload.smtp_from ? this.normalizeEmailAddress(payload.smtp_from) : this.normalizeEmailAddress(`no-reply@${this.nodeId}`);
+    if (!smtpFrom) {
+      throw new LoomError("ENVELOPE_INVALID", "smtp_from must be a valid email address", 400, {
+        field: "smtp_from"
+      });
+    }
 
     const textBody =
       envelope.content?.encrypted
@@ -3371,7 +3783,7 @@ export class LoomStore {
     });
 
     return {
-      smtp_from: payload.smtp_from || `no-reply@${this.nodeId}`,
+      smtp_from: smtpFrom,
       rcpt_to: toEmails,
       subject,
       text: textBody,
@@ -3387,8 +3799,153 @@ export class LoomStore {
     };
   }
 
-  classifyThreadFolder(thread) {
+  ensureMailboxState(thread, identityUri) {
+    if (!thread.mailbox_state || typeof thread.mailbox_state !== "object") {
+      thread.mailbox_state = {};
+    }
+
+    const key = String(identityUri || "").trim();
+    if (!key) {
+      return {
+        seen: false,
+        flagged: false,
+        archived: false,
+        deleted: false,
+        updated_at: null,
+        last_read_at: null
+      };
+    }
+
+    if (!thread.mailbox_state[key] || typeof thread.mailbox_state[key] !== "object") {
+      thread.mailbox_state[key] = {
+        seen: false,
+        flagged: false,
+        archived: false,
+        deleted: false,
+        updated_at: nowIso(),
+        last_read_at: null
+      };
+    }
+
+    const state = thread.mailbox_state[key];
+    state.seen = Boolean(state.seen);
+    state.flagged = Boolean(state.flagged);
+    state.archived = Boolean(state.archived);
+    state.deleted = Boolean(state.deleted);
+    state.updated_at = state.updated_at || nowIso();
+    state.last_read_at = state.last_read_at || null;
+    return state;
+  }
+
+  getThreadMailboxState(threadId, actorIdentity) {
+    const thread = this.threadsById.get(threadId);
+    if (!thread) {
+      throw new LoomError("THREAD_NOT_FOUND", `Thread not found: ${threadId}`, 404, {
+        thread_id: threadId
+      });
+    }
+
+    if (!this.isActiveParticipant(thread, actorIdentity)) {
+      throw new LoomError("CAPABILITY_DENIED", "Only thread participants can access mailbox state", 403, {
+        thread_id: threadId,
+        actor: actorIdentity
+      });
+    }
+
+    const state = this.ensureMailboxState(thread, actorIdentity);
+    return {
+      thread_id: threadId,
+      identity: actorIdentity,
+      ...state
+    };
+  }
+
+  updateThreadMailboxState(threadId, actorIdentity, payload = {}) {
+    const thread = this.threadsById.get(threadId);
+    if (!thread) {
+      throw new LoomError("THREAD_NOT_FOUND", `Thread not found: ${threadId}`, 404, {
+        thread_id: threadId
+      });
+    }
+
+    if (!this.isActiveParticipant(thread, actorIdentity)) {
+      throw new LoomError("CAPABILITY_DENIED", "Only thread participants can update mailbox state", 403, {
+        thread_id: threadId,
+        actor: actorIdentity
+      });
+    }
+
+    if (!payload || typeof payload !== "object") {
+      throw new LoomError("ENVELOPE_INVALID", "Mailbox state payload must be an object", 400, {
+        field: "mailbox_state"
+      });
+    }
+
+    const state = this.ensureMailboxState(thread, actorIdentity);
+    const patchableFields = ["seen", "flagged", "archived", "deleted"];
+    let changed = false;
+
+    for (const field of patchableFields) {
+      if (payload[field] == null) {
+        continue;
+      }
+
+      if (typeof payload[field] !== "boolean") {
+        throw new LoomError("ENVELOPE_INVALID", `Mailbox state field ${field} must be boolean`, 400, {
+          field
+        });
+      }
+
+      if (state[field] !== payload[field]) {
+        state[field] = payload[field];
+        changed = true;
+      }
+    }
+
+    if (state.deleted) {
+      state.archived = false;
+    } else if (state.archived) {
+      state.deleted = false;
+    }
+
+    if (state.seen) {
+      state.last_read_at = state.last_read_at || nowIso();
+    } else if (payload.seen === false) {
+      state.last_read_at = null;
+    }
+
+    if (changed) {
+      state.updated_at = nowIso();
+      thread.updated_at = nowIso();
+      this.persistAndAudit("mailbox.state.update", {
+        thread_id: threadId,
+        identity: actorIdentity,
+        state: {
+          seen: state.seen,
+          flagged: state.flagged,
+          archived: state.archived,
+          deleted: state.deleted
+        }
+      });
+    }
+
+    return {
+      thread_id: threadId,
+      identity: actorIdentity,
+      ...state
+    };
+  }
+
+  classifyThreadFolder(thread, actorIdentity = null) {
     const labels = new Set(thread.labels || []);
+    const mailboxState = actorIdentity ? this.ensureMailboxState(thread, actorIdentity) : null;
+
+    if (mailboxState?.deleted) {
+      return "Trash";
+    }
+    if (mailboxState?.archived) {
+      return "Archive";
+    }
 
     if (labels.has("sys.trash")) {
       return "Trash";
@@ -3449,7 +4006,7 @@ export class LoomStore {
       if (!this.isActiveParticipant(thread, actorIdentity)) {
         continue;
       }
-      const folder = this.classifyThreadFolder(thread);
+      const folder = this.classifyThreadFolder(thread, actorIdentity);
       counts.set(folder, (counts.get(folder) || 0) + 1);
     }
 
@@ -3483,6 +4040,16 @@ export class LoomStore {
       return false;
     }
     return envelope?.audience?.mode === "recipients" || this.hasBccRecipients(envelope);
+  }
+
+  envelopeContainsCapabilitySecret(envelope) {
+    const parameters = envelope?.content?.structured?.parameters;
+    return Boolean(
+      parameters &&
+      typeof parameters === "object" &&
+      typeof parameters.capability_token === "string" &&
+      parameters.capability_token.trim().length > 0
+    );
   }
 
   getDeliveryWrapper(envelopeId, recipientIdentity) {
@@ -3581,16 +4148,37 @@ export class LoomStore {
       });
     }
 
+    let visibleEnvelope = envelope;
+    if (!actorIsSender && envelope?.type === "thread_op" && envelope?.content?.structured?.parameters) {
+      const parameters = envelope.content.structured.parameters;
+      if (typeof parameters.capability_token === "string" && parameters.capability_token.trim()) {
+        const redactedParameters = { ...parameters };
+        delete redactedParameters.capability_token;
+        redactedParameters.capability_token_redacted = true;
+
+        visibleEnvelope = {
+          ...envelope,
+          content: {
+            ...envelope.content,
+            structured: {
+              ...envelope.content.structured,
+              parameters: redactedParameters
+            }
+          }
+        };
+      }
+    }
+
     if (!this.requiresRecipientDeliveryWrapper(envelope)) {
       return {
-        envelope,
+        envelope: visibleEnvelope,
         delivery_wrapper: null
       };
     }
 
     if (actorIsSender) {
       return {
-        envelope,
+        envelope: visibleEnvelope,
         delivery_wrapper: null
       };
     }
@@ -3608,10 +4196,10 @@ export class LoomStore {
 
     return {
       envelope: {
-        ...envelope,
+        ...visibleEnvelope,
         to: visibleRecipients,
         meta: {
-          ...(envelope.meta || {}),
+          ...(visibleEnvelope.meta || {}),
           delivery: {
             wrapper_id: wrapper?.id || null,
             recipient_identity: normalizedActor,
@@ -3660,10 +4248,11 @@ export class LoomStore {
         continue;
       }
 
-      if (this.classifyThreadFolder(thread) !== normalizedFolder) {
+      if (this.classifyThreadFolder(thread, actorIdentity) !== normalizedFolder) {
         continue;
       }
 
+      const mailboxState = this.ensureMailboxState(thread, actorIdentity);
       const envelopes = canonicalThreadOrder(thread.envelope_ids.map((id) => this.envelopesById.get(id))).reverse();
       for (const envelope of envelopes) {
         const messageId = `<${envelope.id}@${this.nodeId}>`;
@@ -3690,6 +4279,12 @@ export class LoomStore {
           message_id: messageId,
           in_reply_to: inReplyTo,
           body_text: envelope.content?.encrypted ? "[Encrypted LOOM content]" : envelope.content?.human?.text || "",
+          mailbox_state: {
+            seen: mailboxState.seen,
+            flagged: mailboxState.flagged,
+            archived: mailboxState.archived,
+            deleted: mailboxState.deleted
+          },
           headers: {
             "Message-ID": messageId,
             ...(inReplyTo ? { "In-Reply-To": inReplyTo } : {}),
@@ -3883,11 +4478,24 @@ export class LoomStore {
       });
     }
 
+    const smtpFrom = payload.smtp_from ? this.normalizeEmailAddress(String(payload.smtp_from || "")) : null;
+    if (payload.smtp_from && !smtpFrom) {
+      throw new LoomError("ENVELOPE_INVALID", "smtp_from must be a valid email address", 400, {
+        field: "smtp_from"
+      });
+    }
+
+    if (payload.subject && containsHeaderUnsafeChars(payload.subject)) {
+      throw new LoomError("ENVELOPE_INVALID", "subject contains invalid header characters", 400, {
+        field: "subject"
+      });
+    }
+
     const outbox = {
       id: `eout_${generateUlid()}`,
       envelope_id: envelopeId,
       thread_id: envelope.thread_id,
-      smtp_from: payload.smtp_from || null,
+      smtp_from: smtpFrom,
       to_email: toEmail,
       subject: payload.subject || null,
       status: "queued",
@@ -4483,13 +5091,28 @@ export class LoomStore {
       }
     }
 
+    const requestedSizeBytes = Number(payload.size_bytes || 0);
+    if (!Number.isFinite(requestedSizeBytes) || requestedSizeBytes < 0) {
+      throw new LoomError("ENVELOPE_INVALID", "size_bytes must be a non-negative number", 400, {
+        field: "size_bytes"
+      });
+    }
+
+    if (requestedSizeBytes > this.blobMaxBytes) {
+      throw new LoomError("PAYLOAD_TOO_LARGE", "Blob size exceeds configured max", 413, {
+        field: "size_bytes",
+        size_bytes: requestedSizeBytes,
+        max_blob_bytes: this.blobMaxBytes
+      });
+    }
+
     const blob = {
       id: `blob_${generateUlid()}`,
       created_by: actorIdentity,
       thread_id: threadId,
       filename: payload.filename || null,
       mime_type: payload.mime_type || "application/octet-stream",
-      size_bytes: Number(payload.size_bytes || 0),
+      size_bytes: requestedSizeBytes,
       created_at: nowIso(),
       completed_at: null,
       status: "pending",
@@ -4542,15 +5165,48 @@ export class LoomStore {
       });
     }
 
+    let partBuffer;
     try {
-      Buffer.from(dataBase64, "base64");
+      partBuffer = Buffer.from(dataBase64, "base64");
     } catch {
       throw new LoomError("ENVELOPE_INVALID", "data_base64 is not valid base64", 400, {
         field: "data_base64"
       });
     }
 
-    blob.parts[String(partNumber)] = dataBase64;
+    if (partBuffer.byteLength > this.blobMaxPartBytes) {
+      throw new LoomError("PAYLOAD_TOO_LARGE", "Blob part exceeds configured max", 413, {
+        field: "data_base64",
+        part_size_bytes: partBuffer.byteLength,
+        max_blob_part_bytes: this.blobMaxPartBytes
+      });
+    }
+
+    const partKey = String(partNumber);
+    const existingPartKeys = Object.keys(blob.parts || {});
+    if (!Object.prototype.hasOwnProperty.call(blob.parts, partKey) && existingPartKeys.length >= this.blobMaxParts) {
+      throw new LoomError("PAYLOAD_TOO_LARGE", "Blob part count exceeds configured max", 413, {
+        blob_id: blobId,
+        max_blob_parts: this.blobMaxParts
+      });
+    }
+
+    let projectedBytes = partBuffer.byteLength;
+    for (const existingKey of existingPartKeys) {
+      if (existingKey === partKey) {
+        continue;
+      }
+      projectedBytes += Buffer.from(blob.parts[existingKey], "base64").byteLength;
+    }
+    if (projectedBytes > this.blobMaxBytes) {
+      throw new LoomError("PAYLOAD_TOO_LARGE", "Blob accumulated size exceeds configured max", 413, {
+        blob_id: blobId,
+        projected_size_bytes: projectedBytes,
+        max_blob_bytes: this.blobMaxBytes
+      });
+    }
+
+    blob.parts[partKey] = dataBase64;
     this.persistAndAudit("blob.part.put", {
       blob_id: blobId,
       part_number: Number(partNumber),
@@ -4595,6 +5251,14 @@ export class LoomStore {
 
     const buffers = orderedPartNumbers.map((number) => Buffer.from(blob.parts[String(number)], "base64"));
     const joined = Buffer.concat(buffers);
+
+    if (joined.byteLength > this.blobMaxBytes) {
+      throw new LoomError("PAYLOAD_TOO_LARGE", "Blob size exceeds configured max", 413, {
+        blob_id: blobId,
+        size_bytes: joined.byteLength,
+        max_blob_bytes: this.blobMaxBytes
+      });
+    }
 
     blob.data_base64 = joined.toString("base64");
     blob.size_bytes = joined.byteLength;
@@ -4660,6 +5324,37 @@ export class LoomStore {
     );
   }
 
+  sanitizeCapabilityToken(token, options = {}) {
+    if (!token) {
+      return null;
+    }
+
+    const sanitized = {
+      loom: token.loom,
+      id: token.id,
+      thread_id: token.thread_id,
+      issued_by: token.issued_by,
+      issued_to: token.issued_to,
+      created_at: token.created_at,
+      expires_at: token.expires_at,
+      single_use: token.single_use,
+      epoch: token.epoch,
+      grants: Array.isArray(token.grants) ? [...token.grants] : [],
+      revoked: Boolean(token.revoked),
+      revoked_at: token.revoked_at || null,
+      spent: Boolean(token.spent),
+      spent_at: token.spent_at || null,
+      secret_hint: token.secret_hint || null,
+      secret_last_used_at: token.secret_last_used_at || null
+    };
+
+    if (options.includePresentationToken === true && options.presentationToken) {
+      sanitized.presentation_token = options.presentationToken;
+    }
+
+    return sanitized;
+  }
+
   issueCapabilityToken(payload, issuedBy) {
     const threadId = payload?.thread_id;
     const thread = this.threadsById.get(threadId);
@@ -4683,6 +5378,7 @@ export class LoomStore {
       });
     }
 
+    const presentationToken = `cpt_${randomUUID().replace(/-/g, "")}`;
     const token = {
       loom: "1.1",
       id: `cap_${generateUlid()}`,
@@ -4697,7 +5393,10 @@ export class LoomStore {
       revoked: false,
       revoked_at: null,
       spent: false,
-      spent_at: null
+      spent_at: null,
+      secret_hash: hashCapabilityPresentationToken(presentationToken),
+      secret_hint: presentationToken.slice(-6),
+      secret_last_used_at: null
     };
 
     if (token.expires_at && parseTime(token.expires_at) == null) {
@@ -4707,13 +5406,17 @@ export class LoomStore {
     }
 
     this.capabilitiesById.set(token.id, token);
+    this.capabilityIdBySecretHash.set(token.secret_hash, token.id);
     this.persistAndAudit("capability.issue", {
       capability_id: token.id,
       thread_id: token.thread_id,
       issued_by: token.issued_by,
       issued_to: token.issued_to
     });
-    return token;
+    return this.sanitizeCapabilityToken(token, {
+      includePresentationToken: true,
+      presentationToken
+    });
   }
 
   listCapabilities(threadId, actorIdentity) {
@@ -4733,7 +5436,8 @@ export class LoomStore {
 
     return Array.from(this.capabilitiesById.values())
       .filter((token) => token.thread_id === threadId)
-      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .map((token) => this.sanitizeCapabilityToken(token));
   }
 
   revokeCapabilityToken(capabilityId, actorIdentity) {
@@ -4770,53 +5474,79 @@ export class LoomStore {
       });
     }
 
-    return token;
+    return this.sanitizeCapabilityToken(token);
   }
 
-  validateCapabilityForThreadOperation({ thread, intent, actorIdentity, capabilityTokenId }) {
+  resolveCapabilityTokenByPresentation({ capabilityTokenValue, capabilityTokenId = null }) {
+    const normalizedValue = String(capabilityTokenValue || "").trim();
+    if (!normalizedValue) {
+      return null;
+    }
+
+    const hashed = hashCapabilityPresentationToken(normalizedValue);
+    if (capabilityTokenId) {
+      const token = this.capabilitiesById.get(capabilityTokenId) || null;
+      if (!token) {
+        return null;
+      }
+      return token.secret_hash === hashed ? token : null;
+    }
+
+    const resolvedId = this.capabilityIdBySecretHash.get(hashed);
+    if (!resolvedId) {
+      return null;
+    }
+    return this.capabilitiesById.get(resolvedId) || null;
+  }
+
+  validateCapabilityForThreadOperation({ thread, intent, actorIdentity, capabilityTokenValue, capabilityTokenId = null }) {
     const requiredGrant = THREAD_OP_TO_GRANT[intent] || "admin";
 
     if (this.isThreadOwner(thread, actorIdentity)) {
       return null;
     }
 
-    if (!capabilityTokenId) {
-      throw new LoomError("CAPABILITY_DENIED", "Capability token required for thread operation", 403, {
+    if (!capabilityTokenValue) {
+      throw new LoomError("CAPABILITY_DENIED", "Capability presentation token required for thread operation", 403, {
         intent,
         actor: actorIdentity
       });
     }
 
-    const token = this.capabilitiesById.get(capabilityTokenId);
+    const token = this.resolveCapabilityTokenByPresentation({
+      capabilityTokenValue,
+      capabilityTokenId
+    });
     if (!token) {
-      throw new LoomError("CAPABILITY_DENIED", "Capability token not found", 403, {
-        capability_token: capabilityTokenId
+      throw new LoomError("CAPABILITY_DENIED", "Capability token invalid", 403, {
+        intent,
+        actor: actorIdentity
       });
     }
 
     if (token.thread_id !== thread.id) {
       throw new LoomError("CAPABILITY_DENIED", "Capability token thread scope mismatch", 403, {
-        capability_token: capabilityTokenId,
+        capability_token: token.id,
         thread_id: thread.id
       });
     }
 
     if (token.issued_to !== actorIdentity) {
       throw new LoomError("CAPABILITY_DENIED", "Capability token issued to different identity", 403, {
-        capability_token: capabilityTokenId,
+        capability_token: token.id,
         actor: actorIdentity
       });
     }
 
     if (token.revoked || token.spent || isExpiredIso(token.expires_at)) {
       throw new LoomError("CAPABILITY_DENIED", "Capability token not usable", 403, {
-        capability_token: capabilityTokenId
+        capability_token: token.id
       });
     }
 
     if (token.epoch !== thread.cap_epoch) {
       throw new LoomError("CAPABILITY_DENIED", "Capability token epoch mismatch", 403, {
-        capability_token: capabilityTokenId,
+        capability_token: token.id,
         token_epoch: token.epoch,
         thread_epoch: thread.cap_epoch
       });
@@ -4825,10 +5555,12 @@ export class LoomStore {
     const grantSet = new Set(token.grants);
     if (!grantSet.has("admin") && !grantSet.has(requiredGrant)) {
       throw new LoomError("CAPABILITY_DENIED", "Capability token grant missing for operation", 403, {
-        capability_token: capabilityTokenId,
+        capability_token: token.id,
         required_grant: requiredGrant
       });
     }
+
+    token.secret_last_used_at = nowIso();
 
     return token;
   }
@@ -4891,7 +5623,7 @@ export class LoomStore {
     return resolved;
   }
 
-  prepareThreadOperation(thread, envelope, actorIdentity) {
+  prepareThreadOperation(thread, envelope, actorIdentity, context = {}) {
     const intent = envelope.content?.structured?.intent;
     const parameters = envelope.content?.structured?.parameters || {};
 
@@ -4901,11 +5633,31 @@ export class LoomStore {
       });
     }
 
+    const payloadCapabilityToken =
+      typeof parameters.capability_token === "string" ? parameters.capability_token.trim() : "";
+    if (payloadCapabilityToken) {
+      throw new LoomError(
+        "ENVELOPE_INVALID",
+        "Capability token must be provided via x-loom-capability-token header, not envelope payload",
+        400,
+        {
+          field: "content.structured.parameters.capability_token"
+        }
+      );
+    }
+
+    const capabilityTokenValue = String(context?.capabilityPresentationToken || "").trim();
+    const capabilityTokenId =
+      typeof parameters.capability_id === "string" && parameters.capability_id.trim()
+        ? parameters.capability_id.trim()
+        : null;
+
     const token = this.validateCapabilityForThreadOperation({
       thread,
       intent,
       actorIdentity,
-      capabilityTokenId: parameters.capability_token || null
+      capabilityTokenValue,
+      capabilityTokenId
     });
 
     return () => {
@@ -5147,6 +5899,7 @@ export class LoomStore {
         created_at: envelope.created_at,
         updated_at: nowIso(),
         participants: [],
+        mailbox_state: {},
         labels: [],
         cap_epoch: 0,
         encryption: {
@@ -5159,7 +5912,8 @@ export class LoomStore {
         pending_parent_count: 0
       };
 
-    const operationMutation = envelope.type === "thread_op" ? this.prepareThreadOperation(thread, envelope, actorIdentity) : null;
+    const operationMutation =
+      envelope.type === "thread_op" ? this.prepareThreadOperation(thread, envelope, actorIdentity, context) : null;
 
     const threadSnapshot = !isNewThread ? structuredClone(thread) : null;
 
@@ -5200,6 +5954,9 @@ export class LoomStore {
         joined_at: storedEnvelope.created_at,
         left_at: null
       }));
+      for (const participant of thread.participants) {
+        this.ensureMailboxState(thread, participant.identity);
+      }
     }
 
     this.envelopesById.set(storedEnvelope.id, storedEnvelope);

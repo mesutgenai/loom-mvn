@@ -77,6 +77,79 @@ test("API rejects request bodies larger than configured max", async (t) => {
   assert.equal(result.body.error.code, "PAYLOAD_TOO_LARGE");
 });
 
+test("API can disable public identity signup", async (t) => {
+  const keys = generateSigningKeyPair();
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret",
+    identitySignupEnabled: false
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const payload = {
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: keys.publicKeyPem }]
+  };
+
+  const denied = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  assert.equal(denied.response.status, 403);
+  assert.equal(denied.body.error.code, "CAPABILITY_DENIED");
+
+  const allowed = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(allowed.response.status, 201);
+  assert.equal(allowed.body.id, payload.id);
+});
+
+test("API can disable bridge and gateway send routes", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    bridgeInboundEnabled: false,
+    bridgeSendEnabled: false,
+    gatewaySmtpSubmitEnabled: false
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const inbound = await jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+  assert.equal(inbound.response.status, 404);
+  assert.equal(inbound.body.error.code, "ENVELOPE_NOT_FOUND");
+
+  const directSend = await jsonRequest(`${baseUrl}/v1/bridge/email/send`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+  assert.equal(directSend.response.status, 404);
+  assert.equal(directSend.body.error.code, "ENVELOPE_NOT_FOUND");
+
+  const smtpSubmit = await jsonRequest(`${baseUrl}/v1/gateway/smtp/submit`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+  assert.equal(smtpSubmit.response.status, 404);
+  assert.equal(smtpSubmit.body.error.code, "ENVELOPE_NOT_FOUND");
+});
+
 test("API enforces rate limit on sensitive auth routes", async (t) => {
   const keys = generateSigningKeyPair();
   const { server } = createLoomServer({
@@ -84,7 +157,7 @@ test("API enforces rate limit on sensitive auth routes", async (t) => {
     domain: "127.0.0.1",
     rateLimitWindowMs: 60_000,
     rateLimitDefaultMax: 1000,
-    rateLimitSensitiveMax: 2
+    rateLimitSensitiveMax: 3
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
@@ -130,6 +203,174 @@ test("API enforces rate limit on sensitive auth routes", async (t) => {
   assert.equal(third.response.status, 429);
   assert.equal(third.body.error.code, "RATE_LIMIT_EXCEEDED");
   assert.equal(third.body.error.details.scope, "sensitive");
+});
+
+test("API does not trust x-forwarded-for for rate limit buckets by default", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    rateLimitWindowMs: 60_000,
+    rateLimitDefaultMax: 1000,
+    rateLimitSensitiveMax: 1
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const payload = {
+    identity: "loom://missing@node.test",
+    key_id: "k_missing_1"
+  };
+
+  const first = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "198.51.100.10"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(first.response.status, 404);
+
+  const second = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "203.0.113.44"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(second.response.status, 429);
+  assert.equal(second.body.error.code, "RATE_LIMIT_EXCEEDED");
+});
+
+test("API can trust x-forwarded-for when explicitly enabled", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    rateLimitWindowMs: 60_000,
+    rateLimitDefaultMax: 1000,
+    rateLimitSensitiveMax: 1,
+    trustProxy: true
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const payload = {
+    identity: "loom://missing@node.test",
+    key_id: "k_missing_1"
+  };
+
+  const first = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "198.51.100.10"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(first.response.status, 404);
+
+  const second = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "203.0.113.44"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(second.response.status, 404);
+});
+
+test("API trusts x-forwarded-for only when proxy source is allowlisted", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    rateLimitWindowMs: 60_000,
+    rateLimitDefaultMax: 1000,
+    rateLimitSensitiveMax: 1,
+    trustProxy: true,
+    trustProxyAllowlist: "127.0.0.1/32"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const payload = {
+    identity: "loom://missing@node.test",
+    key_id: "k_missing_1"
+  };
+
+  const first = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "198.51.100.10"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(first.response.status, 404);
+
+  const second = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "203.0.113.44"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(second.response.status, 404);
+});
+
+test("API ignores x-forwarded-for when proxy source is not allowlisted", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    rateLimitWindowMs: 60_000,
+    rateLimitDefaultMax: 1000,
+    rateLimitSensitiveMax: 1,
+    trustProxy: true,
+    trustProxyAllowlist: "198.51.100.0/24"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const payload = {
+    identity: "loom://missing@node.test",
+    key_id: "k_missing_1"
+  };
+
+  const first = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "198.51.100.10"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(first.response.status, 404);
+
+  const second = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    headers: {
+      "x-forwarded-for": "203.0.113.44"
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(second.response.status, 429);
+  assert.equal(second.body.error.code, "RATE_LIMIT_EXCEEDED");
+});
+
+test("API rejects invalid trusted proxy allowlist configuration", () => {
+  assert.throws(
+    () =>
+      createLoomServer({
+        nodeId: "node.test",
+        domain: "127.0.0.1",
+        trustProxy: true,
+        trustProxyAllowlist: "not-a-cidr"
+      }),
+    /LOOM_TRUST_PROXY_ALLOWLIST/
+  );
 });
 
 test("API exposes readiness and protects admin operational endpoints", async (t) => {
@@ -563,6 +804,101 @@ test("API supports blob create/upload/complete/download", async (t) => {
   });
   assert.equal(getBlob.response.status, 200);
   assert.equal(Buffer.from(getBlob.body.data_base64, "base64").toString("utf-8"), "hello blob");
+});
+
+test("API enforces blob part size and count limits", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    blobMaxBytes: 8,
+    blobMaxPartBytes: 4,
+    blobMaxParts: 1
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const keys = generateSigningKeyPair();
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_blob_limit_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_limit_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_blob_limit_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const createBlob = await jsonRequest(`${baseUrl}/v1/blobs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      filename: "limit.txt",
+      mime_type: "text/plain"
+    })
+  });
+  assert.equal(createBlob.response.status, 201);
+  const blobId = createBlob.body.blob_id;
+
+  const oversizedPart = await jsonRequest(`${baseUrl}/v1/blobs/${blobId}/parts/1`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("hello", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(oversizedPart.response.status, 413);
+  assert.equal(oversizedPart.body.error.code, "PAYLOAD_TOO_LARGE");
+
+  const firstPart = await jsonRequest(`${baseUrl}/v1/blobs/${blobId}/parts/1`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("abcd", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(firstPart.response.status, 200);
+
+  const secondPart = await jsonRequest(`${baseUrl}/v1/blobs/${blobId}/parts/2`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      data_base64: Buffer.from("ef", "utf-8").toString("base64")
+    })
+  });
+  assert.equal(secondPart.response.status, 413);
+  assert.equal(secondPart.body.error.code, "PAYLOAD_TOO_LARGE");
 });
 
 test("API accepts signed federation delivery from trusted node", async (t) => {
@@ -1704,7 +2040,9 @@ test("API processes outbound federation outbox and delivers to remote node", asy
           public_key_pem: remoteNodeSigningKeysSecondary.publicKeyPem
         }
       ],
-      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      allow_insecure_http: true,
+      allow_private_network: true
     })
   });
   assert.equal(localTrustRemote.response.status, 201);
@@ -1881,7 +2219,9 @@ test("API can require signed federation receipts for outbound delivery", async (
       node_id: "remote.test",
       key_id: "k_node_sign_remote_1",
       public_key_pem: remoteNodeSigningKeys.publicKeyPem,
-      deliver_url: remoteDeliverUrl
+      deliver_url: remoteDeliverUrl,
+      allow_insecure_http: true,
+      allow_private_network: true
     })
   });
   assert.equal(localTrustRemote.response.status, 201);
@@ -2027,6 +2367,7 @@ test("API bootstraps federation node trust from node discovery document", async 
     body: JSON.stringify({
       node_document_url: `${remoteBaseUrl}/.well-known/loom.json`,
       allow_insecure_http: true,
+      allow_private_network: true,
       deliver_url: `${remoteBaseUrl}/v1/federation/deliver`
     })
   });
@@ -2090,6 +2431,89 @@ test("API bootstraps federation node trust from node discovery document", async 
   });
   assert.equal(deliver.response.status, 202, JSON.stringify(deliver.body));
   assert.equal(deliver.body.accepted_count, 1);
+});
+
+test("API rejects federation bootstrap to private network by default", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const adminKeys = generateSigningKeyPair();
+
+  const registerAdmin = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_bootstrap_private_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAdmin.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_bootstrap_private_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_bootstrap_private_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const bootstrap = await jsonRequest(`${baseUrl}/v1/federation/nodes/bootstrap`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_document_url: "http://127.0.0.1:34567/.well-known/loom.json",
+      allow_insecure_http: true
+    })
+  });
+
+  assert.equal(bootstrap.response.status, 403);
+  assert.equal(bootstrap.body.error.code, "CAPABILITY_DENIED");
+});
+
+test("API rejects webhook private-network targets unless explicitly allowed", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret-token"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const webhookCreate = await jsonRequest(`${baseUrl}/v1/webhooks`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      url: "http://127.0.0.1:45555/hook",
+      events: ["email.outbox.process.delivered"],
+      timeout_ms: 1000,
+      max_attempts: 3
+    })
+  });
+
+  assert.equal(webhookCreate.response.status, 403);
+  assert.equal(webhookCreate.body.error.code, "CAPABILITY_DENIED");
 });
 
 test("API supports bridge and gateway email surfaces", async (t) => {
@@ -2438,6 +2862,313 @@ test("API hides BCC recipients from non-sender IMAP recipient views", async (t) 
   assert.equal(Boolean(message), true);
   assert.equal(message.to.includes("loom://bob@node.test"), true);
   assert.equal(message.to.includes("loom://grace@node.test"), false);
+});
+
+test("API supports per-user mailbox state without mutating other participants", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  async function registerAndLogin(identity, keyId, keys) {
+    const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+      method: "POST",
+      body: JSON.stringify({
+        id: identity,
+        display_name: identity,
+        signing_keys: [{ key_id: keyId, public_key_pem: keys.publicKeyPem }]
+      })
+    });
+    assert.equal(register.response.status, 201);
+
+    const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId
+      })
+    });
+    assert.equal(challenge.response.status, 200);
+
+    const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId,
+        challenge_id: challenge.body.challenge_id,
+        signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+      })
+    });
+    assert.equal(token.response.status, 200);
+    return token.body.access_token;
+  }
+
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const aliceToken = await registerAndLogin("loom://alice@node.test", "k_sign_alice_mailbox_1", aliceKeys);
+  const bobToken = await registerAndLogin("loom://bob@node.test", "k_sign_bob_mailbox_1", bobKeys);
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7MAA",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G7MAB",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_mailbox_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T23:10:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "mailbox state test", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    aliceKeys.privateKeyPem,
+    "k_sign_alice_mailbox_1"
+  );
+
+  const send = await jsonRequest(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    },
+    body: JSON.stringify(envelope)
+  });
+  assert.equal(send.response.status, 201, JSON.stringify(send.body));
+
+  const bobFoldersBefore = await jsonRequest(`${baseUrl}/v1/gateway/imap/folders`, {
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    }
+  });
+  assert.equal(bobFoldersBefore.response.status, 200);
+  const bobInboxBefore = bobFoldersBefore.body.folders.find((folder) => folder.name === "INBOX");
+  assert.equal(bobInboxBefore.count, 1);
+
+  const bobStateBefore = await jsonRequest(`${baseUrl}/v1/mailbox/threads/${envelope.thread_id}/state`, {
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    }
+  });
+  assert.equal(bobStateBefore.response.status, 200);
+  assert.equal(bobStateBefore.body.archived, false);
+
+  const bobArchive = await jsonRequest(`${baseUrl}/v1/mailbox/threads/${envelope.thread_id}/state`, {
+    method: "PATCH",
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    },
+    body: JSON.stringify({
+      archived: true
+    })
+  });
+  assert.equal(bobArchive.response.status, 200);
+  assert.equal(bobArchive.body.archived, true);
+
+  const bobFoldersAfter = await jsonRequest(`${baseUrl}/v1/gateway/imap/folders`, {
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    }
+  });
+  assert.equal(bobFoldersAfter.response.status, 200);
+  const bobInboxAfter = bobFoldersAfter.body.folders.find((folder) => folder.name === "INBOX");
+  const bobArchiveAfter = bobFoldersAfter.body.folders.find((folder) => folder.name === "Archive");
+  assert.equal(bobInboxAfter.count, 0);
+  assert.equal(bobArchiveAfter.count, 1);
+
+  const aliceFoldersAfter = await jsonRequest(`${baseUrl}/v1/gateway/imap/folders`, {
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    }
+  });
+  assert.equal(aliceFoldersAfter.response.status, 200);
+  const aliceInbox = aliceFoldersAfter.body.folders.find((folder) => folder.name === "INBOX");
+  assert.equal(aliceInbox.count, 1);
+});
+
+test("API supports capability presentation token in header for thread operations", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  async function registerAndLogin(identity, keyId, keys) {
+    const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+      method: "POST",
+      body: JSON.stringify({
+        id: identity,
+        display_name: identity,
+        signing_keys: [{ key_id: keyId, public_key_pem: keys.publicKeyPem }]
+      })
+    });
+    assert.equal(register.response.status, 201);
+
+    const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId
+      })
+    });
+    assert.equal(challenge.response.status, 200);
+
+    const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId,
+        challenge_id: challenge.body.challenge_id,
+        signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+      })
+    });
+    assert.equal(token.response.status, 200);
+    return token.body.access_token;
+  }
+
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const aliceToken = await registerAndLogin("loom://alice@node.test", "k_sign_alice_cap_1", aliceKeys);
+  const bobToken = await registerAndLogin("loom://bob@node.test", "k_sign_bob_cap_1", bobKeys);
+
+  const rootEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7MAC",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G7MAD",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_cap_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T23:15:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "capability header test", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    aliceKeys.privateKeyPem,
+    "k_sign_alice_cap_1"
+  );
+
+  const sendRoot = await jsonRequest(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    },
+    body: JSON.stringify(rootEnvelope)
+  });
+  assert.equal(sendRoot.response.status, 201, JSON.stringify(sendRoot.body));
+
+  const issueCapability = await jsonRequest(`${baseUrl}/v1/capabilities`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    },
+    body: JSON.stringify({
+      thread_id: rootEnvelope.thread_id,
+      issued_to: "loom://bob@node.test",
+      grants: ["resolve"],
+      single_use: true
+    })
+  });
+  assert.equal(issueCapability.response.status, 201);
+  assert.equal(typeof issueCapability.body.presentation_token, "string");
+  assert.equal(issueCapability.body.presentation_token.startsWith("cpt_"), true);
+
+  const listCapabilities = await jsonRequest(`${baseUrl}/v1/capabilities?thread_id=${rootEnvelope.thread_id}`, {
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    }
+  });
+  assert.equal(listCapabilities.response.status, 200);
+  assert.equal(listCapabilities.body.capabilities.length, 1);
+  assert.equal(listCapabilities.body.capabilities[0].presentation_token, undefined);
+
+  const opEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7MAE",
+      thread_id: rootEnvelope.thread_id,
+      parent_id: rootEnvelope.id,
+      type: "thread_op",
+      from: {
+        identity: "loom://bob@node.test",
+        display: "Bob",
+        key_id: "k_sign_bob_cap_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://alice@node.test", role: "primary" }],
+      created_at: "2026-02-16T23:16:00Z",
+      priority: "normal",
+      content: {
+        structured: {
+          intent: "thread.resolve@v1",
+          parameters: {
+            capability_id: issueCapability.body.id
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    bobKeys.privateKeyPem,
+    "k_sign_bob_cap_1"
+  );
+
+  const opDeniedWithoutHeader = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}/ops`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    },
+    body: JSON.stringify(opEnvelope)
+  });
+  assert.equal(opDeniedWithoutHeader.response.status, 403);
+  assert.equal(opDeniedWithoutHeader.body.error.code, "CAPABILITY_DENIED");
+
+  const opAccepted = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}/ops`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bobToken}`,
+      "x-loom-capability-token": issueCapability.body.presentation_token
+    },
+    body: JSON.stringify(opEnvelope)
+  });
+  assert.equal(opAccepted.response.status, 201, JSON.stringify(opAccepted.body));
+
+  const publicEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opEnvelope.id}`);
+  assert.equal(publicEnvelopeView.response.status, 200);
+  assert.equal(publicEnvelopeView.body.content.structured.parameters.capability_token, undefined);
+
+  const aliceEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opEnvelope.id}`, {
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    }
+  });
+  assert.equal(aliceEnvelopeView.response.status, 200);
+  assert.equal(aliceEnvelopeView.body.content.structured.parameters.capability_token, undefined);
+
+  const thread = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}`);
+  assert.equal(thread.response.status, 200);
+  assert.equal(thread.body.state, "resolved");
 });
 
 test("API supports outbound email relay outbox queue and process", async (t) => {
@@ -2923,6 +3654,7 @@ test("API supports webhook receipt delivery with signed callback", async (t) => 
     },
     body: JSON.stringify({
       url: receiverUrl,
+      allow_private_network: true,
       events: ["email.outbox.process.delivered"],
       timeout_ms: 1000,
       max_attempts: 3

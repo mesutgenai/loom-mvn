@@ -37,6 +37,7 @@ v1.1 is implementation-ready for a Core Level 1 node, with concrete requirements
 - Deploy with TLS + reverse proxy and set forwarded client IP headers.
 - Configure durable persistence (`LOOM_PG_URL`) and run restore drills against `/v1/admin/persistence/*`.
 - Set federation guard env vars for your traffic profile (`LOOM_FEDERATION_*` rates/challenge settings).
+- Explicitly configure high-risk email send surfaces (`LOOM_BRIDGE_EMAIL_SEND_ENABLED`, `LOOM_GATEWAY_SMTP_SUBMIT_ENABLED`) for public deployments.
 - Run live-node interoperability checks against at least one external node using federation challenge + deliver paths.
 
 ## Execution Workstreams (Parallel, Not Phased)
@@ -63,9 +64,12 @@ v1.1 is implementation-ready for a Core Level 1 node, with concrete requirements
 
 - Email Replacement Profile (implemented baseline)
 - Mailbox semantics (`sys.*` labels).
+- Per-user mailbox state controls (`seen`, `flagged`, `archived`, `deleted`) exposed via mailbox state API.
 - BCC copy behavior and audience restrictions.
 - Legacy gateway and bridge integration.
 - Outbound email relay queue + processing automation.
+- Wire-level legacy gateway daemon baseline (SMTP submit + IMAP mailbox access) with optional STARTTLS and extended IMAP mailbox commands (`STATUS`, `SEARCH`, `FETCH`, `STORE`, `APPEND`, `IDLE`, `MOVE`, `UID SEARCH`, `UID FETCH`, `UID STORE`, `UID MOVE`).
+- Known wire IMAP limitation: `COPY`/`UID COPY` are rejected in the current mailbox-state model.
 
 ## Definition of Done for MVN (Current Build Target)
 
@@ -74,6 +78,7 @@ v1.1 is implementation-ready for a Core Level 1 node, with concrete requirements
 - Duplicate IDs and DAG cycles are rejected with normative errors.
 - Authenticated envelope submission enforced with proof-of-key login.
 - Capability-gated `thread_op` execution for non-owner actors.
+- Capability token presentation secret is header-based (`x-loom-capability-token`) and not returned by capability list APIs.
 - Agent delegation-chain verification with signature/scope/revocation checks.
 - Optional local persistence with hash-chained audit logging.
 - Authenticated blob upload/complete/download API for attachments.
