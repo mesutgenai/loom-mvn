@@ -7,33 +7,12 @@ import { BlockList, isIP } from "node:net";
 import { toErrorResponse, LoomError } from "../protocol/errors.js";
 import { LoomStore } from "./store.js";
 import { renderDashboardHtml } from "./ui.js";
+import { parseBoolean, parsePositiveNumber, parseHostAllowlist } from "./env.js";
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const DEFAULT_RATE_LIMIT_DEFAULT_MAX = 2000;
 const DEFAULT_RATE_LIMIT_SENSITIVE_MAX = 120;
-
-function parsePositiveNumber(value, fallback) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-}
-
-function parseBoolean(value, fallback = false) {
-  if (value == null) {
-    return fallback;
-  }
-
-  const normalized = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-
-  return fallback;
-}
 
 function normalizeLogFormat(value, fallback = "json") {
   const normalized = String(value || fallback)
@@ -258,26 +237,6 @@ function parseTrustedProxyAllowlist(value) {
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
-}
-
-function parseHostAllowlist(value) {
-  if (value == null) {
-    return [];
-  }
-
-  const list = Array.isArray(value) ? value : String(value).split(",");
-  return Array.from(
-    new Set(
-      list
-        .map((entry) =>
-          String(entry || "")
-            .trim()
-            .toLowerCase()
-            .replace(/\.+$/, "")
-        )
-        .filter(Boolean)
-    )
-  );
 }
 
 function normalizePem(value) {
@@ -1021,6 +980,30 @@ export function createLoomServer(options = {}) {
     options.idempotencyMaxEntries ?? process.env.LOOM_IDEMPOTENCY_MAX_ENTRIES,
     10000
   );
+  const consumedCapabilityMaxEntries = parsePositiveNumber(
+    options.consumedCapabilityMaxEntries ?? process.env.LOOM_CONSUMED_CAPABILITY_MAX_ENTRIES,
+    50000
+  );
+  const revokedDelegationMaxEntries = parsePositiveNumber(
+    options.revokedDelegationMaxEntries ?? process.env.LOOM_REVOKED_DELEGATION_MAX_ENTRIES,
+    50000
+  );
+  const maxLocalIdentities = parsePositiveNumber(
+    options.maxLocalIdentities ?? process.env.LOOM_MAX_LOCAL_IDENTITIES,
+    10000
+  );
+  const maxRemoteIdentities = parsePositiveNumber(
+    options.maxRemoteIdentities ?? process.env.LOOM_MAX_REMOTE_IDENTITIES,
+    50000
+  );
+  const maxDelegationsPerIdentity = parsePositiveNumber(
+    options.maxDelegationsPerIdentity ?? process.env.LOOM_MAX_DELEGATIONS_PER_IDENTITY,
+    500
+  );
+  const maxDelegationsTotal = parsePositiveNumber(
+    options.maxDelegationsTotal ?? process.env.LOOM_MAX_DELEGATIONS_TOTAL,
+    100000
+  );
   const federationNodeRateWindowMs = parsePositiveNumber(
     options.federationNodeRateWindowMs ?? process.env.LOOM_FEDERATION_NODE_RATE_WINDOW_MS,
     60 * 1000
@@ -1225,6 +1208,8 @@ export function createLoomServer(options = {}) {
       persistenceAdapter: options.persistenceAdapter,
       idempotencyTtlMs,
       idempotencyMaxEntries,
+      consumedCapabilityMaxEntries,
+      revokedDelegationMaxEntries,
       federationNodeRateWindowMs,
       federationNodeRateMax,
       federationGlobalRateWindowMs,
@@ -1268,7 +1253,11 @@ export function createLoomServer(options = {}) {
       remoteIdentityHostAllowlist,
       localIdentityDomain,
       outboxClaimLeaseMs,
-      outboxWorkerId
+      outboxWorkerId,
+      maxLocalIdentities,
+      maxRemoteIdentities,
+      maxDelegationsPerIdentity,
+      maxDelegationsTotal
     });
   const maxBodyBytes = parsePositiveNumber(
     options.maxBodyBytes ?? process.env.LOOM_MAX_BODY_BYTES,
@@ -1405,6 +1394,10 @@ export function createLoomServer(options = {}) {
   const emailRelay = options.emailRelay || null;
 
   const requestHandler = async (req, res) => {
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("x-frame-options", "DENY");
+    res.setHeader("cache-control", "no-store");
+
     const reqId = `req_${randomUUID()}`;
     const startedAt = Date.now();
     const method = String(req.method || "GET").toUpperCase();
@@ -2492,6 +2485,10 @@ export function createLoomServer(options = {}) {
         requestHandler
       )
     : createServer(requestHandler);
+
+  server.headersTimeout = 30_000;
+  server.requestTimeout = 120_000;
+  server.keepAliveTimeout = 65_000;
 
   return { server, store };
 }
