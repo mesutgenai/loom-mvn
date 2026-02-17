@@ -1,4 +1,5 @@
 import nodemailer from "nodemailer";
+import { readFileSync } from "node:fs";
 
 import { LoomError } from "../protocol/errors.js";
 
@@ -36,6 +37,76 @@ function normalizeMode(value) {
   return null;
 }
 
+function normalizePem(value) {
+  if (value == null) {
+    return null;
+  }
+  const normalized = String(value).replace(/\\n/g, "\n").trim();
+  return normalized ? `${normalized}\n` : null;
+}
+
+function readOptionalFile(path) {
+  const normalizedPath = String(path || "").trim();
+  if (!normalizedPath) {
+    return null;
+  }
+
+  try {
+    const raw = readFileSync(normalizedPath, "utf-8");
+    return normalizePem(raw);
+  } catch {
+    throw new LoomError("ENVELOPE_INVALID", `Unable to read DKIM private key file: ${normalizedPath}`, 400, {
+      field: "smtp_dkim_private_key_file"
+    });
+  }
+}
+
+function normalizeDkimHeaderFieldNames(value) {
+  if (value == null) {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean)
+      .join(":");
+    return normalized || null;
+  }
+
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
+function buildDkimConfig(options = {}) {
+  const domainName = String(options.smtpDkimDomainName || "").trim();
+  const keySelector = String(options.smtpDkimKeySelector || "").trim();
+  const privateKey =
+    normalizePem(options.smtpDkimPrivateKeyPem) || readOptionalFile(options.smtpDkimPrivateKeyFile);
+  const headerFieldNames = normalizeDkimHeaderFieldNames(options.smtpDkimHeaderFieldNames);
+
+  const configuredFields = [domainName, keySelector, privateKey].filter(Boolean).length;
+  if (configuredFields === 0) {
+    return null;
+  }
+
+  if (!domainName || !keySelector || !privateKey) {
+    throw new LoomError("ENVELOPE_INVALID", "DKIM requires domain, selector, and private key", 400, {
+      field: "smtp_dkim"
+    });
+  }
+
+  const config = {
+    domainName,
+    keySelector,
+    privateKey
+  };
+  if (headerFieldNames) {
+    config.headerFieldNames = headerFieldNames;
+  }
+  return config;
+}
+
 function redact(value) {
   if (!value) {
     return null;
@@ -52,13 +123,17 @@ export class LoomEmailRelay {
     this.mode = normalizeMode(options.mode) || null;
     this.defaultFrom = options.defaultFrom || null;
     this.transporter = null;
+    this.dkim = null;
     this.summary = {
       mode: "disabled",
       configured: false,
       host: null,
       port: null,
       secure: false,
-      has_auth: false
+      has_auth: false,
+      dkim_enabled: false,
+      dkim_domain: null,
+      dkim_selector: null
     };
 
     this.initializeFromOptions(options);
@@ -73,6 +148,8 @@ export class LoomEmailRelay {
     const smtpPass = options.smtpPass || null;
     const smtpRequireTls = parseBoolean(options.smtpRequireTls, false);
     const smtpRejectUnauthorized = parseBoolean(options.smtpRejectUnauthorized, true);
+    const dkim = buildDkimConfig(options);
+    this.dkim = dkim;
 
     if (!this.mode) {
       if (smtpUrl || smtpHost) {
@@ -89,24 +166,34 @@ export class LoomEmailRelay {
         host: null,
         port: null,
         secure: false,
-        has_auth: false
+        has_auth: false,
+        dkim_enabled: false,
+        dkim_domain: null,
+        dkim_selector: null
       };
       return;
     }
 
     if (this.mode === "stream") {
-      this.transporter = nodemailer.createTransport({
+      const config = {
         streamTransport: true,
         newline: "unix",
         buffer: true
-      });
+      };
+      if (dkim) {
+        config.dkim = dkim;
+      }
+      this.transporter = nodemailer.createTransport(config);
       this.summary = {
         mode: "stream",
         configured: true,
         host: "stream",
         port: 0,
         secure: false,
-        has_auth: false
+        has_auth: false,
+        dkim_enabled: Boolean(dkim),
+        dkim_domain: dkim?.domainName || null,
+        dkim_selector: dkim?.keySelector || null
       };
       return;
     }
@@ -118,14 +205,22 @@ export class LoomEmailRelay {
     }
 
     if (smtpUrl) {
-      this.transporter = nodemailer.createTransport(smtpUrl);
+      this.transporter = dkim
+        ? nodemailer.createTransport({
+            url: smtpUrl,
+            dkim
+          })
+        : nodemailer.createTransport(smtpUrl);
       this.summary = {
         mode: "smtp",
         configured: true,
         host: "url",
         port: null,
         secure: smtpUrl.startsWith("smtps://"),
-        has_auth: true
+        has_auth: true,
+        dkim_enabled: Boolean(dkim),
+        dkim_domain: dkim?.domainName || null,
+        dkim_selector: dkim?.keySelector || null
       };
       return;
     }
@@ -138,7 +233,10 @@ export class LoomEmailRelay {
         host: null,
         port: null,
         secure: false,
-        has_auth: false
+        has_auth: false,
+        dkim_enabled: false,
+        dkim_domain: null,
+        dkim_selector: null
       };
       return;
     }
@@ -159,6 +257,9 @@ export class LoomEmailRelay {
         pass: smtpPass || ""
       };
     }
+    if (dkim) {
+      config.dkim = dkim;
+    }
 
     this.transporter = nodemailer.createTransport(config);
     this.summary = {
@@ -168,7 +269,10 @@ export class LoomEmailRelay {
       port: smtpPort,
       secure: smtpSecure,
       has_auth: Boolean(smtpUser || smtpPass),
-      auth_user_hint: redact(smtpUser)
+      auth_user_hint: redact(smtpUser),
+      dkim_enabled: Boolean(dkim),
+      dkim_domain: dkim?.domainName || null,
+      dkim_selector: dkim?.keySelector || null
     };
   }
 
@@ -248,6 +352,12 @@ export function createEmailRelayFromEnv(options = {}) {
     smtpPass: options.smtpPass ?? process.env.LOOM_SMTP_PASS ?? null,
     smtpRequireTls: options.smtpRequireTls ?? process.env.LOOM_SMTP_REQUIRE_TLS ?? null,
     smtpRejectUnauthorized:
-      options.smtpRejectUnauthorized ?? process.env.LOOM_SMTP_REJECT_UNAUTHORIZED ?? null
+      options.smtpRejectUnauthorized ?? process.env.LOOM_SMTP_REJECT_UNAUTHORIZED ?? null,
+    smtpDkimDomainName: options.smtpDkimDomainName ?? process.env.LOOM_SMTP_DKIM_DOMAIN_NAME ?? null,
+    smtpDkimKeySelector: options.smtpDkimKeySelector ?? process.env.LOOM_SMTP_DKIM_KEY_SELECTOR ?? null,
+    smtpDkimPrivateKeyPem: options.smtpDkimPrivateKeyPem ?? process.env.LOOM_SMTP_DKIM_PRIVATE_KEY_PEM ?? null,
+    smtpDkimPrivateKeyFile: options.smtpDkimPrivateKeyFile ?? process.env.LOOM_SMTP_DKIM_PRIVATE_KEY_FILE ?? null,
+    smtpDkimHeaderFieldNames:
+      options.smtpDkimHeaderFieldNames ?? process.env.LOOM_SMTP_DKIM_HEADER_FIELD_NAMES ?? null
   });
 }
