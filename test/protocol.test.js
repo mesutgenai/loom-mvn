@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1443,4 +1443,531 @@ test("email outbox processing honors persistence claim lock semantics", async ()
   assert.equal(releaseCalls.length, 1);
   assert.equal(releaseCalls[0].kind, "email");
   assert.equal(releaseCalls[0].outboxId, queued.id);
+});
+
+test("maintenance sweep evicts expired access tokens and refresh tokens", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  const pastDate = new Date(Date.now() - 60 * 1000).toISOString();
+  const futureDate = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  store.accessTokens.set("at_expired_1", {
+    access_token: "at_expired_1",
+    identity: "loom://alice@node.test",
+    key_id: "k_sign_alice_1",
+    created_at: pastDate,
+    expires_at: pastDate
+  });
+  store.accessTokens.set("at_expired_2", {
+    access_token: "at_expired_2",
+    identity: "loom://bob@node.test",
+    key_id: "k_sign_bob_1",
+    created_at: pastDate,
+    expires_at: pastDate
+  });
+  store.accessTokens.set("at_valid", {
+    access_token: "at_valid",
+    identity: "loom://carol@node.test",
+    key_id: "k_sign_carol_1",
+    created_at: new Date().toISOString(),
+    expires_at: futureDate
+  });
+
+  store.refreshTokens.set("rt_expired", {
+    refresh_token: "rt_expired",
+    identity: "loom://alice@node.test",
+    key_id: "k_sign_alice_1",
+    created_at: pastDate,
+    expires_at: pastDate
+  });
+  store.refreshTokens.set("rt_valid", {
+    refresh_token: "rt_valid",
+    identity: "loom://bob@node.test",
+    key_id: "k_sign_bob_1",
+    created_at: new Date().toISOString(),
+    expires_at: futureDate
+  });
+
+  assert.equal(store.accessTokens.size, 3);
+  assert.equal(store.refreshTokens.size, 2);
+
+  const result = store.runMaintenanceSweep();
+
+  assert.equal(store.accessTokens.size, 1);
+  assert.ok(store.accessTokens.has("at_valid"));
+  assert.equal(store.accessTokens.has("at_expired_1"), false);
+  assert.equal(store.accessTokens.has("at_expired_2"), false);
+
+  assert.equal(store.refreshTokens.size, 1);
+  assert.ok(store.refreshTokens.has("rt_valid"));
+  assert.equal(store.refreshTokens.has("rt_expired"), false);
+
+  assert.ok(result.swept >= 3);
+});
+
+test("maintenance sweep evicts used and expired auth challenges", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  const pastDate = new Date(Date.now() - 60 * 1000).toISOString();
+  const futureDate = new Date(Date.now() + 60 * 1000).toISOString();
+
+  store.authChallenges.set("ch_expired", {
+    challenge_id: "ch_expired",
+    identity: "loom://alice@node.test",
+    nonce: "nonce1",
+    expires_at: pastDate,
+    used: false,
+    created_at: pastDate
+  });
+  store.authChallenges.set("ch_used", {
+    challenge_id: "ch_used",
+    identity: "loom://bob@node.test",
+    nonce: "nonce2",
+    expires_at: futureDate,
+    used: true,
+    created_at: new Date().toISOString()
+  });
+  store.authChallenges.set("ch_active", {
+    challenge_id: "ch_active",
+    identity: "loom://carol@node.test",
+    nonce: "nonce3",
+    expires_at: futureDate,
+    used: false,
+    created_at: new Date().toISOString()
+  });
+
+  assert.equal(store.authChallenges.size, 3);
+
+  store.runMaintenanceSweep();
+
+  assert.equal(store.authChallenges.size, 1);
+  assert.ok(store.authChallenges.has("ch_active"));
+  assert.equal(store.authChallenges.has("ch_expired"), false);
+  assert.equal(store.authChallenges.has("ch_used"), false);
+});
+
+test("maintenance sweep evicts stale identity rate limit buckets", () => {
+  const windowMs = 60 * 1000;
+  const store = new LoomStore({ nodeId: "node.test", identityRateWindowMs: windowMs });
+
+  const staleTime = Date.now() - windowMs * 3;
+  const freshTime = Date.now() - windowMs / 2;
+
+  store.identityRateByBucket.set("default:loom://stale@node.test", {
+    count: 5,
+    window_started_at: staleTime
+  });
+  store.identityRateByBucket.set("sensitive:loom://stale2@node.test", {
+    count: 3,
+    window_started_at: staleTime
+  });
+  store.identityRateByBucket.set("default:loom://fresh@node.test", {
+    count: 2,
+    window_started_at: freshTime
+  });
+
+  assert.equal(store.identityRateByBucket.size, 3);
+
+  store.runMaintenanceSweep();
+
+  assert.equal(store.identityRateByBucket.size, 1);
+  assert.ok(store.identityRateByBucket.has("default:loom://fresh@node.test"));
+  assert.equal(store.identityRateByBucket.has("default:loom://stale@node.test"), false);
+  assert.equal(store.identityRateByBucket.has("sensitive:loom://stale2@node.test"), false);
+});
+
+test("maintenance sweep caps consumedPortableCapabilityIds to configured max", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    consumedCapabilityMaxEntries: 100
+  });
+
+  for (let i = 0; i < 150; i++) {
+    store.consumedPortableCapabilityIds.add(`cap_${String(i).padStart(10, "0")}`);
+  }
+
+  assert.equal(store.consumedPortableCapabilityIds.size, 150);
+
+  store.runMaintenanceSweep();
+
+  assert.equal(store.consumedPortableCapabilityIds.size, 100);
+
+  const remaining = Array.from(store.consumedPortableCapabilityIds);
+  assert.ok(remaining.every((id) => id.startsWith("cap_")));
+  assert.ok(remaining.includes("cap_0000000149"));
+  assert.ok(remaining.includes("cap_0000000050"));
+  assert.equal(remaining.includes("cap_0000000000"), false);
+  assert.equal(remaining.includes("cap_0000000049"), false);
+});
+
+test("maintenance sweep caps revokedDelegationIds to configured max", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    revokedDelegationMaxEntries: 100
+  });
+
+  for (let i = 0; i < 130; i++) {
+    store.revokedDelegationIds.add(`del_${String(i).padStart(10, "0")}`);
+  }
+
+  assert.equal(store.revokedDelegationIds.size, 130);
+
+  store.runMaintenanceSweep();
+
+  assert.equal(store.revokedDelegationIds.size, 100);
+
+  const remaining = Array.from(store.revokedDelegationIds);
+  assert.ok(remaining.includes("del_0000000129"));
+  assert.ok(remaining.includes("del_0000000030"));
+  assert.equal(remaining.includes("del_0000000000"), false);
+  assert.equal(remaining.includes("del_0000000029"), false);
+});
+
+test("maintenance sweep does not remove entries that are still valid", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  const futureDate = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const freshTime = Date.now();
+
+  store.accessTokens.set("at_1", {
+    access_token: "at_1",
+    identity: "loom://a@node.test",
+    expires_at: futureDate
+  });
+  store.refreshTokens.set("rt_1", {
+    refresh_token: "rt_1",
+    identity: "loom://a@node.test",
+    expires_at: futureDate
+  });
+  store.authChallenges.set("ch_1", {
+    challenge_id: "ch_1",
+    expires_at: futureDate,
+    used: false
+  });
+  store.identityRateByBucket.set("default:loom://a@node.test", {
+    count: 1,
+    window_started_at: freshTime
+  });
+
+  store.consumedPortableCapabilityIds.add("cap_a");
+  store.consumedPortableCapabilityIds.add("cap_b");
+  store.revokedDelegationIds.add("del_a");
+
+  store.runMaintenanceSweep();
+
+  assert.equal(store.accessTokens.size, 1);
+  assert.equal(store.refreshTokens.size, 1);
+  assert.equal(store.authChallenges.size, 1);
+  assert.equal(store.identityRateByBucket.size, 1);
+  assert.equal(store.consumedPortableCapabilityIds.size, 2);
+  assert.equal(store.revokedDelegationIds.size, 1);
+});
+
+test("maintenance sweep delegates to existing federation nonce cleanup", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  const oldMs = Date.now() - 20 * 60 * 1000;
+  const freshMs = Date.now() - 1000;
+
+  store.federationNonceCache.set("remote.test:nonce_old", oldMs);
+  store.federationNonceCache.set("remote.test:nonce_fresh", freshMs);
+
+  assert.equal(store.federationNonceCache.size, 2);
+
+  store.runMaintenanceSweep();
+
+  assert.equal(store.federationNonceCache.size, 1);
+  assert.ok(store.federationNonceCache.has("remote.test:nonce_fresh"));
+  assert.equal(store.federationNonceCache.has("remote.test:nonce_old"), false);
+});
+
+test("maintenance sweep returns swept count reflecting total evictions", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  const pastDate = new Date(Date.now() - 60 * 1000).toISOString();
+
+  store.accessTokens.set("at_exp", {
+    access_token: "at_exp",
+    identity: "loom://a@node.test",
+    expires_at: pastDate
+  });
+  store.refreshTokens.set("rt_exp", {
+    refresh_token: "rt_exp",
+    identity: "loom://a@node.test",
+    expires_at: pastDate
+  });
+  store.authChallenges.set("ch_exp", {
+    challenge_id: "ch_exp",
+    expires_at: pastDate,
+    used: false
+  });
+
+  const result = store.runMaintenanceSweep();
+
+  assert.ok(typeof result.swept === "number");
+  assert.ok(result.swept >= 3);
+});
+
+test("outbox worker backoff formula doubles on consecutive failures and caps at 5 minutes", () => {
+  let backoffMs = 0;
+
+  function applyBackoff() {
+    backoffMs = Math.min(300000, backoffMs === 0 ? 10000 : backoffMs * 2);
+    return backoffMs;
+  }
+
+  function resetBackoff() {
+    backoffMs = 0;
+  }
+
+  assert.equal(applyBackoff(), 10000);
+  assert.equal(applyBackoff(), 20000);
+  assert.equal(applyBackoff(), 40000);
+  assert.equal(applyBackoff(), 80000);
+  assert.equal(applyBackoff(), 160000);
+  assert.equal(applyBackoff(), 300000);
+  assert.equal(applyBackoff(), 300000);
+
+  resetBackoff();
+  assert.equal(backoffMs, 0);
+  assert.equal(applyBackoff(), 10000);
+});
+
+test("persistState uses atomic write pattern and produces no leftover tmp file", () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "loom-atomic-"));
+  try {
+    const { publicKeyPem } = generateSigningKeyPair();
+    const store = new LoomStore({ nodeId: "node.test", dataDir });
+
+    store.registerIdentity({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_atomic_1", public_key_pem: publicKeyPem }]
+    });
+
+    const stateFile = join(dataDir, "state.json");
+    const tmpFile = `${stateFile}.tmp`;
+
+    assert.ok(existsSync(stateFile), "state file should exist after registration");
+    assert.ok(!existsSync(tmpFile), "tmp file should not remain after atomic write");
+
+    const content = JSON.parse(readFileSync(stateFile, "utf-8"));
+    assert.equal(content.identities.length, 1);
+    assert.equal(content.identities[0].id, "loom://alice@node.test");
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("persistState survives reload after atomic write", () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "loom-atomic-reload-"));
+  try {
+    const { publicKeyPem } = generateSigningKeyPair();
+    const storeA = new LoomStore({ nodeId: "node.test", dataDir });
+
+    storeA.registerIdentity({
+      id: "loom://bob@node.test",
+      display_name: "Bob",
+      signing_keys: [{ key_id: "k_sign_bob_atom_1", public_key_pem: publicKeyPem }]
+    });
+
+    const storeB = new LoomStore({ nodeId: "node.test", dataDir });
+    const identity = storeB.resolveIdentity("loom://bob@node.test");
+    assert.ok(identity, "reloaded store should find the persisted identity");
+    assert.equal(identity.display_name, "Bob");
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("registerIdentity enforces maxLocalIdentities limit", () => {
+  const store = new LoomStore({ nodeId: "node.test", maxLocalIdentities: 2 });
+
+  for (let i = 0; i < 2; i++) {
+    const { publicKeyPem } = generateSigningKeyPair();
+    store.registerIdentity({
+      id: `loom://user${i}@node.test`,
+      display_name: `User ${i}`,
+      signing_keys: [{ key_id: `k_local_lim_${i}`, public_key_pem: publicKeyPem }]
+    });
+  }
+
+  const { publicKeyPem: extraKey } = generateSigningKeyPair();
+  assert.throws(
+    () => store.registerIdentity({
+      id: "loom://overflow@node.test",
+      display_name: "Overflow",
+      signing_keys: [{ key_id: "k_local_lim_overflow", public_key_pem: extraKey }]
+    }),
+    (error) => error?.code === "RESOURCE_LIMIT" && error.message.includes("local")
+  );
+});
+
+test("registerIdentity enforces maxRemoteIdentities limit", () => {
+  const store = new LoomStore({ nodeId: "node.test", maxRemoteIdentities: 2 });
+
+  for (let i = 0; i < 2; i++) {
+    const { publicKeyPem } = generateSigningKeyPair();
+    store.registerIdentity(
+      {
+        id: `loom://remote${i}@other.test`,
+        display_name: `Remote ${i}`,
+        signing_keys: [{ key_id: `k_remote_lim_${i}`, public_key_pem: publicKeyPem }]
+      },
+      { importedRemote: true, allowRemoteDomain: true, skipRegistrationProof: true }
+    );
+  }
+
+  const { publicKeyPem: extraKey } = generateSigningKeyPair();
+  assert.throws(
+    () => store.registerIdentity(
+      {
+        id: "loom://overflow@other.test",
+        display_name: "Overflow",
+        signing_keys: [{ key_id: "k_remote_lim_overflow", public_key_pem: extraKey }]
+      },
+      { importedRemote: true, allowRemoteDomain: true, skipRegistrationProof: true }
+    ),
+    (error) => error?.code === "RESOURCE_LIMIT" && error.message.includes("remote")
+  );
+});
+
+test("registerIdentity allows overwrite even at limit (does not block updates)", () => {
+  const store = new LoomStore({ nodeId: "node.test", maxLocalIdentities: 1 });
+
+  const { publicKeyPem } = generateSigningKeyPair();
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice v1",
+    signing_keys: [{ key_id: "k_overwrite_1", public_key_pem: publicKeyPem }]
+  });
+
+  const { publicKeyPem: newKey } = generateSigningKeyPair();
+  const updated = store.registerIdentity(
+    {
+      id: "loom://alice@node.test",
+      display_name: "Alice v2",
+      signing_keys: [{ key_id: "k_overwrite_2", public_key_pem: newKey }]
+    },
+    { allowOverwrite: true }
+  );
+  assert.equal(updated.display_name, "Alice v2");
+});
+
+test("createDelegation enforces maxDelegationsTotal limit", () => {
+  const ownerKeys = generateSigningKeyPair();
+  const agentKeys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test", maxDelegationsTotal: 2 });
+
+  store.registerIdentity({
+    id: "loom://owner@node.test",
+    display_name: "Owner",
+    signing_keys: [{ key_id: "k_dlg_total_owner", public_key_pem: ownerKeys.publicKeyPem }]
+  });
+
+  store.registerIdentity({
+    id: "loom://agent@node.test",
+    type: "agent",
+    display_name: "Agent",
+    signing_keys: [{ key_id: "k_dlg_total_agent", public_key_pem: agentKeys.publicKeyPem }]
+  });
+
+  for (let i = 0; i < 2; i++) {
+    const dlgPayload = {
+      id: `dlg_total_${i}`,
+      delegator: "loom://owner@node.test",
+      delegate: "loom://agent@node.test",
+      scope: ["message.general@v1"],
+      created_at: "2026-02-16T20:32:00Z",
+      expires_at: "2027-02-16T20:32:00Z",
+      revocable: true,
+      allow_sub_delegation: false,
+      max_sub_delegation_depth: 0,
+      key_id: "k_dlg_total_owner"
+    };
+    dlgPayload.signature = signUtf8Message(
+      ownerKeys.privateKeyPem,
+      canonicalizeDelegationLink(dlgPayload)
+    );
+    store.createDelegation(dlgPayload, "loom://owner@node.test");
+  }
+
+  const overflowPayload = {
+    id: "dlg_total_overflow",
+    delegator: "loom://owner@node.test",
+    delegate: "loom://agent@node.test",
+    scope: ["message.general@v1"],
+    created_at: "2026-02-16T20:32:00Z",
+    expires_at: "2027-02-16T20:32:00Z",
+    revocable: true,
+    allow_sub_delegation: false,
+    max_sub_delegation_depth: 0,
+    key_id: "k_dlg_total_owner"
+  };
+  overflowPayload.signature = signUtf8Message(
+    ownerKeys.privateKeyPem,
+    canonicalizeDelegationLink(overflowPayload)
+  );
+  assert.throws(
+    () => store.createDelegation(overflowPayload, "loom://owner@node.test"),
+    (error) => error?.code === "RESOURCE_LIMIT" && error.message.includes("total")
+  );
+});
+
+test("createDelegation enforces maxDelegationsPerIdentity limit", () => {
+  const ownerKeys = generateSigningKeyPair();
+  const agentKeys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test", maxDelegationsPerIdentity: 1 });
+
+  store.registerIdentity({
+    id: "loom://owner@node.test",
+    display_name: "Owner",
+    signing_keys: [{ key_id: "k_dlg_per_owner", public_key_pem: ownerKeys.publicKeyPem }]
+  });
+
+  store.registerIdentity({
+    id: "loom://agent@node.test",
+    type: "agent",
+    display_name: "Agent",
+    signing_keys: [{ key_id: "k_dlg_per_agent", public_key_pem: agentKeys.publicKeyPem }]
+  });
+
+  const firstPayload = {
+    id: "dlg_per_first",
+    delegator: "loom://owner@node.test",
+    delegate: "loom://agent@node.test",
+    scope: ["message.general@v1"],
+    created_at: "2026-02-16T20:32:00Z",
+    expires_at: "2027-02-16T20:32:00Z",
+    revocable: true,
+    allow_sub_delegation: false,
+    max_sub_delegation_depth: 0,
+    key_id: "k_dlg_per_owner"
+  };
+  firstPayload.signature = signUtf8Message(
+    ownerKeys.privateKeyPem,
+    canonicalizeDelegationLink(firstPayload)
+  );
+  store.createDelegation(firstPayload, "loom://owner@node.test");
+
+  const secondPayload = {
+    id: "dlg_per_second",
+    delegator: "loom://owner@node.test",
+    delegate: "loom://agent@node.test",
+    scope: ["message.general@v1"],
+    created_at: "2026-02-16T20:33:00Z",
+    expires_at: "2027-02-16T20:33:00Z",
+    revocable: true,
+    allow_sub_delegation: false,
+    max_sub_delegation_depth: 0,
+    key_id: "k_dlg_per_owner"
+  };
+  secondPayload.signature = signUtf8Message(
+    ownerKeys.privateKeyPem,
+    canonicalizeDelegationLink(secondPayload)
+  );
+  assert.throws(
+    () => store.createDelegation(secondPayload, "loom://owner@node.test"),
+    (error) => error?.code === "RESOURCE_LIMIT" && error.message.includes("per identity")
+  );
 });
