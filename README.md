@@ -288,7 +288,9 @@ Optional persistence:
 - Public-bind startup safeguards:
   - Server refuses startup on public bind without `LOOM_ADMIN_TOKEN`.
   - Server refuses `LOOM_METRICS_PUBLIC=true` on public bind unless `LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true`.
-- For `thread_op` submissions by non-owner participants, send capability secret via `x-loom-capability-token` header (not `content.structured.parameters.capability_token`).
+- For `thread_op` submissions by non-owner participants, authorize with either:
+  - `content.structured.parameters.capability_token` (portable signed token; recommended for federation portability)
+  - `x-loom-capability-token` (legacy/local presentation secret header)
 - Optional request logging:
   - `LOOM_REQUEST_LOG_ENABLED=true`
   - `LOOM_REQUEST_LOG_FORMAT=json|text` (default `json`)
@@ -310,6 +312,8 @@ Optional persistence:
   - `LOOM_WIRE_GATEWAY_ENABLED=true|false` (default `false`)
   - `LOOM_WIRE_GATEWAY_HOST` (default `127.0.0.1`)
   - `LOOM_WIRE_GATEWAY_REQUIRE_AUTH=true|false` (default `true`)
+  - `LOOM_WIRE_ALLOW_INSECURE_AUTH=true|false` (default `false`; allows AUTH before TLS for local/dev only)
+  - `LOOM_WIRE_ALLOW_INSECURE_AUTH_ON_PUBLIC_BIND=true|false` (default `false`; required if insecure auth is enabled on public bind)
   - `LOOM_WIRE_SMTP_ENABLED=true|false` (default `true` when wire gateway enabled)
   - `LOOM_WIRE_SMTP_STARTTLS_ENABLED=true|false` (default `true`)
   - `LOOM_WIRE_SMTP_PORT` (default `2525`)
@@ -321,6 +325,9 @@ Optional persistence:
   - TLS material (required when wire TLS is enabled):
     - inline PEMs: `LOOM_WIRE_TLS_CERT_PEM`, `LOOM_WIRE_TLS_KEY_PEM`
     - or file paths: `LOOM_WIRE_TLS_CERT_FILE`, `LOOM_WIRE_TLS_KEY_FILE`
+  - Startup safeguards:
+    - Refuses authenticated wire gateway startup without TLS unless `LOOM_WIRE_ALLOW_INSECURE_AUTH=true`.
+    - Refuses insecure-auth public bind unless `LOOM_WIRE_ALLOW_INSECURE_AUTH_ON_PUBLIC_BIND=true`.
 
 Production baseline:
 
