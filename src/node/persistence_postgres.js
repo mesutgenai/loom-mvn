@@ -1,6 +1,6 @@
 import { Pool } from "pg";
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 function parseBoolean(value, fallback = false) {
   if (value == null) {
@@ -59,6 +59,7 @@ export class LoomPostgresPersistence {
     this.lastBackupAt = null;
     this.lastRestoreAt = null;
     this.maintenanceCounter = 0;
+    this.outboxClaimSweepCounter = 0;
   }
 
   async initialize() {
@@ -155,6 +156,24 @@ export class LoomPostgresPersistence {
         ON loom_federation_challenges (state_key, node_id, expires_at DESC)
       `);
 
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS loom_outbox_claims (
+          state_key TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          outbox_id TEXT NOT NULL,
+          worker_id TEXT NOT NULL,
+          claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          claimed_until TIMESTAMPTZ NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (state_key, kind, outbox_id)
+        )
+      `);
+
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS loom_outbox_claims_state_kind_expiry_idx
+        ON loom_outbox_claims (state_key, kind, claimed_until)
+      `);
+
       await client.query(
         `
           INSERT INTO loom_meta (key, value_json, updated_at)
@@ -217,6 +236,27 @@ export class LoomPostgresPersistence {
     }
   }
 
+  async maybeCleanupOutboxClaims() {
+    this.outboxClaimSweepCounter += 1;
+    if (this.outboxClaimSweepCounter % 200 !== 0) {
+      return;
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query(
+        `
+          DELETE FROM loom_outbox_claims
+          WHERE state_key = $1
+            AND claimed_until < NOW() - INTERVAL '6 hours'
+        `,
+        [this.stateKey]
+      );
+    } finally {
+      client.release();
+    }
+  }
+
   async getSchemaStatus() {
     await this.initialize();
     return {
@@ -225,6 +265,98 @@ export class LoomPostgresPersistence {
       initialized: this.initialized,
       schema_version: this.schemaVersion || CURRENT_SCHEMA_VERSION
     };
+  }
+
+  async claimOutboxItem({ kind, outboxId, leaseMs, workerId }) {
+    await this.initialize();
+
+    const safeKind = String(kind || "").trim().toLowerCase();
+    const safeOutboxId = String(outboxId || "").trim();
+    const safeWorkerId = String(workerId || "").trim() || `worker_${process.pid}`;
+    if (!safeKind || !safeOutboxId) {
+      return {
+        claimed: false
+      };
+    }
+    const safeLeaseMs = Math.max(5000, parsePositiveInt(leaseMs, 60 * 1000));
+
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(
+        `
+          INSERT INTO loom_outbox_claims (
+            state_key,
+            kind,
+            outbox_id,
+            worker_id,
+            claimed_at,
+            claimed_until,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            NOW(),
+            NOW() + ($5::bigint * INTERVAL '1 millisecond'),
+            NOW()
+          )
+          ON CONFLICT (state_key, kind, outbox_id)
+          DO UPDATE SET
+            worker_id = EXCLUDED.worker_id,
+            claimed_at = NOW(),
+            claimed_until = EXCLUDED.claimed_until,
+            updated_at = NOW()
+          WHERE loom_outbox_claims.claimed_until <= NOW()
+            OR loom_outbox_claims.worker_id = EXCLUDED.worker_id
+          RETURNING worker_id, claimed_until
+        `,
+        [this.stateKey, safeKind, safeOutboxId, safeWorkerId, safeLeaseMs]
+      );
+
+      void this.maybeCleanupOutboxClaims();
+
+      return {
+        claimed: result.rowCount > 0,
+        worker_id: result.rows[0]?.worker_id || null,
+        claimed_until: result.rows[0]?.claimed_until || null
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  async releaseOutboxClaim({ kind, outboxId, workerId }) {
+    await this.initialize();
+
+    const safeKind = String(kind || "").trim().toLowerCase();
+    const safeOutboxId = String(outboxId || "").trim();
+    if (!safeKind || !safeOutboxId) {
+      return {
+        released: false
+      };
+    }
+    const safeWorkerId = typeof workerId === "string" && workerId.trim().length > 0 ? workerId.trim() : null;
+
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(
+        `
+          DELETE FROM loom_outbox_claims
+          WHERE state_key = $1
+            AND kind = $2
+            AND outbox_id = $3
+            AND ($4::text IS NULL OR worker_id = $4)
+        `,
+        [this.stateKey, safeKind, safeOutboxId, safeWorkerId]
+      );
+      return {
+        released: result.rowCount > 0
+      };
+    } finally {
+      client.release();
+    }
   }
 
   async loadStateAndAudit() {

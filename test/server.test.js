@@ -5993,6 +5993,179 @@ test("API supports outbound email relay outbox queue and process", async (t) => 
   assert.equal(relayCalls.length, 2);
 });
 
+test("API accepts DSN updates for email outbox items and enforces recipient matching", async (t) => {
+  const relay = {
+    isEnabled: () => true,
+    getStatus: () => ({
+      enabled: true,
+      mode: "mock",
+      configured: true
+    }),
+    send: async (message) => ({
+      provider_message_id: "mock-provider-id",
+      accepted: message.rcpt_to,
+      rejected: [],
+      response: "250 queued",
+      relay_mode: "mock"
+    })
+  };
+
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    emailRelay: relay
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const keys = generateSigningKeyPair();
+
+  const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: keys.publicKeyPem }]
+    })
+  });
+  assert.equal(register.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+  const accessToken = token.body.access_token;
+
+  const inbound = await jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      smtp_from: "Sender <sender@example.net>",
+      rcpt_to: ["alice@node.test"],
+      text: "dsn target message"
+    })
+  });
+  assert.equal(inbound.response.status, 201);
+
+  const queue = await jsonRequest(`${baseUrl}/v1/email/outbox`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      envelope_id: inbound.body.envelope_id,
+      to_email: ["alice@node.test"],
+      smtp_from: "no-reply@node.test"
+    })
+  });
+  assert.equal(queue.response.status, 201);
+  const outboxId = queue.body.id;
+
+  const dsnDelayed = await jsonRequest(`${baseUrl}/v1/email/outbox/${outboxId}/dsn`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      source: "dsn",
+      recipients: [
+        {
+          recipient: "alice@node.test",
+          status: "delayed",
+          status_code: "4.2.0",
+          diagnostic_code: "mailbox full"
+        }
+      ]
+    })
+  });
+  assert.equal(dsnDelayed.response.status, 200);
+  assert.equal(dsnDelayed.body.status, "queued");
+  assert.equal(dsnDelayed.body.last_dsn_source, "dsn");
+  assert.equal(Array.isArray(dsnDelayed.body.recipient_statuses), true);
+  assert.equal(dsnDelayed.body.recipient_statuses[0].status, "delayed");
+
+  const dsnDelivered = await jsonRequest(`${baseUrl}/v1/email/outbox/${outboxId}/dsn`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "idempotency-key": "dsn-update-1"
+    },
+    body: JSON.stringify({
+      source: "dsn",
+      dsn_message_id: "<dsn-message-1@example.net>",
+      recipients: [
+        {
+          recipient: "alice@node.test",
+          status: "delivered",
+          status_code: "2.0.0"
+        }
+      ]
+    })
+  });
+  assert.equal(dsnDelivered.response.status, 200);
+  assert.equal(dsnDelivered.body.status, "delivered");
+  assert.equal(typeof dsnDelivered.body.delivered_at, "string");
+  assert.equal(dsnDelivered.body.recipient_statuses[0].dsn_message_id, "dsn-message-1@example.net");
+
+  const dsnDeliveredReplay = await jsonRequest(`${baseUrl}/v1/email/outbox/${outboxId}/dsn`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "idempotency-key": "dsn-update-1"
+    },
+    body: JSON.stringify({
+      source: "dsn",
+      dsn_message_id: "<dsn-message-1@example.net>",
+      recipients: [
+        {
+          recipient: "alice@node.test",
+          status: "delivered",
+          status_code: "2.0.0"
+        }
+      ]
+    })
+  });
+  assert.equal(dsnDeliveredReplay.response.status, 200);
+  assert.equal(dsnDeliveredReplay.response.headers.get("x-loom-idempotency-replay"), "true");
+
+  const dsnInvalidRecipient = await jsonRequest(`${baseUrl}/v1/email/outbox/${outboxId}/dsn`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      recipients: [
+        {
+          recipient: "mallory@node.test",
+          status: "failed",
+          status_code: "5.1.1"
+        }
+      ]
+    })
+  });
+  assert.equal(dsnInvalidRecipient.response.status, 400);
+  assert.equal(dsnInvalidRecipient.body.error.code, "ENVELOPE_INVALID");
+});
+
 test("API exposes dead-letter outbox and supports admin requeue", async (t) => {
   let relaySendCalls = 0;
   const flakyRelay = {

@@ -74,18 +74,34 @@ function quoteImapString(value) {
   return `"${String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function parseSmtpPath(value) {
+function parseSmtpPathWithParams(value) {
   const trimmed = String(value || "").trim();
   if (!trimmed) {
-    return null;
+    return {
+      address: null,
+      parameters: []
+    };
   }
 
-  const angleMatch = trimmed.match(/^<([^>]+)>$/);
+  const angleMatch = trimmed.match(/^<([^>]+)>(?:\s+(.*))?$/);
   if (angleMatch) {
-    return angleMatch[1].trim();
+    const address = angleMatch[1].trim();
+    const parameters = String(angleMatch[2] || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    return {
+      address: address || null,
+      parameters
+    };
   }
 
-  return trimmed;
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  const address = tokens[0] ? tokens[0].replace(/^<|>$/g, "").trim() : "";
+  return {
+    address: address || null,
+    parameters: tokens.slice(1)
+  };
 }
 
 function decodeBase64Utf8(value) {
@@ -959,7 +975,12 @@ function createSmtpGatewayServer(options) {
           writeLine("501 5.5.2 MAIL requires FROM:<address>");
           return;
         }
-        const fromAddress = parseSmtpPath(fromMatch[1]);
+        const from = parseSmtpPathWithParams(fromMatch[1]);
+        if (from.parameters.some((parameter) => String(parameter).trim().toUpperCase() === "SMTPUTF8")) {
+          writeLine("504 5.5.4 SMTPUTF8 not supported");
+          return;
+        }
+        const fromAddress = from.address;
         if (!fromAddress) {
           writeLine("501 5.5.2 invalid sender");
           return;
@@ -980,7 +1001,12 @@ function createSmtpGatewayServer(options) {
           writeLine("501 5.5.2 RCPT requires TO:<address>");
           return;
         }
-        const recipient = parseSmtpPath(toMatch[1]);
+        const to = parseSmtpPathWithParams(toMatch[1]);
+        if (to.parameters.some((parameter) => String(parameter).trim().toUpperCase() === "SMTPUTF8")) {
+          writeLine("504 5.5.4 SMTPUTF8 not supported");
+          return;
+        }
+        const recipient = to.address;
         if (!recipient) {
           writeLine("501 5.5.2 invalid recipient");
           return;

@@ -953,6 +953,14 @@ export class LoomStore {
     this.stateFile = this.dataDir ? join(this.dataDir, "state.json") : null;
     this.auditFile = this.dataDir ? join(this.dataDir, "audit.log.jsonl") : null;
     this.persistenceAdapter = options.persistenceAdapter || null;
+    this.outboxClaimLeaseMs = Math.max(
+      5 * 1000,
+      parsePositiveInteger(options.outboxClaimLeaseMs, 60 * 1000)
+    );
+    this.outboxWorkerId =
+      typeof options.outboxWorkerId === "string" && options.outboxWorkerId.trim().length > 0
+        ? options.outboxWorkerId.trim()
+        : `worker_${generateUlid()}`;
 
     this.identities = new Map();
     this.remoteIdentities = new Map();
@@ -2319,82 +2327,122 @@ export class LoomStore {
       return item;
     }
 
-    const webhook = this.webhooksById.get(item.webhook_id);
-    if (!webhook || !webhook.active) {
-      this.markWebhookOutboxFailure(item, "Webhook target not active");
-      this.persistAndAudit("webhook.outbox.process.failed", {
-        outbox_id: item.id,
-        webhook_id: item.webhook_id,
-        event_id: item.event_id,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
+    if (!(await this.claimOutboxItemForProcessing("webhook", item))) {
       return item;
     }
-
-    if (!this.systemSigningPrivateKeyPem) {
-      this.markWebhookOutboxFailure(item, "System signing key not configured");
-      this.persistAndAudit("webhook.outbox.process.failed", {
-        outbox_id: item.id,
-        webhook_id: webhook.id,
-        event_id: item.event_id,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      return item;
-    }
-
-    const body = {
-      loom: "1.1",
-      delivery_id: item.id,
-      event_id: item.event_id,
-      event_type: item.event_type,
-      timestamp: nowIso(),
-      node_id: this.nodeId,
-      payload: item.payload
-    };
-    const rawBody = JSON.stringify(body);
-    const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
-    const timestamp = nowIso();
-    const nonce = `wh_${generateUlid()}`;
-    const webhookUrl = webhook.url;
-    const parsedUrl = new URL(webhookUrl);
-    const outboundHostPolicy = await assertOutboundUrlHostAllowed(parsedUrl, {
-      allowPrivateNetwork: webhook.allow_private_network === true,
-      allowedHosts: this.webhookOutboundHostAllowlist,
-      denyMetadataHosts: this.denyMetadataHosts
-    });
-    const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
-    const signature = signUtf8Message(this.systemSigningPrivateKeyPem, canonical);
 
     try {
-      const timeoutMs = Math.max(250, Math.min(parsePositiveInteger(item.timeout_ms, webhook.timeout_ms), 60000));
-      const response = await performPinnedOutboundHttpRequest(webhookUrl, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-loom-event-id": item.event_id,
-          "x-loom-delivery-id": item.id,
-          "x-loom-event-type": item.event_type,
-          "x-loom-key-id": this.systemSigningKeyId,
-          "x-loom-timestamp": timestamp,
-          "x-loom-nonce": nonce,
-          "x-loom-signature": signature
-        },
-        body: rawBody,
-        timeoutMs,
-        maxResponseBytes: this.webhookMaxResponseBytes,
-        responseSizeContext: {
-          webhook_id: webhook.id,
-          outbox_id: item.id
-        },
-        resolvedAddresses: outboundHostPolicy.resolvedAddresses,
-        rejectRedirects: true
-      });
+      const webhook = this.webhooksById.get(item.webhook_id);
+      if (!webhook || !webhook.active) {
+        this.markWebhookOutboxFailure(item, "Webhook target not active");
+        this.persistAndAudit("webhook.outbox.process.failed", {
+          outbox_id: item.id,
+          webhook_id: item.webhook_id,
+          event_id: item.event_id,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
 
-      if (!response.ok) {
-        const responseText = response.bodyText;
-        this.markWebhookOutboxFailure(item, `Webhook response ${response.status}: ${responseText}`, response.status);
+      if (!this.systemSigningPrivateKeyPem) {
+        this.markWebhookOutboxFailure(item, "System signing key not configured");
+        this.persistAndAudit("webhook.outbox.process.failed", {
+          outbox_id: item.id,
+          webhook_id: webhook.id,
+          event_id: item.event_id,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
+
+      const body = {
+        loom: "1.1",
+        delivery_id: item.id,
+        event_id: item.event_id,
+        event_type: item.event_type,
+        timestamp: nowIso(),
+        node_id: this.nodeId,
+        payload: item.payload
+      };
+      const rawBody = JSON.stringify(body);
+      const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+      const timestamp = nowIso();
+      const nonce = `wh_${generateUlid()}`;
+      const webhookUrl = webhook.url;
+      const parsedUrl = new URL(webhookUrl);
+      const outboundHostPolicy = await assertOutboundUrlHostAllowed(parsedUrl, {
+        allowPrivateNetwork: webhook.allow_private_network === true,
+        allowedHosts: this.webhookOutboundHostAllowlist,
+        denyMetadataHosts: this.denyMetadataHosts
+      });
+      const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
+      const signature = signUtf8Message(this.systemSigningPrivateKeyPem, canonical);
+
+      try {
+        const timeoutMs = Math.max(250, Math.min(parsePositiveInteger(item.timeout_ms, webhook.timeout_ms), 60000));
+        const response = await performPinnedOutboundHttpRequest(webhookUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-loom-event-id": item.event_id,
+            "x-loom-delivery-id": item.id,
+            "x-loom-event-type": item.event_type,
+            "x-loom-key-id": this.systemSigningKeyId,
+            "x-loom-timestamp": timestamp,
+            "x-loom-nonce": nonce,
+            "x-loom-signature": signature
+          },
+          body: rawBody,
+          timeoutMs,
+          maxResponseBytes: this.webhookMaxResponseBytes,
+          responseSizeContext: {
+            webhook_id: webhook.id,
+            outbox_id: item.id
+          },
+          resolvedAddresses: outboundHostPolicy.resolvedAddresses,
+          rejectRedirects: true
+        });
+
+        if (!response.ok) {
+          const responseText = response.bodyText;
+          this.markWebhookOutboxFailure(item, `Webhook response ${response.status}: ${responseText}`, response.status);
+          this.persistAndAudit("webhook.outbox.process.failed", {
+            outbox_id: item.id,
+            webhook_id: webhook.id,
+            event_id: item.event_id,
+            reason: item.last_error,
+            actor: actorIdentity
+          });
+          webhook.last_error = item.last_error;
+          webhook.updated_at = nowIso();
+          return item;
+        }
+
+        item.attempts += 1;
+        item.status = "delivered";
+        item.updated_at = nowIso();
+        item.delivered_at = nowIso();
+        item.next_attempt_at = null;
+        item.last_error = null;
+        item.last_http_status = response.status;
+
+        webhook.last_delivery_at = item.delivered_at;
+        webhook.last_error = null;
+        webhook.updated_at = nowIso();
+
+        this.persistAndAudit("webhook.outbox.process.delivered", {
+          outbox_id: item.id,
+          webhook_id: webhook.id,
+          event_id: item.event_id,
+          event_type: item.event_type,
+          attempts: item.attempts,
+          actor: actorIdentity
+        });
+        return item;
+      } catch (error) {
+        this.markWebhookOutboxFailure(item, error?.message || "Webhook delivery network error");
         this.persistAndAudit("webhook.outbox.process.failed", {
           outbox_id: item.id,
           webhook_id: webhook.id,
@@ -2406,40 +2454,8 @@ export class LoomStore {
         webhook.updated_at = nowIso();
         return item;
       }
-
-      item.attempts += 1;
-      item.status = "delivered";
-      item.updated_at = nowIso();
-      item.delivered_at = nowIso();
-      item.next_attempt_at = null;
-      item.last_error = null;
-      item.last_http_status = response.status;
-
-      webhook.last_delivery_at = item.delivered_at;
-      webhook.last_error = null;
-      webhook.updated_at = nowIso();
-
-      this.persistAndAudit("webhook.outbox.process.delivered", {
-        outbox_id: item.id,
-        webhook_id: webhook.id,
-        event_id: item.event_id,
-        event_type: item.event_type,
-        attempts: item.attempts,
-        actor: actorIdentity
-      });
-      return item;
-    } catch (error) {
-      this.markWebhookOutboxFailure(item, error?.message || "Webhook delivery network error");
-      this.persistAndAudit("webhook.outbox.process.failed", {
-        outbox_id: item.id,
-        webhook_id: webhook.id,
-        event_id: item.event_id,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      webhook.last_error = item.last_error;
-      webhook.updated_at = nowIso();
-      return item;
+    } finally {
+      await this.releaseOutboxItemClaim("webhook", item);
     }
   }
 
@@ -4079,204 +4095,212 @@ export class LoomStore {
       return item;
     }
 
-    const node = this.knownNodesById.get(item.recipient_node);
-    if (!node) {
-      this.markOutboxFailure(item, `Unknown recipient node: ${item.recipient_node}`);
-      this.persistAndAudit("federation.outbox.process.failed", {
-        outbox_id: item.id,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
+    if (!(await this.claimOutboxItemForProcessing("federation", item))) {
       return item;
     }
-
-    const envelopes = item.envelope_ids
-      .map((envelopeId) => this.envelopesById.get(envelopeId))
-      .filter(Boolean);
-
-    if (envelopes.length !== item.envelope_ids.length) {
-      this.markOutboxFailure(item, "One or more queued envelopes are missing");
-      this.persistAndAudit("federation.outbox.process.failed", {
-        outbox_id: item.id,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      return item;
-    }
-
-    const wrapper = {
-      loom: "1.1",
-      sender_node: this.nodeId,
-      delivery_id: item.delivery_id || item.id,
-      timestamp: nowIso(),
-      envelopes
-    };
-
-    const rawBody = JSON.stringify(wrapper);
-    const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
-    const timestamp = nowIso();
-    const nonce = `nonce_${generateUlid()}`;
-
-    const deliverUrl = item.deliver_url || this.resolveFederationDeliverUrl(node);
-    let parsedUrl;
-    try {
-      parsedUrl = new URL(deliverUrl);
-    } catch {
-      this.markOutboxFailure(item, "Invalid federation deliver_url");
-      this.persistAndAudit("federation.outbox.process.failed", {
-        outbox_id: item.id,
-        recipient_node: item.recipient_node,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      return item;
-    }
-
-    if (parsedUrl.username || parsedUrl.password) {
-      this.markOutboxFailure(item, "Federation deliver_url must not include credentials");
-      this.persistAndAudit("federation.outbox.process.failed", {
-        outbox_id: item.id,
-        recipient_node: item.recipient_node,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      return item;
-    }
-
-    const allowInsecureHttp = node.allow_insecure_http === true;
-    if (parsedUrl.protocol !== "https:" && !(allowInsecureHttp && parsedUrl.protocol === "http:")) {
-      this.markOutboxFailure(item, "Federation deliver_url must use https unless allow_insecure_http=true");
-      this.persistAndAudit("federation.outbox.process.failed", {
-        outbox_id: item.id,
-        recipient_node: item.recipient_node,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      return item;
-    }
-
-    let outboundHostPolicy;
-    try {
-      outboundHostPolicy = await assertOutboundUrlHostAllowed(parsedUrl, {
-        allowPrivateNetwork: node.allow_private_network === true,
-        allowedHosts: this.federationOutboundHostAllowlist,
-        denyMetadataHosts: this.denyMetadataHosts
-      });
-    } catch (error) {
-      this.markOutboxFailure(item, error?.message || "Federation deliver_url host denied");
-      this.persistAndAudit("federation.outbox.process.failed", {
-        outbox_id: item.id,
-        recipient_node: item.recipient_node,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      return item;
-    }
-
-    const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
-    const signature = signUtf8Message(this.federationSigningPrivateKeyPem, canonical);
 
     try {
-      const response = await performPinnedOutboundHttpRequest(parsedUrl.toString(), {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-loom-node": this.nodeId,
-          "x-loom-timestamp": timestamp,
-          "x-loom-nonce": nonce,
-          "x-loom-key-id": this.federationSigningKeyId,
-          "x-loom-signature": signature
-        },
-        body: rawBody,
-        timeoutMs: this.federationDeliverTimeoutMs,
-        maxResponseBytes: this.federationDeliverMaxResponseBytes,
-        responseSizeContext: {
-          outbox_id: item.id,
-          recipient_node: item.recipient_node
-        },
-        resolvedAddresses: outboundHostPolicy.resolvedAddresses,
-        rejectRedirects: true
-      });
-
-      if (!response.ok) {
-        const responseText = response.bodyText;
-        this.markOutboxFailure(item, `Remote response ${response.status}: ${responseText}`, response.status);
+      const node = this.knownNodesById.get(item.recipient_node);
+      if (!node) {
+        this.markOutboxFailure(item, `Unknown recipient node: ${item.recipient_node}`);
         this.persistAndAudit("federation.outbox.process.failed", {
           outbox_id: item.id,
-          recipient_node: item.recipient_node,
           reason: item.last_error,
           actor: actorIdentity
         });
         return item;
       }
 
-      let responseJson = null;
+      const envelopes = item.envelope_ids
+        .map((envelopeId) => this.envelopesById.get(envelopeId))
+        .filter(Boolean);
+
+      if (envelopes.length !== item.envelope_ids.length) {
+        this.markOutboxFailure(item, "One or more queued envelopes are missing");
+        this.persistAndAudit("federation.outbox.process.failed", {
+          outbox_id: item.id,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
+
+      const wrapper = {
+        loom: "1.1",
+        sender_node: this.nodeId,
+        delivery_id: item.delivery_id || item.id,
+        timestamp: nowIso(),
+        envelopes
+      };
+
+      const rawBody = JSON.stringify(wrapper);
+      const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+      const timestamp = nowIso();
+      const nonce = `nonce_${generateUlid()}`;
+
+      const deliverUrl = item.deliver_url || this.resolveFederationDeliverUrl(node);
+      let parsedUrl;
       try {
-        responseJson = response.bodyText ? JSON.parse(response.bodyText) : null;
+        parsedUrl = new URL(deliverUrl);
       } catch {
-        responseJson = null;
-      }
-
-      const receiptValidation = this.verifyFederationDeliveryReceipt(responseJson?.receipt, {
-        sender_node: item.recipient_node,
-        recipient_node: this.nodeId,
-        delivery_id: item.delivery_id || item.id,
-        node
-      });
-
-      if (!receiptValidation.valid && this.federationRequireSignedReceipts) {
-        this.markOutboxFailure(item, `Signed receipt verification failed: ${receiptValidation.reason}`, null, {
-          receiptVerificationError: receiptValidation.reason
-        });
+        this.markOutboxFailure(item, "Invalid federation deliver_url");
         this.persistAndAudit("federation.outbox.process.failed", {
           outbox_id: item.id,
           recipient_node: item.recipient_node,
           reason: item.last_error,
-          receipt_verification_error: receiptValidation.reason,
           actor: actorIdentity
         });
         return item;
       }
 
-      item.attempts += 1;
-      item.status = "delivered";
-      item.updated_at = nowIso();
-      item.delivered_at = nowIso();
-      item.next_attempt_at = null;
-      item.last_error = null;
-      item.last_http_status = response.status;
-      item.receipt = responseJson?.receipt || null;
-      item.receipt_verified = receiptValidation.valid;
-      item.receipt_verified_at = receiptValidation.valid ? nowIso() : null;
-      item.receipt_verification_error = receiptValidation.valid ? null : receiptValidation.reason;
-
-      this.persistAndAudit("federation.outbox.process.delivered", {
-        outbox_id: item.id,
-        delivery_id: item.delivery_id || item.id,
-        recipient_node: item.recipient_node,
-        attempts: item.attempts,
-        receipt_verified: item.receipt_verified,
-        receipt_verification_error: item.receipt_verification_error,
-        actor: actorIdentity
-      });
-
-      return item;
-    } catch (error) {
-      if (error?.name === "AbortError") {
-        this.markOutboxFailure(
-          item,
-          `Federation delivery timed out after ${this.federationDeliverTimeoutMs}ms`
-        );
-      } else {
-        this.markOutboxFailure(item, error?.message || "Network error");
+      if (parsedUrl.username || parsedUrl.password) {
+        this.markOutboxFailure(item, "Federation deliver_url must not include credentials");
+        this.persistAndAudit("federation.outbox.process.failed", {
+          outbox_id: item.id,
+          recipient_node: item.recipient_node,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
       }
-      this.persistAndAudit("federation.outbox.process.failed", {
-        outbox_id: item.id,
-        recipient_node: item.recipient_node,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
-      return item;
+
+      const allowInsecureHttp = node.allow_insecure_http === true;
+      if (parsedUrl.protocol !== "https:" && !(allowInsecureHttp && parsedUrl.protocol === "http:")) {
+        this.markOutboxFailure(item, "Federation deliver_url must use https unless allow_insecure_http=true");
+        this.persistAndAudit("federation.outbox.process.failed", {
+          outbox_id: item.id,
+          recipient_node: item.recipient_node,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
+
+      let outboundHostPolicy;
+      try {
+        outboundHostPolicy = await assertOutboundUrlHostAllowed(parsedUrl, {
+          allowPrivateNetwork: node.allow_private_network === true,
+          allowedHosts: this.federationOutboundHostAllowlist,
+          denyMetadataHosts: this.denyMetadataHosts
+        });
+      } catch (error) {
+        this.markOutboxFailure(item, error?.message || "Federation deliver_url host denied");
+        this.persistAndAudit("federation.outbox.process.failed", {
+          outbox_id: item.id,
+          recipient_node: item.recipient_node,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
+
+      const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
+      const signature = signUtf8Message(this.federationSigningPrivateKeyPem, canonical);
+
+      try {
+        const response = await performPinnedOutboundHttpRequest(parsedUrl.toString(), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-loom-node": this.nodeId,
+            "x-loom-timestamp": timestamp,
+            "x-loom-nonce": nonce,
+            "x-loom-key-id": this.federationSigningKeyId,
+            "x-loom-signature": signature
+          },
+          body: rawBody,
+          timeoutMs: this.federationDeliverTimeoutMs,
+          maxResponseBytes: this.federationDeliverMaxResponseBytes,
+          responseSizeContext: {
+            outbox_id: item.id,
+            recipient_node: item.recipient_node
+          },
+          resolvedAddresses: outboundHostPolicy.resolvedAddresses,
+          rejectRedirects: true
+        });
+
+        if (!response.ok) {
+          const responseText = response.bodyText;
+          this.markOutboxFailure(item, `Remote response ${response.status}: ${responseText}`, response.status);
+          this.persistAndAudit("federation.outbox.process.failed", {
+            outbox_id: item.id,
+            recipient_node: item.recipient_node,
+            reason: item.last_error,
+            actor: actorIdentity
+          });
+          return item;
+        }
+
+        let responseJson = null;
+        try {
+          responseJson = response.bodyText ? JSON.parse(response.bodyText) : null;
+        } catch {
+          responseJson = null;
+        }
+
+        const receiptValidation = this.verifyFederationDeliveryReceipt(responseJson?.receipt, {
+          sender_node: item.recipient_node,
+          recipient_node: this.nodeId,
+          delivery_id: item.delivery_id || item.id,
+          node
+        });
+
+        if (!receiptValidation.valid && this.federationRequireSignedReceipts) {
+          this.markOutboxFailure(item, `Signed receipt verification failed: ${receiptValidation.reason}`, null, {
+            receiptVerificationError: receiptValidation.reason
+          });
+          this.persistAndAudit("federation.outbox.process.failed", {
+            outbox_id: item.id,
+            recipient_node: item.recipient_node,
+            reason: item.last_error,
+            receipt_verification_error: receiptValidation.reason,
+            actor: actorIdentity
+          });
+          return item;
+        }
+
+        item.attempts += 1;
+        item.status = "delivered";
+        item.updated_at = nowIso();
+        item.delivered_at = nowIso();
+        item.next_attempt_at = null;
+        item.last_error = null;
+        item.last_http_status = response.status;
+        item.receipt = responseJson?.receipt || null;
+        item.receipt_verified = receiptValidation.valid;
+        item.receipt_verified_at = receiptValidation.valid ? nowIso() : null;
+        item.receipt_verification_error = receiptValidation.valid ? null : receiptValidation.reason;
+
+        this.persistAndAudit("federation.outbox.process.delivered", {
+          outbox_id: item.id,
+          delivery_id: item.delivery_id || item.id,
+          recipient_node: item.recipient_node,
+          attempts: item.attempts,
+          receipt_verified: item.receipt_verified,
+          receipt_verification_error: item.receipt_verification_error,
+          actor: actorIdentity
+        });
+
+        return item;
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          this.markOutboxFailure(
+            item,
+            `Federation delivery timed out after ${this.federationDeliverTimeoutMs}ms`
+          );
+        } else {
+          this.markOutboxFailure(item, error?.message || "Network error");
+        }
+        this.persistAndAudit("federation.outbox.process.failed", {
+          outbox_id: item.id,
+          recipient_node: item.recipient_node,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
+    } finally {
+      await this.releaseOutboxItemClaim("federation", item);
     }
   }
 
@@ -4942,6 +4966,91 @@ export class LoomStore {
     };
   }
 
+  buildBridgeOutboundMimeAttachments(envelope, actorIdentity) {
+    const sourceAttachments = Array.isArray(envelope?.attachments) ? envelope.attachments : [];
+    const renderedAttachments = [];
+
+    for (let index = 0; index < sourceAttachments.length; index += 1) {
+      const attachment = sourceAttachments[index];
+      if (!attachment || typeof attachment !== "object") {
+        throw new LoomError("ENVELOPE_INVALID", "Attachment must be an object", 400, {
+          field: `attachments[${index}]`
+        });
+      }
+
+      const blobId = String(attachment.blob_id || "").trim();
+      if (!blobId) {
+        throw new LoomError("ENVELOPE_INVALID", "Attachment blob_id is required", 400, {
+          field: `attachments[${index}].blob_id`
+        });
+      }
+
+      const blob = this.getBlob(blobId, actorIdentity);
+      if (!blob) {
+        throw new LoomError("ENVELOPE_NOT_FOUND", `Attachment blob not found: ${blobId}`, 404, {
+          field: `attachments[${index}].blob_id`,
+          blob_id: blobId
+        });
+      }
+
+      if (blob.status !== "complete" || typeof blob.data_base64 !== "string") {
+        throw new LoomError("ENVELOPE_INVALID", "Attachment blob must be complete before outbound rendering", 400, {
+          field: `attachments[${index}].blob_id`,
+          blob_id: blobId
+        });
+      }
+
+      const expectedHash = String(attachment.hash || "").trim();
+      if (expectedHash && blob.hash && expectedHash !== blob.hash) {
+        throw new LoomError("ENVELOPE_INVALID", "Attachment blob hash mismatch", 400, {
+          field: `attachments[${index}].hash`,
+          blob_id: blobId,
+          expected_hash: expectedHash,
+          actual_hash: blob.hash
+        });
+      }
+
+      const filename = String(attachment.filename || blob.filename || `${blob.id}.bin`).trim();
+      if (!filename || containsHeaderUnsafeChars(filename)) {
+        throw new LoomError("ENVELOPE_INVALID", "Attachment filename is invalid", 400, {
+          field: `attachments[${index}].filename`
+        });
+      }
+
+      const mimeType = String(attachment.mime_type || blob.mime_type || "application/octet-stream").trim();
+      if (!mimeType || containsHeaderUnsafeChars(mimeType)) {
+        throw new LoomError("ENVELOPE_INVALID", "Attachment mime_type is invalid", 400, {
+          field: `attachments[${index}].mime_type`
+        });
+      }
+
+      const dispositionRaw = String(attachment.disposition || "attachment")
+        .trim()
+        .toLowerCase();
+      const disposition = dispositionRaw === "inline" ? "inline" : "attachment";
+      const contentId = attachment.content_id ? String(attachment.content_id).trim() : null;
+      if (contentId && containsHeaderUnsafeChars(contentId)) {
+        throw new LoomError("ENVELOPE_INVALID", "Attachment content_id is invalid", 400, {
+          field: `attachments[${index}].content_id`
+        });
+      }
+
+      renderedAttachments.push({
+        id: String(attachment.id || "").trim() || null,
+        blob_id: blob.id,
+        hash: blob.hash || expectedHash || null,
+        filename,
+        mime_type: mimeType,
+        disposition,
+        content_id: contentId || null,
+        size_bytes: Number(blob.size_bytes || 0),
+        data_base64: blob.data_base64
+      });
+    }
+
+    return renderedAttachments;
+  }
+
   renderBridgeOutboundEmail(payload, actorIdentity) {
     if (!payload || typeof payload !== "object") {
       throw new LoomError("ENVELOPE_INVALID", "Outbound email payload must be an object", 400, {
@@ -5011,6 +5120,17 @@ export class LoomStore {
 
     const messageId = `${envelope.id}@${this.nodeId}`;
     const inReplyTo = envelope.parent_id ? `${envelope.parent_id}@${this.nodeId}` : null;
+    const references = Array.from(
+      new Set(
+        (envelope.references?.external || [])
+          .filter((entry) => entry?.type === "email_message_id" && entry?.ref)
+          .map((entry) => String(entry.ref).trim())
+          .filter(Boolean)
+      )
+    )
+      .map((ref) => (ref.startsWith("<") ? ref : `<${ref}>`))
+      .join(" ");
+    const renderedAttachments = this.buildBridgeOutboundMimeAttachments(envelope, actorIdentity);
 
     this.recordEmailMessageIndex(messageId, envelope.id, envelope.thread_id);
     this.persistAndAudit("bridge.email.outbound.render", {
@@ -5028,11 +5148,12 @@ export class LoomStore {
       headers: {
         "Message-ID": `<${messageId}>`,
         ...(inReplyTo ? { "In-Reply-To": `<${inReplyTo}>` } : {}),
+        ...(references ? { References: references } : {}),
         "X-LOOM-Intent": envelope.content?.structured?.intent || "message.general@v1",
         "X-LOOM-Thread-ID": envelope.thread_id,
         "X-LOOM-Envelope-ID": envelope.id
       },
-      attachments: envelope.attachments || []
+      attachments: renderedAttachments
     };
   }
 
@@ -5786,6 +5907,9 @@ export class LoomStore {
       provider_message_id: null,
       last_provider_response: null,
       last_error: null,
+      recipient_statuses: [],
+      last_dsn_at: null,
+      last_dsn_source: null,
       queued_by: actorIdentity
     };
 
@@ -5897,6 +6021,248 @@ export class LoomStore {
     item.next_attempt_at = new Date(nowMs() + backoffSeconds * 1000).toISOString();
   }
 
+  normalizeEmailDeliveryStatus(value, fallback = "unknown") {
+    const normalized = String(value || "")
+      .trim()
+      .toLowerCase();
+    if (!normalized) {
+      return fallback;
+    }
+
+    if (
+      normalized === "delivered" ||
+      normalized === "relayed" ||
+      normalized === "expanded" ||
+      normalized === "failed" ||
+      normalized === "delayed" ||
+      normalized === "unknown"
+    ) {
+      return normalized;
+    }
+
+    if (normalized === "success" || normalized === "ok") {
+      return "delivered";
+    }
+    if (normalized === "temporary_failure" || normalized === "deferred" || normalized === "retry") {
+      return "delayed";
+    }
+    if (normalized === "permanent_failure" || normalized === "error" || normalized === "bounced") {
+      return "failed";
+    }
+    return fallback;
+  }
+
+  normalizeEmailRecipientDeliveryUpdates(recipients) {
+    const normalized = [];
+    for (const entry of Array.isArray(recipients) ? recipients : []) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+
+      const recipient = this.normalizeEmailAddress(
+        entry.recipient || entry.address || entry.to || entry.email || entry.rcpt_to
+      );
+      if (!recipient) {
+        continue;
+      }
+
+      const status = this.normalizeEmailDeliveryStatus(entry.status || entry.action, "unknown");
+      normalized.push({
+        recipient,
+        status,
+        action: String(entry.action || status).trim().toLowerCase() || status,
+        status_code: entry.status_code ? String(entry.status_code).trim() : null,
+        diagnostic_code: entry.diagnostic_code ? String(entry.diagnostic_code).trim() : null,
+        remote_mta: entry.remote_mta ? String(entry.remote_mta).trim() : null
+      });
+    }
+    return normalized;
+  }
+
+  mergeEmailRecipientStatuses(existingStatuses, updates, source, updatedAt, options = {}) {
+    const dsnMessageId = options.dsnMessageId ? String(options.dsnMessageId).trim() : null;
+    const byRecipient = new Map();
+    for (const statusEntry of Array.isArray(existingStatuses) ? existingStatuses : []) {
+      if (!statusEntry || typeof statusEntry !== "object") {
+        continue;
+      }
+      const recipient = this.normalizeEmailAddress(statusEntry.recipient);
+      if (!recipient) {
+        continue;
+      }
+      byRecipient.set(recipient, {
+        recipient,
+        status: this.normalizeEmailDeliveryStatus(statusEntry.status, "unknown"),
+        action: statusEntry.action || null,
+        status_code: statusEntry.status_code || null,
+        diagnostic_code: statusEntry.diagnostic_code || null,
+        remote_mta: statusEntry.remote_mta || null,
+        source: statusEntry.source || null,
+        updated_at: statusEntry.updated_at || null,
+        dsn_message_id: statusEntry.dsn_message_id || null
+      });
+    }
+
+    for (const update of updates) {
+      const recipient = this.normalizeEmailAddress(update.recipient);
+      if (!recipient) {
+        continue;
+      }
+      byRecipient.set(recipient, {
+        recipient,
+        status: this.normalizeEmailDeliveryStatus(update.status, "unknown"),
+        action: update.action || null,
+        status_code: update.status_code || null,
+        diagnostic_code: update.diagnostic_code || null,
+        remote_mta: update.remote_mta || null,
+        source,
+        updated_at: updatedAt,
+        dsn_message_id: dsnMessageId
+      });
+    }
+
+    return Array.from(byRecipient.values()).sort((left, right) => left.recipient.localeCompare(right.recipient));
+  }
+
+  computeEmailOutboxStateFromRecipientStatuses(recipientStatuses = []) {
+    const statuses = Array.isArray(recipientStatuses) ? recipientStatuses : [];
+    const hasFailed = statuses.some((entry) => entry.status === "failed");
+    const hasDelayed = statuses.some((entry) => entry.status === "delayed");
+    const hasDelivered = statuses.some((entry) =>
+      entry.status === "delivered" || entry.status === "relayed" || entry.status === "expanded"
+    );
+
+    if (hasFailed) {
+      return {
+        status: "failed",
+        reason: "Delivery failed for one or more recipients"
+      };
+    }
+    if (hasDelayed) {
+      return {
+        status: "queued",
+        reason: "Delivery delayed for one or more recipients"
+      };
+    }
+    if (hasDelivered) {
+      return {
+        status: "delivered",
+        reason: null
+      };
+    }
+    return {
+      status: "queued",
+      reason: null
+    };
+  }
+
+  applyEmailOutboxDsnReport(outboxId, payload, actorIdentity = "system") {
+    const item = this.emailOutboxById.get(outboxId);
+    if (!item) {
+      throw new LoomError("ENVELOPE_NOT_FOUND", `Email outbox item not found: ${outboxId}`, 404, {
+        outbox_id: outboxId
+      });
+    }
+
+    if (!payload || typeof payload !== "object") {
+      throw new LoomError("ENVELOPE_INVALID", "DSN payload must be an object", 400, {
+        field: "dsn"
+      });
+    }
+
+    const updates = this.normalizeEmailRecipientDeliveryUpdates(payload.recipients);
+    if (updates.length === 0) {
+      throw new LoomError("ENVELOPE_INVALID", "DSN payload must include at least one valid recipient status", 400, {
+        field: "recipients"
+      });
+    }
+    const allowedRecipients = new Set(
+      (Array.isArray(item.to_email) ? item.to_email : [])
+        .map((entry) => this.normalizeEmailAddress(entry))
+        .filter(Boolean)
+    );
+    if (allowedRecipients.size > 0) {
+      const invalidRecipient = updates.find((entry) => !allowedRecipients.has(entry.recipient));
+      if (invalidRecipient) {
+        throw new LoomError("ENVELOPE_INVALID", "DSN recipient is not part of this outbox delivery", 400, {
+          field: "recipients",
+          recipient: invalidRecipient.recipient
+        });
+      }
+    }
+
+    const source = String(payload.source || "dsn").trim().toLowerCase() || "dsn";
+    const dsnReceivedAt = parseTime(payload.received_at) != null ? new Date(parseTime(payload.received_at)).toISOString() : nowIso();
+    const dsnMessageId = payload.dsn_message_id ? this.parseMessageId(payload.dsn_message_id) : null;
+
+    item.recipient_statuses = this.mergeEmailRecipientStatuses(item.recipient_statuses, updates, source, dsnReceivedAt, {
+      dsnMessageId
+    });
+    item.last_dsn_at = dsnReceivedAt;
+    item.last_dsn_source = source;
+    item.updated_at = nowIso();
+    if (payload.provider_message_id) {
+      item.provider_message_id = String(payload.provider_message_id).trim();
+    }
+    if (payload.provider_response) {
+      item.last_provider_response = String(payload.provider_response).trim();
+    }
+
+    const aggregate = this.computeEmailOutboxStateFromRecipientStatuses(item.recipient_statuses);
+    item.status = aggregate.status;
+    if (aggregate.status === "delivered") {
+      item.delivered_at = item.delivered_at || dsnReceivedAt;
+      item.next_attempt_at = null;
+      item.last_error = null;
+    } else if (aggregate.status === "failed") {
+      const firstFailure = item.recipient_statuses.find((entry) => entry.status === "failed");
+      item.last_error = firstFailure?.diagnostic_code || aggregate.reason;
+      item.next_attempt_at = null;
+    } else {
+      item.last_error = aggregate.reason;
+      if (!item.next_attempt_at || parseTime(item.next_attempt_at) == null || parseTime(item.next_attempt_at) <= nowMs()) {
+        item.next_attempt_at = new Date(nowMs() + 5 * 60 * 1000).toISOString();
+      }
+    }
+
+    this.persistAndAudit("email.outbox.dsn.update", {
+      outbox_id: item.id,
+      envelope_id: item.envelope_id,
+      status: item.status,
+      recipient_updates: updates.length,
+      source,
+      actor: actorIdentity
+    });
+
+    return item;
+  }
+
+  async claimOutboxItemForProcessing(kind, item) {
+    if (!item || !this.persistenceAdapter || typeof this.persistenceAdapter.claimOutboxItem !== "function") {
+      return true;
+    }
+
+    const claim = await this.persistenceAdapter.claimOutboxItem({
+      kind,
+      outboxId: item.id,
+      expectedUpdatedAt: item.updated_at,
+      leaseMs: this.outboxClaimLeaseMs,
+      workerId: this.outboxWorkerId
+    });
+    return claim?.claimed !== false;
+  }
+
+  async releaseOutboxItemClaim(kind, item) {
+    if (!item || !this.persistenceAdapter || typeof this.persistenceAdapter.releaseOutboxClaim !== "function") {
+      return;
+    }
+    await this.persistenceAdapter.releaseOutboxClaim({
+      kind,
+      outboxId: item.id,
+      workerId: this.outboxWorkerId
+    });
+  }
+
   async processEmailOutboxItem(outboxId, emailRelay, actorIdentity = null) {
     const item = this.emailOutboxById.get(outboxId);
     if (!item) {
@@ -5913,42 +6279,82 @@ export class LoomStore {
       return item;
     }
 
-    if (!emailRelay || typeof emailRelay.send !== "function") {
-      this.markEmailOutboxFailure(item, "Email relay adapter not configured");
-      this.persistAndAudit("email.outbox.process.failed", {
-        outbox_id: item.id,
-        envelope_id: item.envelope_id,
-        reason: item.last_error,
-        actor: actorIdentity
-      });
+    if (!(await this.claimOutboxItemForProcessing("email", item))) {
       return item;
     }
 
-    const renderPayload = {
-      envelope_id: item.envelope_id
-    };
-    if (item.smtp_from) {
-      renderPayload.smtp_from = item.smtp_from;
-    }
-    if (item.to_email?.length) {
-      renderPayload.to_email = item.to_email;
-    }
-    if (item.subject) {
-      renderPayload.subject = item.subject;
-    }
-
     try {
+      if (!emailRelay || typeof emailRelay.send !== "function") {
+        this.markEmailOutboxFailure(item, "Email relay adapter not configured");
+        this.persistAndAudit("email.outbox.process.failed", {
+          outbox_id: item.id,
+          envelope_id: item.envelope_id,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
+
+      const renderPayload = {
+        envelope_id: item.envelope_id
+      };
+      if (item.smtp_from) {
+        renderPayload.smtp_from = item.smtp_from;
+      }
+      if (item.to_email?.length) {
+        renderPayload.to_email = item.to_email;
+      }
+      if (item.subject) {
+        renderPayload.subject = item.subject;
+      }
+
       const rendered = this.renderBridgeOutboundEmail(renderPayload, item.queued_by);
       const relayResult = await emailRelay.send(rendered);
+      const accepted = Array.isArray(relayResult?.accepted)
+        ? relayResult.accepted.map((entry) => this.normalizeEmailAddress(String(entry || ""))).filter(Boolean)
+        : [];
+      const rejected = Array.isArray(relayResult?.rejected)
+        ? relayResult.rejected.map((entry) => this.normalizeEmailAddress(String(entry || ""))).filter(Boolean)
+        : [];
 
       item.attempts += 1;
-      item.status = "delivered";
       item.updated_at = nowIso();
-      item.delivered_at = nowIso();
-      item.next_attempt_at = null;
-      item.last_error = null;
       item.provider_message_id = relayResult.provider_message_id || null;
       item.last_provider_response = relayResult.response || null;
+      item.recipient_statuses = this.mergeEmailRecipientStatuses(
+        item.recipient_statuses,
+        [
+          ...accepted.map((recipient) => ({
+            recipient,
+            status: "relayed",
+            action: "relayed"
+          })),
+          ...rejected.map((recipient) => ({
+            recipient,
+            status: "failed",
+            action: "failed",
+            diagnostic_code: relayResult?.response || null
+          }))
+        ],
+        "relay",
+        nowIso()
+      );
+
+      const aggregate = this.computeEmailOutboxStateFromRecipientStatuses(item.recipient_statuses);
+      item.status = aggregate.status;
+      if (aggregate.status === "failed") {
+        item.next_attempt_at = null;
+        const firstFailure = item.recipient_statuses.find((entry) => entry.status === "failed");
+        item.last_error = firstFailure?.diagnostic_code || aggregate.reason;
+        item.delivered_at = null;
+      } else if (aggregate.status === "queued") {
+        item.last_error = aggregate.reason;
+        item.next_attempt_at = new Date(nowMs() + 5 * 60 * 1000).toISOString();
+      } else {
+        item.last_error = null;
+        item.delivered_at = nowIso();
+        item.next_attempt_at = null;
+      }
 
       const envelope = this.envelopesById.get(item.envelope_id);
       if (envelope) {
@@ -5960,6 +6366,7 @@ export class LoomStore {
         envelope_id: item.envelope_id,
         thread_id: item.thread_id,
         provider_message_id: item.provider_message_id,
+        status: item.status,
         actor: actorIdentity
       });
       return item;
@@ -5973,6 +6380,8 @@ export class LoomStore {
         actor: actorIdentity
       });
       return item;
+    } finally {
+      await this.releaseOutboxItemClaim("email", item);
     }
   }
 

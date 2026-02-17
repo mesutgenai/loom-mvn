@@ -226,6 +226,52 @@ test("wire SMTP gateway accepts AUTH and submits envelope into store", async (t)
   assert.equal(envelopes[0].from.identity, "loom://alice@node.test");
 });
 
+test("wire SMTP gateway rejects SMTPUTF8 ESMTP parameter", async (t) => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  const keys = generateSigningKeyPair();
+  const token = createIdentityAndToken(store, "loom://alice@node.test", "k_sign_alice_1", keys);
+
+  const gateway = new LoomWireGateway({
+    store,
+    enabled: true,
+    host: "127.0.0.1",
+    smtpEnabled: true,
+    smtpPort: 0,
+    imapEnabled: false,
+    requireAuth: true,
+    allowInsecureAuth: true
+  });
+  await gateway.start();
+  t.after(async () => {
+    await gateway.stop();
+  });
+
+  const status = gateway.getStatus();
+  const socket = connectTcp(status.smtp.bound_port, "127.0.0.1");
+  await once(socket, "connect");
+  t.after(() => {
+    socket.destroy();
+  });
+
+  const waitFor = createLineWaiter(socket);
+  await waitFor((line) => line.startsWith("220 "));
+
+  socket.write("EHLO localhost\r\n");
+  await waitFor((line) => line.startsWith("250 SIZE "));
+
+  const plain = Buffer.from(`\u0000loom://alice@node.test\u0000${token}`, "utf-8").toString("base64");
+  socket.write(`AUTH PLAIN ${plain}\r\n`);
+  await waitFor((line) => line.startsWith("235 "));
+
+  socket.write("MAIL FROM:<alice@node.test> SMTPUTF8\r\n");
+  await waitFor((line) => line.startsWith("504 5.5.4 SMTPUTF8 not supported"));
+
+  socket.write("MAIL FROM:<alice@node.test>\r\n");
+  await waitFor((line) => line.startsWith("250 "));
+  socket.write("RCPT TO:<bob@node.test> SMTPUTF8\r\n");
+  await waitFor((line) => line.startsWith("504 5.5.4 SMTPUTF8 not supported"));
+});
+
 test("wire IMAP gateway supports LOGIN LIST SELECT FETCH flow", async (t) => {
   const store = new LoomStore({ nodeId: "node.test" });
   const keys = generateSigningKeyPair();

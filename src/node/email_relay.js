@@ -118,6 +118,73 @@ function redact(value) {
   return `${text.slice(0, 2)}***${text.slice(-2)}`;
 }
 
+function containsUnsafeHeaderChars(value) {
+  return /[\r\n\0]/.test(String(value || ""));
+}
+
+function decodeBase64Content(value, field) {
+  const normalized = String(value || "").replace(/\s+/g, "");
+  if (!normalized) {
+    throw new LoomError("ENVELOPE_INVALID", `${field} must be non-empty base64`, 400, {
+      field
+    });
+  }
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || normalized.length % 4 !== 0) {
+    throw new LoomError("ENVELOPE_INVALID", `${field} must be valid base64`, 400, {
+      field
+    });
+  }
+  return Buffer.from(normalized, "base64");
+}
+
+function normalizeRenderedAttachments(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return [];
+  }
+
+  return attachments.map((entry, index) => {
+    if (!entry || typeof entry !== "object") {
+      throw new LoomError("ENVELOPE_INVALID", "Attachment entry must be an object", 400, {
+        field: `attachments[${index}]`
+      });
+    }
+
+    const filename = String(entry.filename || `attachment-${index + 1}.bin`).trim();
+    if (!filename || containsUnsafeHeaderChars(filename)) {
+      throw new LoomError("ENVELOPE_INVALID", "Attachment filename is invalid", 400, {
+        field: `attachments[${index}].filename`
+      });
+    }
+
+    const contentType = String(entry.mime_type || "application/octet-stream").trim();
+    if (!contentType || containsUnsafeHeaderChars(contentType)) {
+      throw new LoomError("ENVELOPE_INVALID", "Attachment mime_type is invalid", 400, {
+        field: `attachments[${index}].mime_type`
+      });
+    }
+
+    const dispositionRaw = String(entry.disposition || "attachment")
+      .trim()
+      .toLowerCase();
+    const disposition = dispositionRaw === "inline" ? "inline" : "attachment";
+
+    const contentId = entry.content_id ? String(entry.content_id).trim() : null;
+    if (contentId && containsUnsafeHeaderChars(contentId)) {
+      throw new LoomError("ENVELOPE_INVALID", "Attachment content_id is invalid", 400, {
+        field: `attachments[${index}].content_id`
+      });
+    }
+
+    return {
+      filename,
+      contentType,
+      contentDisposition: disposition,
+      cid: contentId || undefined,
+      content: decodeBase64Content(entry.data_base64, `attachments[${index}].data_base64`)
+    };
+  });
+}
+
 export class LoomEmailRelay {
   constructor(options = {}) {
     this.mode = normalizeMode(options.mode) || null;
@@ -316,6 +383,10 @@ export class LoomEmailRelay {
       html: renderedMessage.html || undefined,
       headers: renderedMessage.headers || {}
     };
+    const attachments = normalizeRenderedAttachments(renderedMessage.attachments);
+    if (attachments.length > 0) {
+      mail.attachments = attachments;
+    }
 
     if (!mail.from) {
       throw new LoomError("ENVELOPE_INVALID", "SMTP from is required for relay send", 400, {

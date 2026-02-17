@@ -13,6 +13,8 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
   - `LOOM_PG_CONNECT_TIMEOUT_MS`
   - `LOOM_PG_SSL`
   - `LOOM_PG_SSL_REJECT_UNAUTHORIZED`
+  - `LOOM_OUTBOX_CLAIM_LEASE_MS`
+  - `LOOM_OUTBOX_WORKER_ID`
 
 ## Startup Checks
 
@@ -38,6 +40,11 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
    - `curl -sS -X POST http://127.0.0.1:8787/v1/admin/persistence/restore -H "x-loom-admin-token: $LOOM_ADMIN_TOKEN" -H "content-type: application/json" --data-binary @loom-restore.json`
 3. Re-check status:
    - `curl -sS http://127.0.0.1:8787/v1/admin/status -H "x-loom-admin-token: $LOOM_ADMIN_TOKEN"`
+
+## Distributed Outbox Workers
+
+- Outbox claim leasing is persisted in PostgreSQL (`loom_outbox_claims`) and used for `email`, `federation`, and `webhook` outbox processors.
+- Use a stable `LOOM_OUTBOX_WORKER_ID` per worker process and tune `LOOM_OUTBOX_CLAIM_LEASE_MS` for expected processing latency.
 
 ## Schema Migration Policy (MVP)
 

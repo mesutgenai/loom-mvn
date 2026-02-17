@@ -1362,3 +1362,85 @@ test("thread canonical order prioritizes rooted messages over orphaned pending-p
   assert.equal(ordered[0].id, root.id);
   assert.equal(ordered[1].id, orphan.id);
 });
+
+test("email outbox processing honors persistence claim lock semantics", async () => {
+  let claimAllowed = false;
+  const claimCalls = [];
+  const releaseCalls = [];
+  const store = new LoomStore({
+    nodeId: "node.test",
+    persistenceAdapter: {
+      loadStateAndAudit: async () => ({
+        state: null,
+        audit_entries: []
+      }),
+      persistSnapshotAndAudit: async () => {},
+      claimOutboxItem: async (payload) => {
+        claimCalls.push(payload);
+        return {
+          claimed: claimAllowed
+        };
+      },
+      releaseOutboxClaim: async (payload) => {
+        releaseCalls.push(payload);
+        return {
+          released: true
+        };
+      }
+    }
+  });
+
+  const keys = generateSigningKeyPair();
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: keys.publicKeyPem }]
+  });
+
+  const inbound = store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      text: "claim test"
+    },
+    "loom://alice@node.test"
+  );
+
+  const queued = store.queueEmailOutbox(
+    {
+      envelope_id: inbound.envelope_id,
+      to_email: ["alice@node.test"],
+      smtp_from: "no-reply@node.test"
+    },
+    "loom://alice@node.test"
+  );
+
+  let relaySendCalls = 0;
+  const relay = {
+    send: async () => {
+      relaySendCalls += 1;
+      return {
+        provider_message_id: "mock-provider-id",
+        accepted: ["alice@node.test"],
+        rejected: [],
+        response: "250 queued",
+        relay_mode: "mock"
+      };
+    }
+  };
+
+  const skipped = await store.processEmailOutboxItem(queued.id, relay, "loom://alice@node.test");
+  assert.equal(skipped.status, "queued");
+  assert.equal(relaySendCalls, 0);
+  assert.equal(claimCalls.length, 1);
+  assert.equal(releaseCalls.length, 0);
+
+  claimAllowed = true;
+  const delivered = await store.processEmailOutboxItem(queued.id, relay, "loom://alice@node.test");
+  assert.equal(delivered.status, "delivered");
+  assert.equal(relaySendCalls, 1);
+  assert.equal(claimCalls.length, 2);
+  assert.equal(releaseCalls.length, 1);
+  assert.equal(releaseCalls[0].kind, "email");
+  assert.equal(releaseCalls[0].outboxId, queued.id);
+});

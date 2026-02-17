@@ -97,6 +97,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `LOOM-protocol-design.md`
   - `LOOM-specification-v1.0.md`
   - `LOOM-Protocol-Spec-v1.1.md`
+  - `docs/CONFORMANCE.md`
   - `docs/DEVELOPMENT-PLAN.md`
   - `docs/POSTGRES-OPERATIONS.md`
 - A first **Minimum Viable Node (MVN)** implementation with optional disk persistence is in `src/`.
@@ -127,8 +128,11 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 - Federation challenge escalation + challenge token flow (`/v1/federation/challenge`)
 - Signed federation delivery receipts with optional strict verification
 - Outbound federation outbox with retry-based store-and-forward processing and per-node deliver URL safety enforcement
+- Outbox claim leasing hooks for distributed worker coordination (`email`, `federation`, `webhook`)
 - SMTP/IMAP gateway interoperability hardening (address-list parsing, case-insensitive headers, folder aliases)
 - Optional wire-level legacy gateway daemon (SMTP submission + IMAP mailbox access) for legacy clients, with optional STARTTLS support and extended IMAP commands (`STATUS`, `SEARCH`, `FETCH`, `STORE`, `APPEND`, `IDLE`, `MOVE`, `UID SEARCH`, `UID FETCH`, `UID STORE`, `UID MOVE`)
+- Outbound MIME attachment mapping from LOOM blob-backed envelope attachments
+- DSN-style per-recipient delivery status updates for email outbox entries
 - Recipient-view delivery wrappers for BCC privacy (`delivery.wrapper@v1`) with per-recipient visible roster
 - Per-user mailbox state (`seen`, `flagged`, `archived`, `deleted`) without mutating other participants
 - Idempotency-key replay protection for key POST mutations
@@ -161,6 +165,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `GET /v1/email/outbox`
   - `POST /v1/email/outbox/process`
   - `POST /v1/email/outbox/{id}/process`
+  - `POST /v1/email/outbox/{id}/dsn`
   - `GET /v1/gateway/imap/folders`
   - `GET /v1/gateway/imap/folders/{folder}/messages?limit=...`
   - `POST /v1/gateway/smtp/submit`
@@ -266,6 +271,9 @@ Optional persistence:
   - `LOOM_IDENTITY_RATE_LIMIT_DEFAULT_MAX` (default `2000`)
   - `LOOM_IDENTITY_RATE_LIMIT_SENSITIVE_MAX` (default `400`)
 - Set `LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process federation outbox.
+- Set distributed outbox claim lease controls:
+  - `LOOM_OUTBOX_CLAIM_LEASE_MS` (default `60000`)
+  - `LOOM_OUTBOX_WORKER_ID` (optional stable worker identity for claim ownership)
 - Set `LOOM_FEDERATION_NODE_RATE_WINDOW_MS` (default `60000`) and `LOOM_FEDERATION_NODE_RATE_MAX` (default `120`) for per-node inbound federation rate limiting.
 - Set `LOOM_FEDERATION_GLOBAL_RATE_WINDOW_MS` (default `60000`) and `LOOM_FEDERATION_GLOBAL_RATE_MAX` (default `1000`) for global inbound federation rate limiting.
 - Set `LOOM_FEDERATION_INBOUND_MAX_ENVELOPES` (default `100`) to cap envelopes accepted per federation delivery.
@@ -386,6 +394,7 @@ npm test
 
 - This is a protocol-development scaffold, not production-ready.
 - Legacy compatibility now includes both API-level gateway behavior (`/v1/gateway/*` + bridge/relay) and an optional wire-level gateway daemon (SMTP + IMAP + optional STARTTLS + extended mailbox commands). Full parity with all enterprise IMAP/SMTP extensions is still a separate hardening track.
+- Wire SMTP currently rejects the `SMTPUTF8` ESMTP parameter (`504 5.5.4`); UTF-8 submission profiles should use the API surface until SMTPUTF8 support is implemented.
 - Inbound internet-email authentication (SPF/DKIM/DMARC verification and policy enforcement) is expected to run in an upstream MTA; the MVN inbound bridge route should remain private unless explicitly confirmed.
 - Current wire IMAP limitation: `COPY`/`UID COPY` are intentionally rejected because LOOM mailbox state currently models a single effective folder per thread participant.
 - Federation abuse/rate-policy hardening is implemented for baseline operations; deeper interoperability coverage can be extended.

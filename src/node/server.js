@@ -572,6 +572,10 @@ function isSensitiveRoute(method, path) {
     return true;
   }
 
+  if (path.startsWith("/v1/email/outbox/") && path.endsWith("/dsn")) {
+    return true;
+  }
+
   if (path.startsWith("/v1/webhooks/outbox/") && path.endsWith("/process")) {
     return true;
   }
@@ -1193,11 +1197,24 @@ export function createLoomServer(options = {}) {
   const remoteIdentityHostAllowlist = parseHostAllowlist(
     options.remoteIdentityHostAllowlist ?? process.env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST
   );
-  const requirePortableThreadOpCapability = parseBoolean(
-    options.requirePortableThreadOpCapability ?? process.env.LOOM_REQUIRE_PORTABLE_THREAD_OP_CAPABILITY,
+  const nativeTlsConfig = resolveNativeTlsConfig(options);
+  const publicService = parseBoolean(
+    options.publicService ?? process.env.LOOM_PUBLIC_SERVICE,
     false
   );
-  const nativeTlsConfig = resolveNativeTlsConfig(options);
+  const requirePortableThreadOpCapability = parseBoolean(
+    options.requirePortableThreadOpCapability ?? process.env.LOOM_REQUIRE_PORTABLE_THREAD_OP_CAPABILITY,
+    publicService
+  );
+  const outboxClaimLeaseMs = Math.max(
+    5000,
+    Math.floor(
+      parsePositiveNumber(options.outboxClaimLeaseMs ?? process.env.LOOM_OUTBOX_CLAIM_LEASE_MS, 60 * 1000)
+    )
+  );
+  const outboxWorkerIdRaw = options.outboxWorkerId ?? process.env.LOOM_OUTBOX_WORKER_ID ?? null;
+  const outboxWorkerId =
+    typeof outboxWorkerIdRaw === "string" && outboxWorkerIdRaw.trim().length > 0 ? outboxWorkerIdRaw.trim() : null;
   const store =
     options.store ||
     new LoomStore({
@@ -1249,7 +1266,9 @@ export function createLoomServer(options = {}) {
       federationBootstrapHostAllowlist,
       webhookOutboundHostAllowlist,
       remoteIdentityHostAllowlist,
-      localIdentityDomain
+      localIdentityDomain,
+      outboxClaimLeaseMs,
+      outboxWorkerId
     });
   const maxBodyBytes = parsePositiveNumber(
     options.maxBodyBytes ?? process.env.LOOM_MAX_BODY_BYTES,
@@ -1260,10 +1279,6 @@ export function createLoomServer(options = {}) {
     trustProxyAllowlist:
       options.trustProxyAllowlist ?? process.env.LOOM_TRUST_PROXY_ALLOWLIST ?? null
   });
-  const publicService = parseBoolean(
-    options.publicService ?? process.env.LOOM_PUBLIC_SERVICE,
-    false
-  );
   const requireHttpsFromProxy = parseBoolean(
     options.requireHttpsFromProxy ?? process.env.LOOM_REQUIRE_HTTPS_FROM_PROXY,
     publicService && !nativeTlsConfig.enabled
@@ -2328,6 +2343,20 @@ export function createLoomServer(options = {}) {
         const outboxId = path.slice("/v1/email/outbox/".length, -"/process".length);
         const result = await store.processEmailOutboxItem(outboxId, emailRelay, actorIdentity);
         sendJson(res, 200, result);
+        return;
+      }
+
+      if (methodIs(req, "POST") && path.startsWith("/v1/email/outbox/") && path.endsWith("/dsn")) {
+        const actorIdentity = requireActorIdentity(req, store);
+        const outboxId = path.slice("/v1/email/outbox/".length, -"/dsn".length);
+        const body = await readJson(req, maxBodyBytes);
+        const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, body);
+        if (maybeSendIdempotentReplay(res, idempotency)) {
+          return;
+        }
+        const updated = store.applyEmailOutboxDsnReport(outboxId, body, actorIdentity);
+        storeIdempotentResult(store, idempotency, 200, updated);
+        sendJson(res, 200, updated);
         return;
       }
 
