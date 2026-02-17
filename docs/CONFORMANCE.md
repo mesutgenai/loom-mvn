@@ -1,10 +1,16 @@
-# LOOM MVN v1.1 Conformance Profile
+# LOOM MVN v1.1 Conformance Profile (v0.2.5)
 
 This document defines the current conformance surface implemented by this MVN and the test vectors that gate protocol behavior.
 
 ## Scope
 
 This profile is for API and protocol behaviors implemented in this repository (`src/`). It is not a full Internet email MTA profile.
+
+Release and governance references:
+
+- Changelog: `CHANGELOG.md`
+- CI workflow: `.github/workflows/ci.yml`
+- License: `LICENSE`
 
 ## Normative Surface
 

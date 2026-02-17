@@ -31,6 +31,12 @@ v1.1 is implementation-ready for a Core Level 1 node, with concrete requirements
   - Rate policy controls, allowlist/trust model, abuse automation, and discovery bootstrap.
 - Distributed abuse controls baseline:
   - Global inbound limits, reputation updates, auto-policy gates, and challenge escalation/token flow.
+- Delivery/outbox hardening baseline:
+  - DSN-style per-recipient email outbox status updates (`/v1/email/outbox/{id}/dsn`).
+  - Distributed outbox claim leasing for `email`, `federation`, and `webhook` workers.
+- Repo operations baseline:
+  - License and CI workflow are present (`LICENSE`, `.github/workflows/ci.yml`).
+  - Conformance profile and vectors documented in `docs/CONFORMANCE.md`.
 
 ## Immediate Production Actions (Parallel, No Phases)
 
@@ -99,11 +105,15 @@ v1.1 is implementation-ready for a Core Level 1 node, with concrete requirements
 - Request payload-size and route-level rate-limit guards for API hardening.
 - Operational readiness + metrics endpoints and admin status surface.
 - Outbound email relay mode (`disabled|stream|smtp`) and delivery outbox APIs.
+- DSN-style per-recipient outbox status ingestion (`/v1/email/outbox/{id}/dsn`) with recipient validation.
+- Distributed outbox claim/release support for multi-worker processing coordination.
 - Dead-letter outbox administration (`/v1/outbox/dlq`, `/v1/outbox/dlq/requeue`) for failed delivery recovery.
 - Idempotency-key support for key POST mutations with conflict detection.
 - Signed webhook receipt subscriptions and webhook outbox processing (`/v1/webhooks*`).
 - Optional PostgreSQL-backed state + audit persistence (`LOOM_PG_URL`) with startup hydration and shutdown flush.
 - Distributed federation guard persistence support (rate/reputation/challenge tables via PostgreSQL adapter).
+- Outbox claim persistence support via PostgreSQL (`loom_outbox_claims`).
 - Admin persistence operations (`/v1/admin/persistence/schema|backup|restore`).
 - Node discovery document served at `/.well-known/loom.json`.
+- Repository governance baseline includes `LICENSE` and CI workflow in `.github/workflows/ci.yml`.
 - Test suite covers signature validity, duplicate rejection, DAG constraints, ordering, auth flow, capability enforcement, delegation verification, blob APIs, federation ingest/outbox delivery, federation challenge flow, bridge/gateway routes, relay outbox processing, root UI serving, payload limits, rate limiting, persistence backup/restore admin APIs, and operational endpoint auth.

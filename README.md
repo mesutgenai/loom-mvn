@@ -93,7 +93,9 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 
 ## Current status
 
+- Current release is `v0.2.5` (see `CHANGELOG.md` for release-level change history).
 - Protocol design docs are available in:
+  - `CHANGELOG.md`
   - `LOOM-protocol-design.md`
   - `LOOM-specification-v1.0.md`
   - `LOOM-Protocol-Spec-v1.1.md`
@@ -101,6 +103,9 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `docs/DEVELOPMENT-PLAN.md`
   - `docs/POSTGRES-OPERATIONS.md`
 - A first **Minimum Viable Node (MVN)** implementation with optional disk persistence is in `src/`.
+- Repository baseline now includes:
+  - `LICENSE` (MIT)
+  - GitHub Actions CI workflow (`.github/workflows/ci.yml`)
 
 ## MVN features implemented
 

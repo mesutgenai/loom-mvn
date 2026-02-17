@@ -24,6 +24,9 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
    - `curl -sS http://127.0.0.1:8787/v1/admin/persistence/schema -H "x-loom-admin-token: $LOOM_ADMIN_TOKEN"`
 3. Confirm runtime operational status:
    - `curl -sS http://127.0.0.1:8787/v1/admin/status -H "x-loom-admin-token: $LOOM_ADMIN_TOKEN"`
+4. Confirm schema version and claim table availability:
+   - Current schema target is `3` (`src/node/persistence_postgres.js`).
+   - Verify `loom_outbox_claims` exists for distributed outbox workers.
 
 ## Backup Drill
 
@@ -45,6 +48,7 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
 
 - Outbox claim leasing is persisted in PostgreSQL (`loom_outbox_claims`) and used for `email`, `federation`, and `webhook` outbox processors.
 - Use a stable `LOOM_OUTBOX_WORKER_ID` per worker process and tune `LOOM_OUTBOX_CLAIM_LEASE_MS` for expected processing latency.
+- Claim rows are auto-cleaned in maintenance sweeps; stale rows older than 6 hours past lease expiry are removed.
 
 ## Schema Migration Policy (MVP)
 
