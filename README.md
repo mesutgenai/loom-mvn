@@ -284,10 +284,14 @@ Optional persistence:
 - Set `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process webhook outbox.
 - Set `LOOM_ADMIN_TOKEN` to protect operational endpoints (`/metrics`, `/v1/admin/status`).
 - Set `LOOM_METRICS_PUBLIC=true` only if you intentionally want unauthenticated `/metrics`.
+- Set `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true` only if you intentionally want to disable strict outbound host allowlist startup guards on public bind.
 - Set `LOOM_IDENTITY_SIGNUP_ENABLED=false` to require admin token for `POST /v1/identity`.
 - Public-bind startup safeguards:
   - Server refuses startup on public bind without `LOOM_ADMIN_TOKEN`.
   - Server refuses `LOOM_METRICS_PUBLIC=true` on public bind unless `LOOM_ALLOW_PUBLIC_METRICS_ON_PUBLIC_BIND=true`.
+  - Server refuses open outbound host fetch configuration on public bind unless `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true`.
+    - Required by default on public bind: `LOOM_FEDERATION_HOST_ALLOWLIST`, `LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST`, `LOOM_WEBHOOK_HOST_ALLOWLIST`.
+    - If `LOOM_FEDERATION_RESOLVE_REMOTE_IDENTITIES=true` (default), `LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST` is also required.
 - For `thread_op` submissions by non-owner participants, authorize with either:
   - `content.structured.parameters.capability_token` (portable signed token; recommended for federation portability)
   - `x-loom-capability-token` (legacy/local presentation secret header)

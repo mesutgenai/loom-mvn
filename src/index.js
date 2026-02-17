@@ -17,6 +17,26 @@ function parseBoolean(value, fallback = false) {
   return fallback;
 }
 
+function parseHostAllowlist(value) {
+  if (value == null) {
+    return [];
+  }
+
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  return Array.from(
+    new Set(
+      list
+        .map((entry) =>
+          String(entry || "")
+            .trim()
+            .toLowerCase()
+            .replace(/\.+$/, "")
+        )
+        .filter(Boolean)
+    )
+  );
+}
+
 function isPublicBindHost(value) {
   const normalized = String(value || "")
     .trim()
@@ -51,6 +71,15 @@ const identityRequireProof = parseBoolean(
   process.env.LOOM_IDENTITY_REQUIRE_PROOF,
   isPublicBindHost(process.env.HOST || "127.0.0.1")
 );
+const allowOpenOutboundHostsOnPublicBind = parseBoolean(
+  process.env.LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND,
+  false
+);
+const federationResolveRemoteIdentities = parseBoolean(process.env.LOOM_FEDERATION_RESOLVE_REMOTE_IDENTITIES, true);
+const federationOutboundHostAllowlist = parseHostAllowlist(process.env.LOOM_FEDERATION_HOST_ALLOWLIST);
+const federationBootstrapHostAllowlist = parseHostAllowlist(process.env.LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST);
+const remoteIdentityHostAllowlist = parseHostAllowlist(process.env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST);
+const webhookHostAllowlist = parseHostAllowlist(process.env.LOOM_WEBHOOK_HOST_ALLOWLIST);
 const publicBind = isPublicBindHost(host);
 
 if (publicBind && !adminToken) {
@@ -71,6 +100,32 @@ if (publicBind && requireTlsProxyOnPublicBind && !tlsProxyConfirmed && !nativeTl
 
 if (publicBind && demoPublicReads && !demoPublicReadsConfirmed) {
   throw new Error("Refusing LOOM_DEMO_PUBLIC_READS=true on public bind without LOOM_DEMO_PUBLIC_READS_CONFIRMED=true");
+}
+
+if (publicBind && !allowOpenOutboundHostsOnPublicBind) {
+  if (federationOutboundHostAllowlist.length === 0) {
+    throw new Error(
+      "Refusing public bind without LOOM_FEDERATION_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+    );
+  }
+
+  if (federationBootstrapHostAllowlist.length === 0) {
+    throw new Error(
+      "Refusing public bind without LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+    );
+  }
+
+  if (webhookHostAllowlist.length === 0) {
+    throw new Error(
+      "Refusing public bind without LOOM_WEBHOOK_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+    );
+  }
+
+  if (federationResolveRemoteIdentities && remoteIdentityHostAllowlist.length === 0) {
+    throw new Error(
+      "Refusing public bind with remote identity resolution enabled and no LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST; set LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true to override"
+    );
+  }
 }
 
 const federationOutboxAutoProcessIntervalMs = Number(process.env.LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
