@@ -3,7 +3,11 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  openSync,
+  closeSync,
+  fsyncSync,
   readFileSync,
+  renameSync,
   writeFileSync
 } from "node:fs";
 import { request as httpRequest } from "node:http";
@@ -30,6 +34,7 @@ import {
   verifyDelegationChainOrThrow,
   verifyDelegationLinkOrThrow
 } from "../protocol/delegation.js";
+import { parseBoolean } from "./env.js";
 
 function nowIso() {
   return new Date().toISOString();
@@ -52,21 +57,6 @@ function parsePositiveInteger(value, fallback) {
 function parseNonNegativeInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
-}
-
-function parseBoolean(value, fallback = false) {
-  if (value == null) {
-    return fallback;
-  }
-
-  const normalized = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  return fallback;
 }
 
 function containsHeaderUnsafeChars(value) {
@@ -992,6 +982,12 @@ export class LoomStore {
     this.idempotencyByKey = new Map();
     this.idempotencyTtlMs = Math.max(1000, parsePositiveInteger(options.idempotencyTtlMs, 24 * 60 * 60 * 1000));
     this.idempotencyMaxEntries = Math.max(100, parsePositiveInteger(options.idempotencyMaxEntries, 10000));
+    this.consumedCapabilityMaxEntries = Math.max(100, parsePositiveInteger(options.consumedCapabilityMaxEntries, 50000));
+    this.revokedDelegationMaxEntries = Math.max(100, parsePositiveInteger(options.revokedDelegationMaxEntries, 50000));
+    this.maxLocalIdentities = Math.max(0, parseNonNegativeInteger(options.maxLocalIdentities, 10000));
+    this.maxRemoteIdentities = Math.max(0, parseNonNegativeInteger(options.maxRemoteIdentities, 50000));
+    this.maxDelegationsPerIdentity = Math.max(0, parseNonNegativeInteger(options.maxDelegationsPerIdentity, 500));
+    this.maxDelegationsTotal = Math.max(0, parseNonNegativeInteger(options.maxDelegationsTotal, 100000));
     this.blobMaxBytes = Math.max(1024, parsePositiveInteger(options.blobMaxBytes, 25 * 1024 * 1024));
     this.blobMaxPartBytes = Math.max(1024, parsePositiveInteger(options.blobMaxPartBytes, 2 * 1024 * 1024));
     this.blobMaxParts = Math.max(1, parsePositiveInteger(options.blobMaxParts, 64));
@@ -1775,7 +1771,15 @@ export class LoomStore {
       return;
     }
 
-    writeFileSync(this.stateFile, JSON.stringify(this.toSerializableState(), null, 2));
+    const tmpFile = `${this.stateFile}.tmp`;
+    writeFileSync(tmpFile, JSON.stringify(this.toSerializableState(), null, 2));
+    const fd = openSync(tmpFile, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmpFile, this.stateFile);
   }
 
   appendAudit(action, payload) {
@@ -6646,6 +6650,18 @@ export class LoomStore {
       });
     }
 
+    if (!existingIdentity) {
+      const isRemote = options.importedRemote === true;
+      const cap = isRemote ? this.maxRemoteIdentities : this.maxLocalIdentities;
+      const currentCount = isRemote ? this.remoteIdentities.size : this.identities.size;
+      if (cap > 0 && currentCount >= cap) {
+        throw new LoomError("RESOURCE_LIMIT", `Maximum ${isRemote ? "remote" : "local"} identity count reached (${cap})`, 403, {
+          limit: cap,
+          current: currentCount
+        });
+      }
+    }
+
     const signingKeys = Array.isArray(identityDoc.signing_keys) ? identityDoc.signing_keys : [];
     if (signingKeys.length === 0) {
       throw new LoomError("ENVELOPE_INVALID", "Identity must include at least one signing key", 400, {
@@ -7456,6 +7472,29 @@ export class LoomStore {
       resolveIdentity: (identity) => this.resolveIdentity(identity),
       resolvePublicKey: (keyId) => this.resolvePublicKey(keyId)
     });
+
+    if (this.maxDelegationsTotal > 0 && this.delegationsById.size >= this.maxDelegationsTotal) {
+      throw new LoomError("RESOURCE_LIMIT", `Maximum total delegation count reached (${this.maxDelegationsTotal})`, 403, {
+        limit: this.maxDelegationsTotal,
+        current: this.delegationsById.size
+      });
+    }
+
+    if (this.maxDelegationsPerIdentity > 0) {
+      let delegatorCount = 0;
+      for (const d of this.delegationsById.values()) {
+        if (d.delegator === delegation.delegator) {
+          delegatorCount += 1;
+        }
+      }
+      if (delegatorCount >= this.maxDelegationsPerIdentity) {
+        throw new LoomError("RESOURCE_LIMIT", `Maximum delegations per identity reached (${this.maxDelegationsPerIdentity})`, 403, {
+          limit: this.maxDelegationsPerIdentity,
+          current: delegatorCount,
+          identity: delegation.delegator
+        });
+      }
+    }
 
     this.delegationsById.set(delegation.id, delegation);
     this.persistAndAudit("delegation.create", {
@@ -9215,5 +9254,72 @@ export class LoomStore {
         value: nodeSignature
       }
     };
+  }
+
+  runMaintenanceSweep() {
+    const now = nowMs();
+    let swept = 0;
+
+    for (const [token, session] of this.accessTokens) {
+      if (isExpiredIso(session.expires_at)) {
+        this.accessTokens.delete(token);
+        swept += 1;
+      }
+    }
+
+    for (const [token, session] of this.refreshTokens) {
+      if (isExpiredIso(session.expires_at)) {
+        this.refreshTokens.delete(token);
+        swept += 1;
+      }
+    }
+
+    for (const [id, challenge] of this.authChallenges) {
+      if (challenge.used || isExpiredIso(challenge.expires_at)) {
+        this.authChallenges.delete(id);
+        swept += 1;
+      }
+    }
+
+    const rateCutoff = now - this.identityRateWindowMs * 2;
+    for (const [key, entry] of this.identityRateByBucket) {
+      if (entry.window_started_at < rateCutoff) {
+        this.identityRateByBucket.delete(key);
+        swept += 1;
+      }
+    }
+
+    if (this.consumedPortableCapabilityIds.size > this.consumedCapabilityMaxEntries) {
+      const overflow = this.consumedPortableCapabilityIds.size - this.consumedCapabilityMaxEntries;
+      let removed = 0;
+      for (const id of this.consumedPortableCapabilityIds) {
+        if (removed >= overflow) break;
+        this.consumedPortableCapabilityIds.delete(id);
+        removed += 1;
+      }
+      swept += removed;
+    }
+
+    if (this.revokedDelegationIds.size > this.revokedDelegationMaxEntries) {
+      const overflow = this.revokedDelegationIds.size - this.revokedDelegationMaxEntries;
+      let removed = 0;
+      for (const id of this.revokedDelegationIds) {
+        if (removed >= overflow) break;
+        this.revokedDelegationIds.delete(id);
+        removed += 1;
+      }
+      swept += removed;
+    }
+
+    this.cleanupIdempotencyCache();
+    this.cleanupFederationNonces();
+    this.cleanupFederationInboundRateState();
+    this.cleanupFederationInboundAbuseState();
+    this.cleanupFederationChallengeState();
+    this.cleanupIdentityRegistrationChallenges(now);
+    this.cleanupDailyQuotaMap(this.identityEnvelopeUsageByDay);
+    this.cleanupDailyQuotaMap(this.identityBlobUsageByDay);
+
+    return { swept };
   }
 }

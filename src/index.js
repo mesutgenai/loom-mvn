@@ -2,40 +2,7 @@ import { createLoomServer } from "./node/server.js";
 import { createEmailRelayFromEnv } from "./node/email_relay.js";
 import { createPostgresPersistenceFromEnv } from "./node/persistence_postgres.js";
 import { createWireGatewayFromEnv } from "./node/wire_gateway.js";
-
-function parseBoolean(value, fallback = false) {
-  if (value == null) {
-    return fallback;
-  }
-  const normalized = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  return fallback;
-}
-
-function parseHostAllowlist(value) {
-  if (value == null) {
-    return [];
-  }
-
-  const list = Array.isArray(value) ? value : String(value).split(",");
-  return Array.from(
-    new Set(
-      list
-        .map((entry) =>
-          String(entry || "")
-            .trim()
-            .toLowerCase()
-            .replace(/\.+$/, "")
-        )
-        .filter(Boolean)
-    )
-  );
-}
+import { parseBoolean, parseHostAllowlist } from "./node/env.js";
 
 function isPublicBindHost(value) {
   const normalized = String(value || "")
@@ -154,6 +121,7 @@ const emailOutboxAutoProcessIntervalMs = Number(process.env.LOOM_EMAIL_OUTBOX_AU
 const emailOutboxAutoProcessBatchSize = Number(process.env.LOOM_EMAIL_OUTBOX_AUTO_PROCESS_BATCH_SIZE || 20);
 const webhookOutboxAutoProcessIntervalMs = Number(process.env.LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
 const webhookOutboxAutoProcessBatchSize = Number(process.env.LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_BATCH_SIZE || 20);
+const maintenanceSweepIntervalMs = Number(process.env.LOOM_MAINTENANCE_SWEEP_INTERVAL_MS || 60000);
 const federationSigningPrivateKeyPem = process.env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM
   ? process.env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM.replace(/\\n/g, "\n")
   : null;
@@ -171,7 +139,8 @@ const runtimeStatus = {
     last_run_at: null,
     last_processed_count: 0,
     last_error: null,
-    last_error_at: null
+    last_error_at: null,
+    batch_backoff_ms: 0
   },
   email_outbox_worker: {
     enabled: false,
@@ -182,7 +151,8 @@ const runtimeStatus = {
     last_run_at: null,
     last_processed_count: 0,
     last_error: null,
-    last_error_at: null
+    last_error_at: null,
+    batch_backoff_ms: 0
   },
   webhook_outbox_worker: {
     enabled: false,
@@ -193,7 +163,8 @@ const runtimeStatus = {
     last_run_at: null,
     last_processed_count: 0,
     last_error: null,
-    last_error_at: null
+    last_error_at: null,
+    batch_backoff_ms: 0
   }
 };
 
@@ -232,10 +203,16 @@ wireGatewayRef = wireGateway;
 
 let federationOutboxTimer = null;
 let isFederationOutboxProcessing = false;
+let federationOutboxBackoffUntil = 0;
+let federationOutboxBackoffMs = 0;
 let emailOutboxTimer = null;
 let isEmailOutboxProcessing = false;
+let emailOutboxBackoffUntil = 0;
+let emailOutboxBackoffMs = 0;
 let webhookOutboxTimer = null;
 let isWebhookOutboxProcessing = false;
+let webhookOutboxBackoffUntil = 0;
+let webhookOutboxBackoffMs = 0;
 
 function startFederationOutboxWorker() {
   if (!Number.isFinite(federationOutboxAutoProcessIntervalMs) || federationOutboxAutoProcessIntervalMs <= 0) {
@@ -249,6 +226,9 @@ function startFederationOutboxWorker() {
     if (isFederationOutboxProcessing) {
       return;
     }
+    if (federationOutboxBackoffUntil > Date.now()) {
+      return;
+    }
 
     isFederationOutboxProcessing = true;
     runtimeStatus.federation_outbox_worker.in_progress = true;
@@ -259,6 +239,9 @@ function startFederationOutboxWorker() {
       runtimeStatus.federation_outbox_worker.last_processed_count = result.processed_count;
       runtimeStatus.federation_outbox_worker.last_error = null;
       runtimeStatus.federation_outbox_worker.last_error_at = null;
+      federationOutboxBackoffMs = 0;
+      federationOutboxBackoffUntil = 0;
+      runtimeStatus.federation_outbox_worker.batch_backoff_ms = 0;
       if (result.processed_count > 0) {
         // eslint-disable-next-line no-console
         console.log(`LOOM federation outbox worker processed ${result.processed_count} item(s)`);
@@ -266,6 +249,9 @@ function startFederationOutboxWorker() {
     } catch (error) {
       runtimeStatus.federation_outbox_worker.last_error = error?.message || "Unknown federation outbox worker error";
       runtimeStatus.federation_outbox_worker.last_error_at = new Date().toISOString();
+      federationOutboxBackoffMs = Math.min(300000, federationOutboxBackoffMs === 0 ? 10000 : federationOutboxBackoffMs * 2);
+      federationOutboxBackoffUntil = Date.now() + federationOutboxBackoffMs;
+      runtimeStatus.federation_outbox_worker.batch_backoff_ms = federationOutboxBackoffMs;
       // eslint-disable-next-line no-console
       console.error("LOOM federation outbox worker failed", error);
     } finally {
@@ -301,6 +287,9 @@ function startEmailOutboxWorker() {
     if (isEmailOutboxProcessing) {
       return;
     }
+    if (emailOutboxBackoffUntil > Date.now()) {
+      return;
+    }
 
     isEmailOutboxProcessing = true;
     runtimeStatus.email_outbox_worker.in_progress = true;
@@ -312,6 +301,9 @@ function startEmailOutboxWorker() {
       runtimeStatus.email_outbox_worker.last_processed_count = result.processed_count;
       runtimeStatus.email_outbox_worker.last_error = null;
       runtimeStatus.email_outbox_worker.last_error_at = null;
+      emailOutboxBackoffMs = 0;
+      emailOutboxBackoffUntil = 0;
+      runtimeStatus.email_outbox_worker.batch_backoff_ms = 0;
       if (result.processed_count > 0) {
         // eslint-disable-next-line no-console
         console.log(`LOOM email outbox worker processed ${result.processed_count} item(s)`);
@@ -319,6 +311,9 @@ function startEmailOutboxWorker() {
     } catch (error) {
       runtimeStatus.email_outbox_worker.last_error = error?.message || "Unknown email outbox worker error";
       runtimeStatus.email_outbox_worker.last_error_at = new Date().toISOString();
+      emailOutboxBackoffMs = Math.min(300000, emailOutboxBackoffMs === 0 ? 10000 : emailOutboxBackoffMs * 2);
+      emailOutboxBackoffUntil = Date.now() + emailOutboxBackoffMs;
+      runtimeStatus.email_outbox_worker.batch_backoff_ms = emailOutboxBackoffMs;
       // eslint-disable-next-line no-console
       console.error("LOOM email outbox worker failed", error);
     } finally {
@@ -349,6 +344,9 @@ function startWebhookOutboxWorker() {
     if (isWebhookOutboxProcessing) {
       return;
     }
+    if (webhookOutboxBackoffUntil > Date.now()) {
+      return;
+    }
 
     isWebhookOutboxProcessing = true;
     runtimeStatus.webhook_outbox_worker.in_progress = true;
@@ -360,6 +358,9 @@ function startWebhookOutboxWorker() {
       runtimeStatus.webhook_outbox_worker.last_processed_count = result.processed_count;
       runtimeStatus.webhook_outbox_worker.last_error = null;
       runtimeStatus.webhook_outbox_worker.last_error_at = null;
+      webhookOutboxBackoffMs = 0;
+      webhookOutboxBackoffUntil = 0;
+      runtimeStatus.webhook_outbox_worker.batch_backoff_ms = 0;
       if (result.processed_count > 0) {
         // eslint-disable-next-line no-console
         console.log(`LOOM webhook outbox worker processed ${result.processed_count} item(s)`);
@@ -367,6 +368,9 @@ function startWebhookOutboxWorker() {
     } catch (error) {
       runtimeStatus.webhook_outbox_worker.last_error = error?.message || "Unknown webhook outbox worker error";
       runtimeStatus.webhook_outbox_worker.last_error_at = new Date().toISOString();
+      webhookOutboxBackoffMs = Math.min(300000, webhookOutboxBackoffMs === 0 ? 10000 : webhookOutboxBackoffMs * 2);
+      webhookOutboxBackoffUntil = Date.now() + webhookOutboxBackoffMs;
+      runtimeStatus.webhook_outbox_worker.batch_backoff_ms = webhookOutboxBackoffMs;
       // eslint-disable-next-line no-console
       console.error("LOOM webhook outbox worker failed", error);
     } finally {
@@ -382,6 +386,32 @@ function stopWebhookOutboxWorker() {
   if (webhookOutboxTimer) {
     clearInterval(webhookOutboxTimer);
     webhookOutboxTimer = null;
+  }
+}
+
+let maintenanceSweepTimer = null;
+
+function startMaintenanceSweep() {
+  if (!Number.isFinite(maintenanceSweepIntervalMs) || maintenanceSweepIntervalMs <= 0) {
+    return;
+  }
+
+  maintenanceSweepTimer = setInterval(() => {
+    try {
+      store.runMaintenanceSweep();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("LOOM maintenance sweep failed", error);
+    }
+  }, maintenanceSweepIntervalMs);
+
+  maintenanceSweepTimer.unref?.();
+}
+
+function stopMaintenanceSweep() {
+  if (maintenanceSweepTimer) {
+    clearInterval(maintenanceSweepTimer);
+    maintenanceSweepTimer = null;
   }
 }
 
@@ -458,6 +488,7 @@ async function shutdown(signal, exitCode = 0) {
   stopFederationOutboxWorker();
   stopEmailOutboxWorker();
   stopWebhookOutboxWorker();
+  stopMaintenanceSweep();
   try {
     await wireGateway.stop();
   } catch (error) {
@@ -522,7 +553,19 @@ async function start() {
   startFederationOutboxWorker();
   startEmailOutboxWorker();
   startWebhookOutboxWorker();
+  startMaintenanceSweep();
 }
+
+process.on("unhandledRejection", (reason) => {
+  // eslint-disable-next-line no-console
+  console.error("LOOM unhandled promise rejection", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  // eslint-disable-next-line no-console
+  console.error("LOOM uncaught exception — shutting down", error);
+  void shutdown("UNCAUGHT_EXCEPTION", 1);
+});
 
 start().catch((error) => {
   // eslint-disable-next-line no-console
