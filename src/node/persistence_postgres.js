@@ -1,25 +1,8 @@
 import { Pool } from "pg";
 
+import { parseBoolean, parsePositiveInt } from "./env.js";
+
 const CURRENT_SCHEMA_VERSION = 3;
-
-function parseBoolean(value, fallback = false) {
-  if (value == null) {
-    return fallback;
-  }
-  const normalized = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  return fallback;
-}
-
-function parsePositiveInt(value, fallback) {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 function parseNonNegativeInt(value, fallback = 0) {
   const parsed = Number(value);

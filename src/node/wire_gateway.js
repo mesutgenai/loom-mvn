@@ -3,20 +3,7 @@ import { readFileSync } from "node:fs";
 import { createSecureContext, TLSSocket } from "node:tls";
 
 import { LoomError } from "../protocol/errors.js";
-
-function parseBoolean(value, fallback = false) {
-  if (value == null) {
-    return fallback;
-  }
-  const normalized = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  return fallback;
-}
+import { parseBoolean, parsePositiveInt } from "./env.js";
 
 function isPublicBindHost(value) {
   const normalized = String(value || "")
@@ -35,11 +22,6 @@ function isPublicBindHost(value) {
   }
 
   return true;
-}
-
-function parsePositiveInt(value, fallback) {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function parseNonNegativeInt(value, fallback) {

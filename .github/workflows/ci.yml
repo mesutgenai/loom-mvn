@@ -27,8 +27,26 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test
+      - name: Run tests with coverage
+        run: node --test --experimental-test-coverage
+
+      - name: Check for accidental helper duplication
+        run: |
+          count=$(grep -r "function parseBoolean" src/ | wc -l)
+          if [ "$count" -gt 1 ]; then
+            echo "ERROR: parseBoolean is defined $count times (expected 1 in src/node/env.js)"
+            grep -rn "function parseBoolean" src/
+            exit 1
+          fi
+
+      - name: Verify no unused exports in shared env module
+        run: |
+          for fn in parseBoolean parsePositiveInt parsePositiveNumber parseHostAllowlist; do
+            importers=$(grep -rl "$fn" src/ --include='*.js' | grep -v 'src/node/env.js' | wc -l)
+            if [ "$importers" -eq 0 ]; then
+              echo "WARNING: $fn in src/node/env.js has no importers"
+            fi
+          done
 
       - name: Dependency audit (high+)
         run: npm audit --audit-level=high

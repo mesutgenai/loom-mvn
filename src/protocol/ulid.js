@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 
 const ENCODING = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const RANDOM_BITS = 80n;
+const RANDOM_MASK = (1n << RANDOM_BITS) - 1n;
 
 function encodeBase32(value, length) {
   let output = "";
@@ -16,18 +18,32 @@ function encodeTime(nowMs) {
   return encodeBase32(BigInt(nowMs), 10);
 }
 
-function encodeRandom() {
+function seedRandom() {
   const bytes = randomBytes(16);
   let value = 0n;
   for (const byte of bytes) {
     value = (value << 8n) | BigInt(byte);
   }
-
-  // Keep 80 bits for the randomness portion.
-  const mask = (1n << 80n) - 1n;
-  return encodeBase32(value & mask, 16);
+  return value & RANDOM_MASK;
 }
 
+let lastTimestamp = 0;
+let lastRandom = 0n;
+
 export function generateUlid() {
-  return `${encodeTime(Date.now())}${encodeRandom()}`;
+  const now = Date.now();
+
+  if (now === lastTimestamp) {
+    // Same millisecond — increment the random portion for monotonicity.
+    lastRandom += 1n;
+    if (lastRandom > RANDOM_MASK) {
+      // Overflow: extremely unlikely (2^80 calls in 1 ms), but handle it.
+      throw new Error("ULID random overflow within the same millisecond");
+    }
+  } else {
+    lastTimestamp = now;
+    lastRandom = seedRandom();
+  }
+
+  return `${encodeTime(now)}${encodeBase32(lastRandom, 16)}`;
 }
