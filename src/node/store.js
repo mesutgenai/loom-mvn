@@ -506,6 +506,38 @@ function hashCapabilityPresentationToken(tokenValue) {
     .digest("hex");
 }
 
+function normalizePortableCapabilityGrants(grants) {
+  return Array.from(
+    new Set(
+      (Array.isArray(grants) ? grants : [])
+        .map((grant) => String(grant || "").trim())
+        .filter(Boolean)
+    )
+  ).sort();
+}
+
+function buildPortableCapabilityTokenPayload(token) {
+  const epoch = Number(token?.epoch);
+  return {
+    loom: "1.1",
+    type: "capability_token",
+    id: String(token?.id || "").trim(),
+    thread_id: String(token?.thread_id || "").trim(),
+    issued_by: String(token?.issued_by || "").trim(),
+    issued_to: String(token?.issued_to || "").trim(),
+    issuer_node: String(token?.issuer_node || "").trim(),
+    created_at: String(token?.created_at || "").trim(),
+    expires_at: token?.expires_at ? String(token.expires_at).trim() : null,
+    single_use: token?.single_use === true,
+    epoch: Number.isInteger(epoch) ? epoch : epoch,
+    grants: normalizePortableCapabilityGrants(token?.grants)
+  };
+}
+
+function canonicalizePortableCapabilityToken(token) {
+  return canonicalizeJson(buildPortableCapabilityTokenPayload(token));
+}
+
 function mergeFederationSigningKeys(baseKeys = [], nextKeys = []) {
   const merged = new Map();
   for (const key of [...baseKeys, ...nextKeys]) {
@@ -684,6 +716,7 @@ export class LoomStore {
     this.refreshTokens = new Map();
     this.capabilitiesById = new Map();
     this.capabilityIdBySecretHash = new Map();
+    this.consumedPortableCapabilityIds = new Set();
     this.delegationsById = new Map();
     this.revokedDelegationIds = new Set();
     this.blobsById = new Map();
@@ -1241,6 +1274,11 @@ export class LoomStore {
         capability.secret_last_used_at = null;
       }
     }
+    this.consumedPortableCapabilityIds = new Set(
+      (state.consumed_portable_capability_ids || [])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    );
     this.delegationsById = new Map((state.delegations || []).map((item) => [item.id, item]));
     this.revokedDelegationIds = new Set(state.revoked_delegation_ids || []);
     this.blobsById = new Map((state.blobs || []).map((item) => [item.id, item]));
@@ -1368,6 +1406,7 @@ export class LoomStore {
       envelopes: Array.from(this.envelopesById.values()),
       threads: Array.from(this.threadsById.values()),
       capabilities: Array.from(this.capabilitiesById.values()),
+      consumed_portable_capability_ids: Array.from(this.consumedPortableCapabilityIds.values()),
       delegations: Array.from(this.delegationsById.values()),
       revoked_delegation_ids: Array.from(this.revokedDelegationIds),
       blobs: Array.from(this.blobsById.values()),
@@ -3356,7 +3395,8 @@ export class LoomStore {
 
       const stored = this.ingestEnvelope(envelopeWithPolicyMeta, {
         actorIdentity: envelopeWithPolicyMeta?.from?.identity,
-        federated: true
+        federated: true,
+        federationNode: verifiedNode
       });
 
       if (quarantined) {
@@ -4719,11 +4759,12 @@ export class LoomStore {
 
   envelopeContainsCapabilitySecret(envelope) {
     const parameters = envelope?.content?.structured?.parameters;
+    const capabilityToken = parameters?.capability_token;
     return Boolean(
       parameters &&
       typeof parameters === "object" &&
-      typeof parameters.capability_token === "string" &&
-      parameters.capability_token.trim().length > 0
+      ((typeof capabilityToken === "string" && capabilityToken.trim().length > 0) ||
+        (capabilityToken && typeof capabilityToken === "object" && !Array.isArray(capabilityToken)))
     );
   }
 
@@ -4827,7 +4868,11 @@ export class LoomStore {
     let visibleEnvelope = envelope;
     if (!actorIsSender && envelope?.type === "thread_op" && envelope?.content?.structured?.parameters) {
       const parameters = envelope.content.structured.parameters;
-      if (typeof parameters.capability_token === "string" && parameters.capability_token.trim()) {
+      const capabilityToken = parameters.capability_token;
+      if (
+        (typeof capabilityToken === "string" && capabilityToken.trim()) ||
+        (capabilityToken && typeof capabilityToken === "object" && !Array.isArray(capabilityToken))
+      ) {
         const redactedParameters = { ...parameters };
         delete redactedParameters.capability_token;
         redactedParameters.capability_token_redacted = true;
@@ -6847,8 +6892,42 @@ export class LoomStore {
     if (options.includePresentationToken === true && options.presentationToken) {
       sanitized.presentation_token = options.presentationToken;
     }
+    if (options.includePortableToken === true && token?.portable_token) {
+      sanitized.portable_token = structuredClone(token.portable_token);
+    }
 
     return sanitized;
+  }
+
+  issuePortableCapabilityToken(token) {
+    if (!token || typeof token !== "object") {
+      throw new LoomError("ENVELOPE_INVALID", "Capability token payload is required", 400, {
+        field: "capability"
+      });
+    }
+
+    const signingPrivateKeyPem = this.federationSigningPrivateKeyPem || this.systemSigningPrivateKeyPem;
+    const signingKeyId = String(this.federationSigningKeyId || this.systemSigningKeyId || "").trim();
+    if (!signingPrivateKeyPem || !signingKeyId) {
+      throw new LoomError("SIGNATURE_INVALID", "Capability token signing key is not configured", 500, {
+        field: "signature"
+      });
+    }
+
+    const unsignedToken = buildPortableCapabilityTokenPayload({
+      ...token,
+      issuer_node: this.nodeId
+    });
+
+    const signature = signUtf8Message(signingPrivateKeyPem, canonicalizePortableCapabilityToken(unsignedToken));
+    return {
+      ...unsignedToken,
+      signature: {
+        algorithm: "Ed25519",
+        key_id: signingKeyId,
+        value: signature
+      }
+    };
   }
 
   issueCapabilityToken(payload, issuedBy) {
@@ -6892,7 +6971,8 @@ export class LoomStore {
       spent_at: null,
       secret_hash: hashCapabilityPresentationToken(presentationToken),
       secret_hint: presentationToken.slice(-6),
-      secret_last_used_at: null
+      secret_last_used_at: null,
+      portable_token: null
     };
 
     if (token.expires_at && parseTime(token.expires_at) == null) {
@@ -6901,17 +6981,21 @@ export class LoomStore {
       });
     }
 
+    token.portable_token = this.issuePortableCapabilityToken(token);
+
     this.capabilitiesById.set(token.id, token);
     this.capabilityIdBySecretHash.set(token.secret_hash, token.id);
     this.persistAndAudit("capability.issue", {
       capability_id: token.id,
       thread_id: token.thread_id,
       issued_by: token.issued_by,
-      issued_to: token.issued_to
+      issued_to: token.issued_to,
+      portable_token_signing_key: token.portable_token?.signature?.key_id || null
     });
     return this.sanitizeCapabilityToken(token, {
       includePresentationToken: true,
-      presentationToken
+      presentationToken,
+      includePortableToken: true
     });
   }
 
@@ -6995,11 +7079,220 @@ export class LoomStore {
     return this.capabilitiesById.get(resolvedId) || null;
   }
 
-  validateCapabilityForThreadOperation({ thread, intent, actorIdentity, capabilityTokenValue, capabilityTokenId = null }) {
+  resolvePortableCapabilitySigningPublicKey(portableToken, context = {}) {
+    const signatureKeyId = String(portableToken?.signature?.key_id || "").trim();
+    if (!signatureKeyId) {
+      throw new LoomError("SIGNATURE_INVALID", "Portable capability token signature key_id is required", 401, {
+        field: "content.structured.parameters.capability_token.signature.key_id"
+      });
+    }
+
+    const issuerNodeId = String(portableToken?.issuer_node || "").trim();
+    if (!issuerNodeId) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token issuer_node is required", 403, {
+        field: "content.structured.parameters.capability_token.issuer_node"
+      });
+    }
+
+    if (context?.federated === true && context?.federationNode?.node_id) {
+      const expectedNodeId = String(context.federationNode.node_id || "").trim().toLowerCase();
+      if (issuerNodeId.toLowerCase() !== expectedNodeId) {
+        throw new LoomError("CAPABILITY_DENIED", "Portable capability token issuer_node must match federation sender node", 403, {
+          field: "content.structured.parameters.capability_token.issuer_node",
+          issuer_node: issuerNodeId,
+          sender_node: context.federationNode.node_id
+        });
+      }
+    }
+
+    if (issuerNodeId.toLowerCase() === String(this.nodeId || "").trim().toLowerCase()) {
+      if (signatureKeyId !== this.federationSigningKeyId) {
+        throw new LoomError("SIGNATURE_INVALID", "Portable capability token key_id is not authorized for local issuer node", 401, {
+          field: "content.structured.parameters.capability_token.signature.key_id",
+          key_id: signatureKeyId
+        });
+      }
+
+      try {
+        return derivePublicKeyPemFromPrivateKeyPem(this.federationSigningPrivateKeyPem);
+      } catch {
+        throw new LoomError("SIGNATURE_INVALID", "Unable to derive local federation signing public key", 500, {
+          field: "content.structured.parameters.capability_token.signature.key_id"
+        });
+      }
+    }
+
+    const knownNode = context?.federationNode || this.resolveKnownNodeById(issuerNodeId);
+    if (!knownNode) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token issuer node is unknown", 403, {
+        field: "content.structured.parameters.capability_token.issuer_node",
+        issuer_node: issuerNodeId
+      });
+    }
+
+    const signingKey = resolveFederationNodeSigningKey(knownNode, signatureKeyId);
+    if (!signingKey) {
+      throw new LoomError("SIGNATURE_INVALID", "Portable capability token signature key is not trusted for issuer node", 401, {
+        field: "content.structured.parameters.capability_token.signature.key_id",
+        issuer_node: issuerNodeId,
+        key_id: signatureKeyId
+      });
+    }
+
+    return signingKey.public_key_pem;
+  }
+
+  validatePortableCapabilityTokenForThreadOperation({
+    thread,
+    actorIdentity,
+    requiredGrant,
+    portableCapabilityToken,
+    context = {}
+  }) {
+    if (!portableCapabilityToken || typeof portableCapabilityToken !== "object" || Array.isArray(portableCapabilityToken)) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token is invalid", 403, {
+        field: "content.structured.parameters.capability_token"
+      });
+    }
+
+    const signature = portableCapabilityToken.signature;
+    if (!signature || typeof signature !== "object") {
+      throw new LoomError("SIGNATURE_INVALID", "Portable capability token signature is required", 401, {
+        field: "content.structured.parameters.capability_token.signature"
+      });
+    }
+
+    const signatureAlgorithm = String(signature.algorithm || "").trim();
+    const signatureValue = String(signature.value || "").trim();
+    if (signatureAlgorithm !== "Ed25519" || !signatureValue) {
+      throw new LoomError("SIGNATURE_INVALID", "Portable capability token signature is invalid", 401, {
+        field: "content.structured.parameters.capability_token.signature"
+      });
+    }
+
+    const normalizedToken = buildPortableCapabilityTokenPayload(portableCapabilityToken);
+    if (!normalizedToken.id || !normalizedToken.thread_id || !normalizedToken.issued_by || !normalizedToken.issued_to) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token requires id, thread_id, issued_by, and issued_to", 403, {
+        field: "content.structured.parameters.capability_token"
+      });
+    }
+
+    if (normalizedToken.thread_id !== thread.id) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token thread scope mismatch", 403, {
+        capability_token: normalizedToken.id,
+        token_thread_id: normalizedToken.thread_id,
+        thread_id: thread.id
+      });
+    }
+
+    if (normalizedToken.issued_to !== actorIdentity) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token issued_to mismatch", 403, {
+        capability_token: normalizedToken.id,
+        issued_to: normalizedToken.issued_to,
+        actor: actorIdentity
+      });
+    }
+
+    if (!this.isThreadOwner(thread, normalizedToken.issued_by)) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token issuer is not an active thread owner", 403, {
+        capability_token: normalizedToken.id,
+        issued_by: normalizedToken.issued_by
+      });
+    }
+
+    if (normalizedToken.expires_at) {
+      if (parseTime(normalizedToken.expires_at) == null || isExpiredIso(normalizedToken.expires_at)) {
+        throw new LoomError("CAPABILITY_DENIED", "Portable capability token expired or invalid expires_at", 403, {
+          capability_token: normalizedToken.id
+        });
+      }
+    }
+
+    if (!Number.isInteger(normalizedToken.epoch) || normalizedToken.epoch < 0) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token epoch is invalid", 403, {
+        capability_token: normalizedToken.id,
+        token_epoch: normalizedToken.epoch
+      });
+    }
+
+    if (normalizedToken.epoch !== thread.cap_epoch) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token epoch mismatch", 403, {
+        capability_token: normalizedToken.id,
+        token_epoch: normalizedToken.epoch,
+        thread_epoch: thread.cap_epoch
+      });
+    }
+
+    const grantSet = new Set(normalizedToken.grants);
+    if (!grantSet.has("admin") && !grantSet.has(requiredGrant)) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token grant missing for operation", 403, {
+        capability_token: normalizedToken.id,
+        required_grant: requiredGrant
+      });
+    }
+
+    if (normalizedToken.single_use && this.consumedPortableCapabilityIds.has(normalizedToken.id)) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token already spent", 403, {
+        capability_token: normalizedToken.id
+      });
+    }
+
+    const publicKeyPem = this.resolvePortableCapabilitySigningPublicKey(
+      {
+        ...normalizedToken,
+        signature
+      },
+      context
+    );
+    const validSignature = verifyUtf8MessageSignature(
+      publicKeyPem,
+      canonicalizePortableCapabilityToken(normalizedToken),
+      signatureValue
+    );
+    if (!validSignature) {
+      throw new LoomError("SIGNATURE_INVALID", "Portable capability token signature verification failed", 401, {
+        field: "content.structured.parameters.capability_token.signature"
+      });
+    }
+
+    const localToken = this.capabilitiesById.get(normalizedToken.id) || null;
+    if (localToken && localToken.revoked) {
+      throw new LoomError("CAPABILITY_DENIED", "Portable capability token revoked", 403, {
+        capability_token: normalizedToken.id
+      });
+    }
+
+    return {
+      kind: "portable",
+      id: normalizedToken.id,
+      single_use: normalizedToken.single_use,
+      localToken
+    };
+  }
+
+  validateCapabilityForThreadOperation({
+    thread,
+    intent,
+    actorIdentity,
+    capabilityTokenValue,
+    capabilityTokenId = null,
+    portableCapabilityToken = null,
+    context = {}
+  }) {
     const requiredGrant = THREAD_OP_TO_GRANT[intent] || "admin";
 
     if (this.isThreadOwner(thread, actorIdentity)) {
       return null;
+    }
+
+    if (portableCapabilityToken && typeof portableCapabilityToken === "object") {
+      return this.validatePortableCapabilityTokenForThreadOperation({
+        thread,
+        actorIdentity,
+        requiredGrant,
+        portableCapabilityToken,
+        context
+      });
     }
 
     if (!capabilityTokenValue) {
@@ -7058,7 +7351,10 @@ export class LoomStore {
 
     token.secret_last_used_at = nowIso();
 
-    return token;
+    return {
+      kind: "local",
+      token
+    };
   }
 
   validateCapabilityForThreadRead({ thread, actorIdentity, capabilityTokenValue, strict = true }) {
@@ -7224,31 +7520,30 @@ export class LoomStore {
       });
     }
 
-    const payloadCapabilityToken =
-      typeof parameters.capability_token === "string" ? parameters.capability_token.trim() : "";
-    if (payloadCapabilityToken) {
-      throw new LoomError(
-        "ENVELOPE_INVALID",
-        "Capability token must be provided via x-loom-capability-token header, not envelope payload",
-        400,
-        {
-          field: "content.structured.parameters.capability_token"
-        }
-      );
-    }
-
-    const capabilityTokenValue = String(context?.capabilityPresentationToken || "").trim();
+    const payloadCapabilityTokenRaw = parameters.capability_token;
+    const payloadPortableCapabilityToken =
+      payloadCapabilityTokenRaw &&
+      typeof payloadCapabilityTokenRaw === "object" &&
+      !Array.isArray(payloadCapabilityTokenRaw)
+        ? payloadCapabilityTokenRaw
+        : null;
+    const payloadCapabilityTokenValue =
+      typeof payloadCapabilityTokenRaw === "string" ? payloadCapabilityTokenRaw.trim() : "";
+    const headerCapabilityTokenValue = String(context?.capabilityPresentationToken || "").trim();
+    const capabilityTokenValue = headerCapabilityTokenValue || payloadCapabilityTokenValue;
     const capabilityTokenId =
       typeof parameters.capability_id === "string" && parameters.capability_id.trim()
         ? parameters.capability_id.trim()
         : null;
 
-    const token = this.validateCapabilityForThreadOperation({
+    const validatedToken = this.validateCapabilityForThreadOperation({
       thread,
       intent,
       actorIdentity,
       capabilityTokenValue,
-      capabilityTokenId
+      capabilityTokenId,
+      portableCapabilityToken: payloadPortableCapabilityToken,
+      context
     });
 
     return () => {
@@ -7412,9 +7707,22 @@ export class LoomStore {
           });
       }
 
-      if (token?.single_use && !token.spent) {
-        token.spent = true;
-        token.spent_at = envelope.created_at;
+      if (validatedToken?.kind === "local") {
+        const token = validatedToken.token;
+        if (token?.single_use && !token.spent) {
+          token.spent = true;
+          token.spent_at = envelope.created_at;
+        }
+      } else if (validatedToken?.kind === "portable" && validatedToken.single_use) {
+        const localToken = validatedToken.localToken;
+        if (localToken) {
+          if (!localToken.spent) {
+            localToken.spent = true;
+            localToken.spent_at = envelope.created_at;
+          }
+        } else {
+          this.consumedPortableCapabilityIds.add(validatedToken.id);
+        }
       }
     };
   }
@@ -7477,16 +7785,72 @@ export class LoomStore {
     return identityPublicKey;
   }
 
+  resolveAuthoritativeEnvelopeSenderType(envelope) {
+    const fromIdentity = this.normalizeIdentityReference(envelope?.from?.identity);
+    if (!fromIdentity) {
+      throw new LoomError("SIGNATURE_INVALID", "Envelope sender identity is missing", 401, {
+        field: "from.identity"
+      });
+    }
+
+    const claimedType = String(envelope?.from?.type || "").trim();
+    if (!claimedType) {
+      throw new LoomError("ENVELOPE_INVALID", "Envelope sender type is missing", 400, {
+        field: "from.type"
+      });
+    }
+
+    if (fromIdentity.startsWith("bridge://")) {
+      if (claimedType !== "bridge") {
+        throw new LoomError("DELEGATION_INVALID", "Bridge sender identities must use from.type=bridge", 403, {
+          field: "from.type",
+          identity: fromIdentity,
+          expected_type: "bridge",
+          actual_type: claimedType
+        });
+      }
+      return "bridge";
+    }
+
+    const senderIdentity = this.resolveIdentity(fromIdentity);
+    if (!senderIdentity) {
+      throw new LoomError("SIGNATURE_INVALID", "Envelope sender identity is not registered", 401, {
+        field: "from.identity",
+        identity: fromIdentity
+      });
+    }
+
+    const registeredType = String(senderIdentity.type || "human").trim() || "human";
+    if (registeredType !== claimedType) {
+      throw new LoomError(
+        "DELEGATION_INVALID",
+        "Envelope sender type does not match registered identity type",
+        403,
+        {
+          field: "from.type",
+          identity: fromIdentity,
+          expected_type: registeredType,
+          actual_type: claimedType
+        }
+      );
+    }
+
+    return registeredType;
+  }
+
   ingestEnvelope(envelope, context = {}) {
     validateEnvelopeOrThrow(envelope);
 
-    const actorIdentity = context.actorIdentity || envelope.from?.identity;
-    if (actorIdentity !== envelope.from?.identity) {
+    const actorIdentity = this.normalizeIdentityReference(context.actorIdentity || envelope.from?.identity);
+    const fromIdentity = this.normalizeIdentityReference(envelope.from?.identity);
+    if (!fromIdentity || actorIdentity !== fromIdentity) {
       throw new LoomError("CAPABILITY_DENIED", "Authenticated actor must match envelope.from.identity", 403, {
         actor: actorIdentity,
-        from: envelope.from?.identity
+        from: fromIdentity || envelope.from?.identity || null
       });
     }
+
+    const authoritativeSenderType = this.resolveAuthoritativeEnvelopeSenderType(envelope);
 
     this.enforceThreadRecipientFanout(envelope);
 
@@ -7502,7 +7866,7 @@ export class LoomStore {
       this.resolveEnvelopeSignaturePublicKey(signedEnvelope, keyId, context)
     );
 
-    if (envelope.from?.type === "agent") {
+    if (authoritativeSenderType === "agent") {
       const contextRequiredActions = Array.isArray(context.requiredActions)
         ? context.requiredActions
         : context.requiredAction

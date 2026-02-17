@@ -5064,13 +5064,14 @@ test("API supports capability presentation token in header for thread operations
     body: JSON.stringify({
       thread_id: rootEnvelope.thread_id,
       issued_to: "loom://bob@node.test",
-      grants: ["resolve"],
+      grants: ["label"],
       single_use: true
     })
   });
   assert.equal(issueCapability.response.status, 201);
   assert.equal(typeof issueCapability.body.presentation_token, "string");
   assert.equal(issueCapability.body.presentation_token.startsWith("cpt_"), true);
+  assert.equal(typeof issueCapability.body.portable_token, "object");
 
   const listCapabilities = await jsonRequest(`${baseUrl}/v1/capabilities?thread_id=${rootEnvelope.thread_id}`, {
     headers: {
@@ -5081,7 +5082,7 @@ test("API supports capability presentation token in header for thread operations
   assert.equal(listCapabilities.body.capabilities.length, 1);
   assert.equal(listCapabilities.body.capabilities[0].presentation_token, undefined);
 
-  const opEnvelope = signEnvelope(
+  const opDeniedWithoutCapability = signEnvelope(
     {
       loom: "1.1",
       id: "env_01ARZ3NDEKTSV4RRFFQ69G7MAE",
@@ -5099,9 +5100,9 @@ test("API supports capability presentation token in header for thread operations
       priority: "normal",
       content: {
         structured: {
-          intent: "thread.resolve@v1",
+          intent: "thread.update@v1",
           parameters: {
-            capability_id: issueCapability.body.id
+            subject: "portable subject update"
           }
         },
         encrypted: false
@@ -5117,31 +5118,118 @@ test("API supports capability presentation token in header for thread operations
     headers: {
       authorization: `Bearer ${bobToken}`
     },
-    body: JSON.stringify(opEnvelope)
+    body: JSON.stringify(opDeniedWithoutCapability)
   });
   assert.equal(opDeniedWithoutHeader.response.status, 403);
   assert.equal(opDeniedWithoutHeader.body.error.code, "CAPABILITY_DENIED");
 
-  const opAccepted = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}/ops`, {
+  const opAcceptedPortable = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}/ops`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    },
+    body: JSON.stringify(
+      signEnvelope(
+        {
+          loom: "1.1",
+          id: "env_01ARZ3NDEKTSV4RRFFQ69G7MAF",
+          thread_id: rootEnvelope.thread_id,
+          parent_id: rootEnvelope.id,
+          type: "thread_op",
+          from: {
+            identity: "loom://bob@node.test",
+            display: "Bob",
+            key_id: "k_sign_bob_cap_1",
+            type: "human"
+          },
+          to: [{ identity: "loom://alice@node.test", role: "primary" }],
+          created_at: "2026-02-16T23:16:10Z",
+          priority: "normal",
+          content: {
+            structured: {
+              intent: "thread.update@v1",
+              parameters: {
+                subject: "portable subject update",
+                capability_token: issueCapability.body.portable_token
+              }
+            },
+            encrypted: false
+          },
+          attachments: []
+        },
+        bobKeys.privateKeyPem,
+        "k_sign_bob_cap_1"
+      )
+    )
+  });
+  assert.equal(opAcceptedPortable.response.status, 201, JSON.stringify(opAcceptedPortable.body));
+
+  const issueResolveCapability = await jsonRequest(`${baseUrl}/v1/capabilities`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    },
+    body: JSON.stringify({
+      thread_id: rootEnvelope.thread_id,
+      issued_to: "loom://bob@node.test",
+      grants: ["resolve"],
+      single_use: true
+    })
+  });
+  assert.equal(issueResolveCapability.response.status, 201);
+
+  const opResolve = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7MAG",
+      thread_id: rootEnvelope.thread_id,
+      parent_id: rootEnvelope.id,
+      type: "thread_op",
+      from: {
+        identity: "loom://bob@node.test",
+        display: "Bob",
+        key_id: "k_sign_bob_cap_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://alice@node.test", role: "primary" }],
+      created_at: "2026-02-16T23:16:20Z",
+      priority: "normal",
+      content: {
+        structured: {
+          intent: "thread.resolve@v1",
+          parameters: {
+            capability_id: issueResolveCapability.body.id
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    bobKeys.privateKeyPem,
+    "k_sign_bob_cap_1"
+  );
+
+  const opAcceptedWithHeader = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}/ops`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${bobToken}`,
-      "x-loom-capability-token": issueCapability.body.presentation_token
+      "x-loom-capability-token": issueResolveCapability.body.presentation_token
     },
-    body: JSON.stringify(opEnvelope)
+    body: JSON.stringify(opResolve)
   });
-  assert.equal(opAccepted.response.status, 201, JSON.stringify(opAccepted.body));
+  assert.equal(opAcceptedWithHeader.response.status, 201, JSON.stringify(opAcceptedWithHeader.body));
 
-  const publicEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opEnvelope.id}`);
+  const publicEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opAcceptedPortable.body.id}`);
   assert.equal(publicEnvelopeView.response.status, 401);
 
-  const aliceEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opEnvelope.id}`, {
+  const aliceEnvelopeView = await jsonRequest(`${baseUrl}/v1/envelopes/${opAcceptedPortable.body.id}`, {
     headers: {
       authorization: `Bearer ${aliceToken}`
     }
   });
   assert.equal(aliceEnvelopeView.response.status, 200);
   assert.equal(aliceEnvelopeView.body.content.structured.parameters.capability_token, undefined);
+  assert.equal(aliceEnvelopeView.body.content.structured.parameters.capability_token_redacted, true);
 
   const thread = await jsonRequest(`${baseUrl}/v1/threads/${rootEnvelope.thread_id}`, {
     headers: {
@@ -5149,6 +5237,7 @@ test("API supports capability presentation token in header for thread operations
     }
   });
   assert.equal(thread.response.status, 200);
+  assert.equal(thread.body.subject, "portable subject update");
   assert.equal(thread.body.state, "resolved");
 });
 

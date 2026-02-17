@@ -610,6 +610,47 @@ test("agent envelope with valid delegation chain is accepted", () => {
   assert.equal(stored.id, envelope.id);
 });
 
+test("agent identity cannot bypass delegation by mislabeling from.type", () => {
+  const agentKeys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://assistant.owner@node.test",
+    type: "agent",
+    display_name: "Assistant",
+    signing_keys: [{ key_id: "k_sign_agent_1", public_key_pem: agentKeys.publicKeyPem }]
+  });
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FE2",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FE3",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://assistant.owner@node.test",
+        display: "Assistant",
+        key_id: "k_sign_agent_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://target@node.test", role: "primary" }],
+      created_at: "2026-02-16T20:31:30Z",
+      priority: "normal",
+      content: {
+        human: { text: "mislabel attempt", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    agentKeys.privateKeyPem,
+    "k_sign_agent_1"
+  );
+
+  assert.throws(() => store.ingestEnvelope(envelope), (error) => error?.code === "DELEGATION_INVALID");
+});
+
 test("agent envelope fails when delegation chain exceeds max_sub_delegation_depth", () => {
   const ownerKeys = generateSigningKeyPair();
   const delegateKeys = generateSigningKeyPair();
@@ -850,16 +891,17 @@ test("thread_op requires capability token for non-owner and consumes single-use 
     (error) => error?.code === "CAPABILITY_DENIED"
   );
 
-  const capability = store.issueCapabilityToken(
+  const portableCapability = store.issueCapabilityToken(
     {
       thread_id: threadId,
       issued_to: "loom://bob@node.test",
-      grants: ["resolve"],
+      grants: ["label"],
       single_use: true
     },
     "loom://alice@node.test"
   );
-  assert.equal(typeof capability.presentation_token, "string");
+  assert.equal(typeof portableCapability.presentation_token, "string");
+  assert.equal(typeof portableCapability.portable_token, "object");
   const listedBefore = store.listCapabilities(threadId, "loom://alice@node.test");
   assert.equal(listedBefore[0].presentation_token, undefined);
 
@@ -881,8 +923,11 @@ test("thread_op requires capability token for non-owner and consumes single-use 
       priority: "normal",
       content: {
         structured: {
-          intent: "thread.resolve@v1",
-          parameters: { capability_token: capability.id }
+          intent: "thread.update@v1",
+          parameters: {
+            subject: "portable token update",
+            capability_token: portableCapability.portable_token
+          }
         },
         encrypted: false
       },
@@ -891,9 +936,16 @@ test("thread_op requires capability token for non-owner and consumes single-use 
     bobKeys.privateKeyPem,
     "k_sign_bob_1"
   );
-  assert.throws(
-    () => store.ingestEnvelope(resolveWithPayloadCapabilityToken),
-    (error) => error?.code === "ENVELOPE_INVALID"
+  store.ingestEnvelope(resolveWithPayloadCapabilityToken);
+
+  const resolveCapability = store.issueCapabilityToken(
+    {
+      thread_id: threadId,
+      issued_to: "loom://bob@node.test",
+      grants: ["resolve"],
+      single_use: true
+    },
+    "loom://alice@node.test"
   );
 
   const resolveWithCapability = signEnvelope(
@@ -926,14 +978,16 @@ test("thread_op requires capability token for non-owner and consumes single-use 
   );
 
   store.ingestEnvelope(resolveWithCapability, {
-    capabilityPresentationToken: capability.presentation_token
+    capabilityPresentationToken: resolveCapability.presentation_token
   });
 
   const thread = store.getThread(threadId);
+  assert.equal(thread.subject, "portable token update");
   assert.equal(thread.state, "resolved");
 
   const listed = store.listCapabilities(threadId, "loom://alice@node.test");
-  assert.equal(listed[0].spent, true);
+  assert.equal(listed.length, 2);
+  assert.equal(listed.every((token) => token.spent === true), true);
 });
 
 test("identity and timestamp validators enforce canonical protocol format", () => {
