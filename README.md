@@ -2,6 +2,95 @@
 
 This repository tracks **LOOM** (Linked Operations & Orchestrated Messaging).
 
+## Why This Exists
+
+Email infrastructure was designed for human-to-human messages in the 1980s protocol model (SMTP + MIME + IMAP folders). It still works for people, but agent workflows have different requirements:
+
+- deterministic machine-readable semantics, not heuristic text parsing
+- verifiable delegated authority for agent actions
+- safe scoped permissions, not full mailbox access
+- reliable idempotent APIs and replay-safe operations
+- cryptographic trust between nodes, not partial trust via headers
+- event/state transitions that can be automated without ambiguity
+
+LOOM exists to provide a communication layer where humans and agents can collaborate in the same thread, but with protocol-native structure, trust, and control surfaces.
+
+## Why Traditional Email Breaks For Agents
+
+Traditional email can be integrated with agents, but it fails as the primary protocol when agents are first-class participants at scale.
+
+### 1) Intent Is Ambiguous
+
+- Email body content is mostly unstructured free text and HTML.
+- Agents must guess intent from natural language and brittle templates.
+- A small formatting change can break automation.
+
+LOOM approach:
+
+- Every envelope carries both human-readable content and structured intent payloads.
+- Agents act on explicit `intent + parameters` fields instead of inference alone.
+
+### 2) Authorization Is Coarse
+
+- Mailbox access is usually account-level (all or almost all data).
+- Delegation is operationally messy (shared inboxes, forwarding rules, app passwords).
+- Hard to prove whether an action came from the owner or a delegated agent.
+
+LOOM approach:
+
+- Capability tokens scope actions to a thread and grant type.
+- Delegation chains are signed and revocable.
+- Agent actions are attributable and auditable by protocol.
+
+### 3) Thread Semantics Are Not Deterministic
+
+- Email threading depends on client heuristics (`subject`, `In-Reply-To`, `References`).
+- Fork/merge/handoff flows are implicit and unreliable.
+- Different clients render different conversation histories.
+
+LOOM approach:
+
+- Canonical thread DAG with explicit parent references.
+- Deterministic ordering and thread operations (`fork`, `merge`, `delegate`, `resolve`).
+
+### 4) Trust Model Is Weak For Autonomous Systems
+
+- SMTP metadata can be manipulated unless layers of anti-spoof controls align.
+- SPF/DKIM/DMARC help but are still email-era compensating controls.
+- Cross-system automation needs stronger per-request verification and replay protection.
+
+LOOM approach:
+
+- Signed envelopes and signed federation requests.
+- Nonce + timestamp replay protection.
+- Explicit federation node trust policies (`trusted`, `quarantine`, `deny`) and abuse automation.
+
+### 5) Delivery Operations Are Not API-First
+
+- Email retry/error handling is fragmented across MTAs and providers.
+- Idempotency behavior is not consistent across clients/integrations.
+- Operational introspection is limited for real-time agent systems.
+
+LOOM approach:
+
+- API-first outbox queues for email/federation/webhooks.
+- Dead-letter queue requeue controls.
+- Idempotency-key support on critical write routes.
+- Metrics/readiness/admin surfaces for continuous operation.
+
+### 6) State Mutation Over Email Is Unsafe
+
+- Actions like "approve", "close", or "reassign" are implied through message text.
+- Parsing these into reliable state transitions is error-prone.
+
+LOOM approach:
+
+- `thread_op` intents are explicit, validated, authorized, and persisted with audit chain.
+
+### Summary
+
+Email remains useful as a bridge transport for legacy users and systems. It is not enough as the core protocol for agent-native collaboration. LOOM keeps compatibility where needed, but moves the source of truth to signed, structured, auditable protocol primitives.
+
 ## Current status
 
 - Protocol design docs are available in:
