@@ -2,6 +2,55 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.2.6 - 2026-02-17
+
+Production hardening, memory safety, and operational resilience:
+
+### Critical Fixes
+- **Memory leak sweep**: Added periodic `runMaintenanceSweep()` that evicts expired
+  access tokens, refresh tokens, auth challenges, stale rate-limit windows, and
+  caps the `consumedPortableCapabilityIds` / `revokedDelegationIds` Sets (FIFO).
+  Also delegates to all 7 existing cleanup methods. Runs every 60 s by default
+  (`LOOM_MAINTENANCE_SWEEP_INTERVAL_MS`).
+- **Worker exponential backoff**: All three outbox workers (federation, email,
+  webhook) now apply exponential backoff on batch-level failures (10 s → 300 s
+  cap) instead of retrying every tick indefinitely.
+- **Atomic file persistence**: `persistState()` now writes to a `.tmp` file,
+  calls `fsync`, then renames — preventing half-written state on crash.
+
+### High-Risk Fixes
+- **Resource limits**: Configurable caps for local identities (10 k default),
+  remote identities (50 k), delegations per identity (500), and total
+  delegations (100 k). Enforced in `registerIdentity()` and
+  `createDelegation()` with `RESOURCE_LIMIT` errors.
+  New env vars: `LOOM_MAX_LOCAL_IDENTITIES`, `LOOM_MAX_REMOTE_IDENTITIES`,
+  `LOOM_MAX_DELEGATIONS_PER_IDENTITY`, `LOOM_MAX_DELEGATIONS_TOTAL`,
+  `LOOM_CONSUMED_CAPABILITY_MAX_ENTRIES`, `LOOM_REVOKED_DELEGATION_MAX_ENTRIES`.
+
+### Security
+- **Response headers**: Every HTTP response now includes `x-content-type-options:
+  nosniff`, `x-frame-options: DENY`, `cache-control: no-store`.
+- **HTTP server timeouts**: `headersTimeout` (30 s), `requestTimeout` (2 min),
+  `keepAliveTimeout` (65 s) to mitigate slow-loris and idle-connection attacks.
+- **Global error handlers**: `unhandledRejection` logs and continues;
+  `uncaughtException` logs and triggers graceful shutdown.
+
+### Maintenance
+- **Helper deduplication**: Consolidated `parseBoolean`, `parsePositiveInt`,
+  `parsePositiveNumber`, and `parseHostAllowlist` into a single shared module
+  (`src/node/env.js`), replacing 6+ duplicated copies across the codebase.
+- **ULID monotonicity**: `generateUlid()` now increments the random portion
+  within the same millisecond instead of re-seeding, guaranteeing strict
+  ordering for same-ms calls.
+- **CI enhancements**: Added `--experimental-test-coverage`, a helper
+  duplication guard, and an unused-export check to the GitHub Actions workflow.
+
+### Tests
+- Added 16 new tests covering maintenance sweep, backoff formula, atomic
+  persistence, identity limits, and delegation limits (136 total).
+
+---
+
 ## v0.2.5 - 2026-02-17
 
 Security and interoperability updates:

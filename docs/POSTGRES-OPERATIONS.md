@@ -15,6 +15,15 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
   - `LOOM_PG_SSL_REJECT_UNAUTHORIZED`
   - `LOOM_OUTBOX_CLAIM_LEASE_MS`
   - `LOOM_OUTBOX_WORKER_ID`
+- Resource limits:
+  - `LOOM_MAX_LOCAL_IDENTITIES` (default 10000)
+  - `LOOM_MAX_REMOTE_IDENTITIES` (default 50000)
+  - `LOOM_MAX_DELEGATIONS_PER_IDENTITY` (default 500)
+  - `LOOM_MAX_DELEGATIONS_TOTAL` (default 100000)
+  - `LOOM_CONSUMED_CAPABILITY_MAX_ENTRIES` (default 50000)
+  - `LOOM_REVOKED_DELEGATION_MAX_ENTRIES` (default 50000)
+- Maintenance:
+  - `LOOM_MAINTENANCE_SWEEP_INTERVAL_MS` (default 60000)
 
 ## Startup Checks
 
