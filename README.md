@@ -108,6 +108,9 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 - Ed25519 envelope signing and verification
 - Thread DAG validation and canonical rendering order
 - Proof-of-key auth (`challenge` -> signed nonce -> bearer token)
+- Optional proof-of-key identity registration (`/v1/identity/challenge` + `registration_proof`)
+- Imported remote identities are stored in a read-only remote cache namespace with TTL-based expiry
+- Private-by-default mailbox reads: thread/envelope read endpoints require bearer auth unless explicit demo mode is enabled
 - Capability token hardening: one-time presentation secret, hashed-at-rest secret tracking, and header-based `thread_op` authorization
 - `thread_op` authorization with owner/capability enforcement
 - Agent delegation-chain verification with signature/scope/revocation checks
@@ -117,6 +120,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 - Federation node policies: `trusted`, `quarantine`, `deny`
 - Federation node key rotation support (`signing_keys` + `active_key_id`)
 - Federation node auto-discovery bootstrap from `/.well-known/loom.json` with SSRF guards (HTTPS by default, no redirects, response-size cap, private-network block by default)
+- Federated sender identity authority checks + remote identity auto-resolution with node-signed identity document verification (`identity_resolve_url` with `{identity}` template support)
 - Federation inbound abuse controls: per-node rate limit + max envelopes per delivery
 - Federation reputation automation: auto-quarantine/auto-deny for repeatedly failing nodes
 - Federation distributed guard support: global inbound rate controls and shared abuse/challenge state via persistence adapter
@@ -134,18 +138,20 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `GET /.well-known/loom.json`
   - `GET /ready`
   - `GET /metrics` (Prometheus format, admin token by default)
-  - `POST /v1/identity`
+  - `POST /v1/identity/challenge` (registration nonce challenge)
+  - `POST /v1/identity` (self-service local-domain identities; remote imports require `imported_remote: true` and admin token when configured)
   - `GET /v1/identity/{encoded_loom_uri}`
+  - `PATCH /v1/identity/{encoded_loom_uri}` (owner-authenticated local identity update/rotation)
   - `POST /v1/auth/challenge`
   - `POST /v1/auth/token`
   - `POST /v1/auth/refresh`
   - `POST /v1/envelopes`
   - `POST /v1/threads/{id}/ops`
-  - `GET /v1/envelopes/{id}`
+  - `GET /v1/envelopes/{id}` (authenticated)
   - `GET /v1/envelopes/{id}/delivery` (authenticated recipient-view delivery wrapper)
   - `GET /v1/threads`
-  - `GET /v1/threads/{id}`
-  - `GET /v1/threads/{id}/envelopes`
+  - `GET /v1/threads/{id}` (authenticated)
+  - `GET /v1/threads/{id}/envelopes` (authenticated)
   - `GET /v1/search?q=...&type=...&intent=...`
   - `GET /v1/audit?limit=...`
   - `POST /v1/bridge/email/inbound`
@@ -216,6 +222,32 @@ Optional persistence:
   - On startup, node hydrates from Postgres first when configured.
 - Set `LOOM_NODE_SIGNING_PRIVATE_KEY_PEM` and `LOOM_NODE_SIGNING_KEY_ID` to enable outbound signed federation delivery.
 - Set `LOOM_MAX_BODY_BYTES` to cap request payload size (default `2097152`).
+- Set `LOOM_IDENTITY_DOMAIN` to override the local identity authority domain used by `POST /v1/identity` local-domain checks (defaults to `LOOM_NODE_ID` host/domain).
+- Set `LOOM_IDENTITY_REQUIRE_PROOF=true` to require registration proof-of-key on self-service identity creation.
+- Set `LOOM_IDENTITY_CHALLENGE_TTL_MS` to control identity challenge expiry (default `120000`).
+- Set `LOOM_REMOTE_IDENTITY_TTL_MS` to control expiry for imported remote identity cache entries (default `86400000`).
+- Federation remote identity resolution controls:
+  - `LOOM_FEDERATION_REMOTE_IDENTITY_RESOLVE_ENABLED=true|false` (default `true`)
+  - `LOOM_FEDERATION_REQUIRE_SIGNED_REMOTE_IDENTITY=true|false` (default `true`)
+  - `LOOM_FEDERATION_REMOTE_IDENTITY_TIMEOUT_MS` (default `5000`)
+  - `LOOM_FEDERATION_REMOTE_IDENTITY_MAX_RESPONSE_BYTES` (default `262144`)
+- Set `LOOM_DEMO_PUBLIC_READS=true` only for non-production demos that need unauthenticated thread/envelope reads (default `false`).
+- Public bind safety checks:
+  - `LOOM_REQUIRE_TLS_PROXY=true` (default) refuses non-loopback bind unless `LOOM_TLS_PROXY_CONFIRMED=true`.
+    - Alternatively, set `LOOM_NATIVE_TLS_ENABLED=true` with native TLS material to serve HTTPS directly.
+  - `LOOM_DEMO_PUBLIC_READS=true` on public bind requires `LOOM_DEMO_PUBLIC_READS_CONFIRMED=true`.
+- Optional native TLS/HTTP2 server mode:
+  - `LOOM_NATIVE_TLS_ENABLED=true|false` (default `false`)
+  - `LOOM_NATIVE_TLS_CERT_PEM` or `LOOM_NATIVE_TLS_CERT_FILE`
+  - `LOOM_NATIVE_TLS_KEY_PEM` or `LOOM_NATIVE_TLS_KEY_FILE`
+  - `LOOM_NATIVE_TLS_ALLOW_HTTP1=true|false` (default `true`)
+  - `LOOM_NATIVE_TLS_MIN_VERSION` (must be `TLSv1.3`, default `TLSv1.3`)
+- Set per-identity anti-abuse quotas (all default `0`, disabled):
+  - `LOOM_ENVELOPE_DAILY_MAX` maximum envelopes ingested per sender identity per UTC day.
+  - `LOOM_THREAD_RECIPIENT_MAX` maximum recipients allowed per envelope.
+  - `LOOM_BLOB_DAILY_COUNT_MAX` maximum blobs created per identity per UTC day.
+  - `LOOM_BLOB_DAILY_BYTES_MAX` maximum completed blob bytes per identity per UTC day.
+  - `LOOM_BLOB_IDENTITY_TOTAL_BYTES_MAX` maximum total completed blob bytes retained per identity.
 - Set blob limits to control attachment abuse ceilings:
   - `LOOM_BLOB_MAX_BYTES` (default `26214400`)
   - `LOOM_BLOB_MAX_PART_BYTES` (default `2097152`)
@@ -223,11 +255,20 @@ Optional persistence:
 - Set `LOOM_RATE_LIMIT_WINDOW_MS`, `LOOM_RATE_LIMIT_DEFAULT_MAX`, and `LOOM_RATE_LIMIT_SENSITIVE_MAX` for API rate limits.
 - Set `LOOM_TRUST_PROXY=true` only when the node is behind a trusted reverse proxy that sets `X-Forwarded-For`.
 - Prefer explicit trusted proxy allowlist with `LOOM_TRUST_PROXY_ALLOWLIST` (comma-separated IP/CIDR values).
+- Set identity rate limits for authenticated actors:
+  - `LOOM_IDENTITY_RATE_LIMIT_WINDOW_MS` (default `60000`)
+  - `LOOM_IDENTITY_RATE_LIMIT_DEFAULT_MAX` (default `2000`)
+  - `LOOM_IDENTITY_RATE_LIMIT_SENSITIVE_MAX` (default `400`)
 - Set `LOOM_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process federation outbox.
 - Set `LOOM_FEDERATION_NODE_RATE_WINDOW_MS` (default `60000`) and `LOOM_FEDERATION_NODE_RATE_MAX` (default `120`) for per-node inbound federation rate limiting.
 - Set `LOOM_FEDERATION_GLOBAL_RATE_WINDOW_MS` (default `60000`) and `LOOM_FEDERATION_GLOBAL_RATE_MAX` (default `1000`) for global inbound federation rate limiting.
 - Set `LOOM_FEDERATION_INBOUND_MAX_ENVELOPES` (default `100`) to cap envelopes accepted per federation delivery.
 - Set `LOOM_FEDERATION_REQUIRE_SIGNED_RECEIPTS=true` to require signed receipt verification for outbound federation delivery.
+- Outbound host allowlists (comma-separated hostnames, suffixes like `.example.com`, or wildcards like `*.example.com`):
+  - `LOOM_FEDERATION_HOST_ALLOWLIST` for federation delivery/outbound federation requests.
+  - `LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST` for node discovery bootstrap fetches.
+  - `LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST` for federated remote identity document fetches.
+  - `LOOM_WEBHOOK_HOST_ALLOWLIST` for webhook callback targets.
 - Optional federation abuse automation:
   - `LOOM_FEDERATION_ABUSE_AUTO_POLICY_ENABLED=true`
   - `LOOM_FEDERATION_ABUSE_WINDOW_MS` (default `300000`)
@@ -256,6 +297,11 @@ Optional persistence:
   - `LOOM_SMTP_DEFAULT_FROM`
   - `LOOM_SMTP_URL` or (`LOOM_SMTP_HOST`, `LOOM_SMTP_PORT`, `LOOM_SMTP_SECURE`, `LOOM_SMTP_USER`, `LOOM_SMTP_PASS`)
   - Optional TLS tuning: `LOOM_SMTP_REQUIRE_TLS`, `LOOM_SMTP_REJECT_UNAUTHORIZED`
+  - Optional DKIM signing:
+    - `LOOM_SMTP_DKIM_DOMAIN_NAME`
+    - `LOOM_SMTP_DKIM_KEY_SELECTOR`
+    - `LOOM_SMTP_DKIM_PRIVATE_KEY_PEM` or `LOOM_SMTP_DKIM_PRIVATE_KEY_FILE`
+    - `LOOM_SMTP_DKIM_HEADER_FIELD_NAMES` (optional override)
 - Optional API send-surface kill switches:
   - `LOOM_BRIDGE_EMAIL_INBOUND_ENABLED=true|false` (default `true`)
   - `LOOM_BRIDGE_EMAIL_SEND_ENABLED=true|false` (default `true`)
@@ -278,7 +324,7 @@ Optional persistence:
 
 Production baseline:
 
-- Run behind TLS/reverse proxy, and set `LOOM_TRUST_PROXY=true` only when that proxy is trusted and controlled by you.
+- Run behind a reverse proxy that enforces TLS 1.3 and HTTP/2 for public traffic (or enable native TLS/HTTP2 mode with TLSv1.3), and set `LOOM_TRUST_PROXY=true` only when that proxy is trusted and controlled by you.
 - Use `LOOM_TRUST_PROXY_ALLOWLIST` so forwarded client IP headers are accepted only from trusted proxy source IP/CIDR ranges.
 - Keep `LOOM_DATA_DIR` and/or PostgreSQL storage on durable infrastructure with backups.
 - Run process under a supervisor (systemd/pm2/container orchestrator) for restart and lifecycle management.
