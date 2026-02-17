@@ -13,6 +13,7 @@ import {
 } from "../src/protocol/crypto.js";
 import { canonicalizeDelegationLink } from "../src/protocol/delegation.js";
 import { validateEnvelopeShape } from "../src/protocol/envelope.js";
+import { isIsoDateTime, isLoomIdentity } from "../src/protocol/ids.js";
 import { LoomStore } from "../src/node/store.js";
 
 function makeEnvelope(overrides = {}) {
@@ -626,4 +627,243 @@ test("thread_op requires capability token for non-owner and consumes single-use 
 
   const listed = store.listCapabilities(threadId, "loom://alice@node.test");
   assert.equal(listed[0].spent, true);
+});
+
+test("identity and timestamp validators enforce canonical protocol format", () => {
+  assert.equal(isLoomIdentity("loom://alice@node.test"), true);
+  assert.equal(isLoomIdentity("loom://Alice@node.test"), false);
+  assert.equal(isLoomIdentity("loom://alice@-node.test"), false);
+
+  assert.equal(isIsoDateTime("2026-02-16T20:00:00Z"), true);
+  assert.equal(isIsoDateTime("2026-02-16T20:00:00.123Z"), true);
+  assert.equal(isIsoDateTime("2026-02-16 20:00:00"), false);
+  assert.equal(isIsoDateTime("2026-02-30T20:00:00Z"), false);
+});
+
+test("envelope validation enforces type-intent consistency and bcc audience mode", () => {
+  const wrongIntent = makeEnvelope({
+    type: "task",
+    content: {
+      human: { text: "bad intent", format: "markdown" },
+      structured: { intent: "message.general@v1", parameters: {} },
+      encrypted: false
+    }
+  });
+  const wrongIntentErrors = validateEnvelopeShape(wrongIntent);
+  assert.equal(
+    wrongIntentErrors.some((error) => error.field === "content.structured.intent"),
+    true
+  );
+
+  const bccWithoutAudience = makeEnvelope({
+    to: [
+      { identity: "loom://bob@node.test", role: "primary" },
+      { identity: "loom://carol@node.test", role: "bcc" }
+    ]
+  });
+  const bccErrors = validateEnvelopeShape(bccWithoutAudience);
+  assert.equal(
+    bccErrors.some((error) => error.field === "audience.mode"),
+    true
+  );
+
+  const bccWithAudience = makeEnvelope({
+    to: [
+      { identity: "loom://bob@node.test", role: "primary" },
+      { identity: "loom://carol@node.test", role: "bcc" }
+    ],
+    audience: {
+      mode: "recipients"
+    }
+  });
+  const bccAudienceErrors = validateEnvelopeShape(bccWithAudience);
+  assert.equal(
+    bccAudienceErrors.some((error) => error.field === "audience.mode"),
+    false
+  );
+});
+
+test("delegation authorization uses server-required action context", () => {
+  const ownerKeys = generateSigningKeyPair();
+  const agentKeys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://owner@node.test",
+    display_name: "Owner",
+    signing_keys: [{ key_id: "k_sign_owner_1", public_key_pem: ownerKeys.publicKeyPem }]
+  });
+  store.registerIdentity({
+    id: "loom://assistant.owner@node.test",
+    type: "agent",
+    display_name: "Assistant",
+    signing_keys: [{ key_id: "k_sign_agent_1", public_key_pem: agentKeys.publicKeyPem }]
+  });
+
+  const delegationWithoutSignature = {
+    id: "dlg_01ARZ3NDEKTSV4RRFFQ69G5FG0",
+    delegator: "loom://owner@node.test",
+    delegate: "loom://assistant.owner@node.test",
+    scope: ["message.general@v1"],
+    created_at: "2026-02-16T21:30:00Z",
+    expires_at: "2027-02-16T21:30:00Z",
+    revocable: true,
+    allow_sub_delegation: false,
+    max_sub_delegation_depth: 0,
+    key_id: "k_sign_owner_1"
+  };
+  const delegation = {
+    ...delegationWithoutSignature,
+    signature: signUtf8Message(ownerKeys.privateKeyPem, canonicalizeDelegationLink(delegationWithoutSignature))
+  };
+
+  const rootEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FG1",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FG2",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://owner@node.test",
+        display: "Owner",
+        key_id: "k_sign_owner_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://assistant.owner@node.test", role: "primary" }],
+      created_at: "2026-02-16T21:31:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "root", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    ownerKeys.privateKeyPem,
+    "k_sign_owner_1"
+  );
+  store.ingestEnvelope(rootEnvelope);
+
+  const capability = store.issueCapabilityToken(
+    {
+      thread_id: rootEnvelope.thread_id,
+      issued_to: "loom://assistant.owner@node.test",
+      grants: ["resolve"]
+    },
+    "loom://owner@node.test"
+  );
+
+  const threadOp = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FG3",
+      thread_id: rootEnvelope.thread_id,
+      parent_id: rootEnvelope.id,
+      type: "thread_op",
+      from: {
+        identity: "loom://assistant.owner@node.test",
+        display: "Assistant",
+        key_id: "k_sign_agent_1",
+        type: "agent",
+        delegation_chain: [delegation]
+      },
+      to: [{ identity: "loom://owner@node.test", role: "primary" }],
+      created_at: "2026-02-16T21:32:00Z",
+      priority: "normal",
+      content: {
+        structured: {
+          intent: "thread.resolve@v1",
+          parameters: {
+            capability_token: capability.id
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    agentKeys.privateKeyPem,
+    "k_sign_agent_1"
+  );
+
+  assert.throws(
+    () =>
+      store.ingestEnvelope(threadOp, {
+        requiredActions: ["thread.op.execute@v1"]
+      }),
+    (error) => error?.code === "DELEGATION_INVALID"
+  );
+});
+
+test("thread canonical order prioritizes rooted messages over orphaned pending-parent envelopes", () => {
+  const keys = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: keys.publicKeyPem }]
+  });
+
+  const threadId = "thr_01ARZ3NDEKTSV4RRFFQ69G5FG4";
+  const orphan = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FG5",
+      thread_id: threadId,
+      parent_id: "env_01ARZ3NDEKTSV4RRFFQ69G5FG6",
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T21:39:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "orphan first", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_1"
+  );
+
+  const root = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FG6",
+      thread_id: threadId,
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-16T21:40:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "root second", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_1"
+  );
+
+  store.ingestEnvelope(orphan);
+  store.ingestEnvelope(root);
+
+  const ordered = store.getThreadEnvelopes(threadId);
+  assert.equal(ordered[0].id, root.id);
+  assert.equal(ordered[1].id, orphan.id);
 });

@@ -19,7 +19,7 @@ import {
 import { validateEnvelopeOrThrow } from "../protocol/envelope.js";
 import { LoomError } from "../protocol/errors.js";
 import { canonicalThreadOrder, validateThreadDag } from "../protocol/thread.js";
-import { isIdentity } from "../protocol/ids.js";
+import { isIdentity, normalizeLoomIdentity } from "../protocol/ids.js";
 import { generateUlid } from "../protocol/ulid.js";
 import {
   verifyDelegationChainOrThrow,
@@ -56,6 +56,7 @@ function isExpiredIso(value) {
 }
 
 function toThreadSummary(thread) {
+  const pendingParentCount = Number(thread.pending_parent_count || 0);
   return {
     id: thread.id,
     root_envelope_id: thread.root_envelope_id,
@@ -66,7 +67,9 @@ function toThreadSummary(thread) {
     participants: thread.participants,
     labels: thread.labels,
     cap_epoch: thread.cap_epoch,
-    encryption: thread.encryption
+    encryption: thread.encryption,
+    pending_parent_count: pendingParentCount,
+    has_pending_parents: pendingParentCount > 0
   };
 }
 
@@ -193,6 +196,19 @@ const THREAD_OP_TO_GRANT = {
   "thread.link@v1": "forward",
   "capability.revoked@v1": "admin",
   "capability.spent@v1": "admin"
+};
+
+const ENVELOPE_TYPE_DELEGATION_ACTIONS = {
+  message: ["message.send@v1", "message.general@v1"],
+  task: ["task.send@v1", "task.general@v1"],
+  approval: ["approval.send@v1", "approval.general@v1"],
+  event: ["event.send@v1", "event.general@v1"],
+  notification: ["notification.send@v1", "notification.general@v1"],
+  handoff: ["handoff.send@v1", "handoff.general@v1"],
+  data: ["data.send@v1", "data.general@v1"],
+  receipt: ["receipt.send@v1", "receipt.general@v1"],
+  workflow: ["workflow.send@v1", "workflow.general@v1"],
+  thread_op: ["thread.op.execute@v1"]
 };
 
 const WEBHOOK_DELIVERY_ACTIONS = new Set([
@@ -361,6 +377,20 @@ export class LoomStore {
     this.publicKeysById = new Map(state.public_keys || []);
     this.envelopesById = new Map((state.envelopes || []).map((item) => [item.id, item]));
     this.threadsById = new Map((state.threads || []).map((item) => [item.id, item]));
+    for (const thread of this.threadsById.values()) {
+      if (Number.isFinite(Number(thread.pending_parent_count))) {
+        thread.pending_parent_count = Math.max(0, Number(thread.pending_parent_count || 0));
+        continue;
+      }
+
+      const pendingCount = Array.isArray(thread.envelope_ids)
+        ? thread.envelope_ids.reduce((count, envelopeId) => {
+            const envelope = this.envelopesById.get(envelopeId);
+            return count + (envelope?.meta?.pending_parent ? 1 : 0);
+          }, 0)
+        : 0;
+      thread.pending_parent_count = pendingCount;
+    }
     this.capabilitiesById = new Map((state.capabilities || []).map((item) => [item.id, item]));
     this.delegationsById = new Map((state.delegations || []).map((item) => [item.id, item]));
     this.revokedDelegationIds = new Set(state.revoked_delegation_ids || []);
@@ -3169,6 +3199,9 @@ export class LoomStore {
         type: "bridge"
       },
       to,
+      audience: {
+        mode: to.some((recipient) => recipient.role === "bcc") ? "recipients" : "thread"
+      },
       created_at: createdAt,
       priority: payload.priority || "normal",
       content: {
@@ -3404,6 +3437,21 @@ export class LoomStore {
     }));
   }
 
+  getVisibleEnvelopeRecipients(envelope, viewerIdentity) {
+    const recipients = Array.isArray(envelope?.to) ? envelope.to : [];
+    if (recipients.length === 0) {
+      return [];
+    }
+
+    const viewerIsSender = envelope?.from?.identity === viewerIdentity;
+    return recipients.filter((recipient) => {
+      if (recipient.role !== "bcc") {
+        return true;
+      }
+      return viewerIsSender || recipient.identity === viewerIdentity;
+    });
+  }
+
   listGatewayImapMessages(folderName, actorIdentity, limit = 100) {
     const normalizedFolder = this.normalizeGatewayFolderName(folderName);
     const cappedLimit = Math.max(1, Math.min(Number(limit || 100), 500));
@@ -3439,7 +3487,7 @@ export class LoomStore {
           subject: thread.subject || "(no subject)",
           from: envelope.from?.identity || null,
           from_email: this.inferEmailFromIdentity(envelope.from?.identity || ""),
-          to: (envelope.to || []).map((recipient) => recipient.identity),
+          to: this.getVisibleEnvelopeRecipients(envelope, actorIdentity).map((recipient) => recipient.identity),
           date: envelope.created_at,
           message_id: messageId,
           in_reply_to: inReplyTo,
@@ -3519,6 +3567,9 @@ export class LoomStore {
         type: "human"
       },
       to,
+      audience: {
+        mode: to.some((recipient) => recipient.role === "bcc") ? "recipients" : "thread"
+      },
       created_at: createdAt,
       priority: payload.priority || "normal",
       content: {
@@ -3875,7 +3926,8 @@ export class LoomStore {
       });
     }
 
-    if (typeof identityDoc.id !== "string" || !identityDoc.id.startsWith("loom://")) {
+    const normalizedIdentity = normalizeLoomIdentity(identityDoc.id);
+    if (!normalizedIdentity) {
       throw new LoomError("ENVELOPE_INVALID", "Identity id must be a loom:// URI", 400, {
         field: "id"
       });
@@ -3898,9 +3950,9 @@ export class LoomStore {
     }
 
     const stored = {
-      id: identityDoc.id,
+      id: normalizedIdentity,
       type: identityDoc.type || "human",
-      display_name: identityDoc.display_name || identityDoc.id,
+      display_name: identityDoc.display_name || normalizedIdentity,
       signing_keys: signingKeys,
       created_at: identityDoc.created_at || nowIso(),
       updated_at: nowIso()
@@ -4583,6 +4635,64 @@ export class LoomStore {
     return token;
   }
 
+  resolveDelegationRequiredActions(envelope) {
+    const type = String(envelope?.type || "").trim();
+    if (!type) {
+      return ["message.send@v1"];
+    }
+
+    if (type === "thread_op") {
+      const intent = String(envelope?.content?.structured?.intent || "").trim();
+      const actions = [...(ENVELOPE_TYPE_DELEGATION_ACTIONS.thread_op || ["thread.op.execute@v1"])];
+      if (intent && THREAD_OP_TO_GRANT[intent]) {
+        actions.unshift(intent);
+      }
+      return Array.from(new Set(actions));
+    }
+
+    const mapped = ENVELOPE_TYPE_DELEGATION_ACTIONS[type];
+    if (Array.isArray(mapped) && mapped.length > 0) {
+      return mapped;
+    }
+
+    return [`${type}.send@v1`];
+  }
+
+  resolvePendingParentsForThread(thread, parentEnvelopeId) {
+    if (!thread || !parentEnvelopeId) {
+      return 0;
+    }
+
+    let resolved = 0;
+    for (const envelopeId of thread.envelope_ids || []) {
+      if (envelopeId === parentEnvelopeId) {
+        continue;
+      }
+
+      const envelope = this.envelopesById.get(envelopeId);
+      if (!envelope || envelope.parent_id !== parentEnvelopeId) {
+        continue;
+      }
+
+      if (!envelope.meta?.pending_parent) {
+        continue;
+      }
+
+      envelope.meta = {
+        ...envelope.meta,
+        pending_parent: false,
+        parent_resolved_at: nowIso()
+      };
+      resolved += 1;
+    }
+
+    if (resolved > 0) {
+      thread.pending_parent_count = Math.max(0, Number(thread.pending_parent_count || 0) - resolved);
+    }
+
+    return resolved;
+  }
+
   prepareThreadOperation(thread, envelope, actorIdentity) {
     const intent = envelope.content?.structured?.intent;
     const parameters = envelope.content?.structured?.parameters || {};
@@ -4788,11 +4898,21 @@ export class LoomStore {
     verifyEnvelopeSignature(envelope, (keyId) => this.resolvePublicKey(keyId));
 
     if (envelope.from?.type === "agent") {
+      const contextRequiredActions = Array.isArray(context.requiredActions)
+        ? context.requiredActions
+        : context.requiredAction
+          ? [context.requiredAction]
+          : [];
+      const requiredActions =
+        contextRequiredActions.length > 0
+          ? Array.from(new Set(contextRequiredActions.map((value) => String(value || "").trim()).filter(Boolean)))
+          : this.resolveDelegationRequiredActions(envelope);
       verifyDelegationChainOrThrow(envelope, {
         resolveIdentity: (identity) => this.resolveIdentity(identity),
         resolvePublicKey: (keyId) => this.resolvePublicKey(keyId),
         isDelegationRevoked: (link) => this.isDelegationRevoked(link),
-        now: nowMs()
+        now: nowMs(),
+        requiredActions
       });
     }
 
@@ -4837,7 +4957,8 @@ export class LoomStore {
           key_epoch: 0
         },
         event_seq_counter: 0,
-        envelope_ids: []
+        envelope_ids: [],
+        pending_parent_count: 0
       };
 
     const operationMutation = envelope.type === "thread_op" ? this.prepareThreadOperation(thread, envelope, actorIdentity) : null;
@@ -4845,6 +4966,9 @@ export class LoomStore {
     const threadSnapshot = !isNewThread ? structuredClone(thread) : null;
 
     const pendingParent = !!(envelope.parent_id && !this.envelopesById.has(envelope.parent_id));
+    if (pendingParent) {
+      thread.pending_parent_count = Number(thread.pending_parent_count || 0) + 1;
+    }
     thread.event_seq_counter += 1;
 
     const storedEnvelope = {
@@ -4914,10 +5038,14 @@ export class LoomStore {
       throw error;
     }
 
+    const resolvedPendingParents = this.resolvePendingParentsForThread(thread, storedEnvelope.id);
+
     this.persistAndAudit("envelope.ingest", {
       envelope_id: storedEnvelope.id,
       thread_id: storedEnvelope.thread_id,
       type: storedEnvelope.type,
+      pending_parent: pendingParent,
+      resolved_pending_parents: resolvedPendingParents,
       actor: actorIdentity
     });
 

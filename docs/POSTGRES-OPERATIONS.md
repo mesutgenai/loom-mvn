@@ -44,6 +44,6 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
 - Current schema version is managed in `loom_meta` (`schema_version`).
 - Any schema change must:
   1. Be additive-first when possible.
-  2. Bump `CURRENT_SCHEMA_VERSION` in `/Users/mesut/Desktop/email++/src/node/persistence_postgres.js`.
+  2. Bump `CURRENT_SCHEMA_VERSION` in `src/node/persistence_postgres.js`.
   3. Keep backward-safe read paths during rollout.
   4. Be covered by backup/restore drill before production deploy.

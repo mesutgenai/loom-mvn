@@ -2333,6 +2333,77 @@ test("API hardens SMTP and IMAP parsing for edge-case address and header formats
   assert.equal(sentMessage.in_reply_to, `<${inbound.body.envelope_id}@node.test>`);
 });
 
+test("API hides BCC recipients from non-sender IMAP recipient views", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  async function registerAndLogin(identity, keyId, keys) {
+    const register = await jsonRequest(`${baseUrl}/v1/identity`, {
+      method: "POST",
+      body: JSON.stringify({
+        id: identity,
+        display_name: identity,
+        signing_keys: [{ key_id: keyId, public_key_pem: keys.publicKeyPem }]
+      })
+    });
+    assert.equal(register.response.status, 201);
+
+    const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId
+      })
+    });
+    assert.equal(challenge.response.status, 200);
+
+    const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+      method: "POST",
+      body: JSON.stringify({
+        identity,
+        key_id: keyId,
+        challenge_id: challenge.body.challenge_id,
+        signature: signUtf8Message(keys.privateKeyPem, challenge.body.nonce)
+      })
+    });
+    assert.equal(token.response.status, 200);
+    return token.body.access_token;
+  }
+
+  const aliceKeys = generateSigningKeyPair();
+  const bobKeys = generateSigningKeyPair();
+  const aliceToken = await registerAndLogin("loom://alice@node.test", "k_sign_alice_bcc_1", aliceKeys);
+  const bobToken = await registerAndLogin("loom://bob@node.test", "k_sign_bob_bcc_1", bobKeys);
+
+  const smtpSubmit = await jsonRequest(`${baseUrl}/v1/gateway/smtp/submit`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${aliceToken}`
+    },
+    body: JSON.stringify({
+      to: ["bob@node.test"],
+      bcc: ["grace@node.test"],
+      text: "bcc privacy test"
+    })
+  });
+  assert.equal(smtpSubmit.response.status, 201, JSON.stringify(smtpSubmit.body));
+
+  const bobSent = await jsonRequest(`${baseUrl}/v1/gateway/imap/folders/Sent/messages?limit=20`, {
+    headers: {
+      authorization: `Bearer ${bobToken}`
+    }
+  });
+  assert.equal(bobSent.response.status, 200);
+  const message = bobSent.body.messages.find((item) => item.envelope_id === smtpSubmit.body.envelope_id);
+  assert.equal(Boolean(message), true);
+  assert.equal(message.to.includes("loom://bob@node.test"), true);
+  assert.equal(message.to.includes("loom://grace@node.test"), false);
+});
+
 test("API supports outbound email relay outbox queue and process", async (t) => {
   const relayCalls = [];
   const mockRelay = {

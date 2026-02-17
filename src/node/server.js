@@ -174,6 +174,25 @@ function methodIs(req, method) {
   return req.method?.toUpperCase() === method;
 }
 
+function resolveDelegationRequiredActionsForRoute(path, envelope) {
+  const type = typeof envelope?.type === "string" ? envelope.type.trim() : "";
+  if (path === "/v1/envelopes") {
+    if (!type) {
+      return ["message.send@v1", "message.general@v1"];
+    }
+    if (type === "thread_op") {
+      return ["thread.op.execute@v1"];
+    }
+    return [`${type}.send@v1`, `${type}.general@v1`];
+  }
+
+  if (path.startsWith("/v1/threads/") && path.endsWith("/ops")) {
+    return ["thread.op.execute@v1"];
+  }
+
+  return [];
+}
+
 function resolveClientIp(req) {
   const forwardedFor = req.headers["x-forwarded-for"];
   if (typeof forwardedFor === "string" && forwardedFor.trim()) {
@@ -1036,11 +1055,20 @@ export function createLoomServer(options = {}) {
       if (methodIs(req, "POST") && path === "/v1/envelopes") {
         const actorIdentity = requireActorIdentity(req, store);
         const envelope = await readJson(req, maxBodyBytes);
+        const requiredActions = Array.from(
+          new Set([
+            ...resolveDelegationRequiredActionsForRoute(path, envelope),
+            ...store.resolveDelegationRequiredActions(envelope)
+          ])
+        );
         const idempotency = createIdempotencyContext(req, store, actorIdentity, method, path, envelope);
         if (maybeSendIdempotentReplay(res, idempotency)) {
           return;
         }
-        const stored = store.ingestEnvelope(envelope, { actorIdentity });
+        const stored = store.ingestEnvelope(envelope, {
+          actorIdentity,
+          requiredActions
+        });
         storeIdempotentResult(store, idempotency, 201, stored);
         sendJson(res, 201, stored);
         return;
@@ -1050,6 +1078,12 @@ export function createLoomServer(options = {}) {
         const actorIdentity = requireActorIdentity(req, store);
         const threadId = path.slice("/v1/threads/".length, -"/ops".length);
         const envelope = await readJson(req, maxBodyBytes);
+        const requiredActions = Array.from(
+          new Set([
+            ...resolveDelegationRequiredActionsForRoute(path, envelope),
+            ...store.resolveDelegationRequiredActions(envelope)
+          ])
+        );
 
         if (!envelope.thread_id) {
           throw new LoomError("ENVELOPE_INVALID", "Signed thread_op envelopes must include thread_id", 400, {
@@ -1075,7 +1109,10 @@ export function createLoomServer(options = {}) {
         if (maybeSendIdempotentReplay(res, idempotency)) {
           return;
         }
-        const stored = store.ingestEnvelope(envelope, { actorIdentity });
+        const stored = store.ingestEnvelope(envelope, {
+          actorIdentity,
+          requiredActions
+        });
         storeIdempotentResult(store, idempotency, 201, stored);
         sendJson(res, 201, stored);
         return;

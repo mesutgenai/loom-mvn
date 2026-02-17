@@ -11,6 +11,15 @@ function compareEnvelopeOrder(a, b) {
   return a.id.localeCompare(b.id);
 }
 
+function compareQueueIds(idA, idB, byId, orphanSet) {
+  const aOrphan = orphanSet.has(idA);
+  const bOrphan = orphanSet.has(idB);
+  if (aOrphan !== bOrphan) {
+    return aOrphan ? 1 : -1;
+  }
+  return compareEnvelopeOrder(byId.get(idA), byId.get(idB));
+}
+
 export function analyzeThreadGraph(envelopes) {
   const byId = new Map();
   for (const envelope of envelopes) {
@@ -46,11 +55,14 @@ export function analyzeThreadGraph(envelopes) {
     childIds.sort((idA, idB) => compareEnvelopeOrder(byId.get(idA), byId.get(idB)));
   }
 
+  orphanIds.sort((idA, idB) => compareEnvelopeOrder(byId.get(idA), byId.get(idB)));
+
   return { byId, childrenByParent, indegree, orphanIds };
 }
 
 export function validateThreadDag(envelopes) {
   const { byId, childrenByParent, indegree, orphanIds } = analyzeThreadGraph(envelopes);
+  const orphanSet = new Set(orphanIds);
 
   const queue = [];
   for (const [id, degree] of indegree.entries()) {
@@ -59,7 +71,7 @@ export function validateThreadDag(envelopes) {
     }
   }
 
-  queue.sort((idA, idB) => compareEnvelopeOrder(byId.get(idA), byId.get(idB)));
+  queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
 
   let seen = 0;
   while (queue.length > 0) {
@@ -74,7 +86,7 @@ export function validateThreadDag(envelopes) {
       }
     }
 
-    queue.sort((idA, idB) => compareEnvelopeOrder(byId.get(idA), byId.get(idB)));
+    queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
   }
 
   const hasCycle = seen !== envelopes.length;
@@ -98,7 +110,8 @@ export function assertThreadDagOrThrow(envelopes) {
 }
 
 export function canonicalThreadOrder(envelopes) {
-  const { byId, childrenByParent, indegree } = analyzeThreadGraph(envelopes);
+  const { byId, childrenByParent, indegree, orphanIds } = analyzeThreadGraph(envelopes);
+  const orphanSet = new Set(orphanIds);
 
   const queue = [];
   for (const [id, degree] of indegree.entries()) {
@@ -107,7 +120,7 @@ export function canonicalThreadOrder(envelopes) {
     }
   }
 
-  queue.sort((idA, idB) => compareEnvelopeOrder(byId.get(idA), byId.get(idB)));
+  queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
 
   const ordered = [];
 
@@ -123,7 +136,7 @@ export function canonicalThreadOrder(envelopes) {
       }
     }
 
-    queue.sort((idA, idB) => compareEnvelopeOrder(byId.get(idA), byId.get(idB)));
+    queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
   }
 
   if (ordered.length !== envelopes.length) {

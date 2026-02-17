@@ -1,5 +1,6 @@
 import {
   AUDIENCE_MODES,
+  ENVELOPE_TYPES,
   IDENTITY_TYPES,
   LOOM_VERSION,
   PRIORITIES,
@@ -101,6 +102,25 @@ function validateAudience(audience, errors) {
   }
 }
 
+function validateRecipientAudienceConsistency(to, audience, errors) {
+  if (!Array.isArray(to) || to.length === 0) {
+    return;
+  }
+
+  const hasBcc = to.some((recipient) => recipient?.role === "bcc");
+  if (!hasBcc) {
+    return;
+  }
+
+  if (!audience || audience.mode !== "recipients") {
+    pushError(
+      errors,
+      "audience.mode",
+      "bcc recipients require audience.mode=\"recipients\" for privacy-safe recipient views"
+    );
+  }
+}
+
 function validateContent(content, errors) {
   if (!content || typeof content !== "object") {
     pushError(errors, "content", "content object is required");
@@ -139,6 +159,47 @@ function validateContent(content, errors) {
     if (typeof content.structured.intent !== "string" || content.structured.intent.length === 0) {
       pushError(errors, "content.structured.intent", "must be a non-empty string");
     }
+  }
+}
+
+const INTENT_PREFIXES_BY_TYPE = {
+  message: ["message."],
+  task: ["task."],
+  approval: ["approval."],
+  event: ["event."],
+  notification: ["notification."],
+  handoff: ["handoff."],
+  data: ["data."],
+  receipt: ["receipt."],
+  workflow: ["workflow."],
+  thread_op: ["thread.", "capability."]
+};
+
+function validateTypeIntentConsistency(envelope, errors) {
+  const type = typeof envelope?.type === "string" ? envelope.type.trim() : "";
+  const structuredIntent =
+    typeof envelope?.content?.structured?.intent === "string"
+      ? envelope.content.structured.intent.trim()
+      : "";
+
+  if (!type || !structuredIntent) {
+    if (type === "thread_op" && !structuredIntent) {
+      pushError(errors, "content.structured.intent", "thread_op requires a structured intent");
+    }
+    return;
+  }
+
+  const allowedPrefixes = INTENT_PREFIXES_BY_TYPE[type];
+  if (!allowedPrefixes || allowedPrefixes.length === 0) {
+    return;
+  }
+
+  if (!allowedPrefixes.some((prefix) => structuredIntent.startsWith(prefix))) {
+    pushError(
+      errors,
+      "content.structured.intent",
+      `must match envelope type "${type}" (${allowedPrefixes.join(" or ")})`
+    );
   }
 }
 
@@ -217,11 +278,14 @@ export function validateEnvelopeShape(envelope) {
 
   if (typeof envelope.type !== "string" || envelope.type.length === 0) {
     pushError(errors, "type", "must be a non-empty string");
+  } else if (!ENVELOPE_TYPES.has(envelope.type)) {
+    pushError(errors, "type", "must be one of the protocol envelope types");
   }
 
   validateSender(envelope.from, errors);
   validateRecipients(envelope.to, errors);
   validateAudience(envelope.audience, errors);
+  validateRecipientAudienceConsistency(envelope.to, envelope.audience, errors);
 
   if (!isIsoDateTime(envelope.created_at)) {
     pushError(errors, "created_at", "must be an ISO-8601 timestamp");
@@ -236,6 +300,7 @@ export function validateEnvelopeShape(envelope) {
   }
 
   validateContent(envelope.content, errors);
+  validateTypeIntentConsistency(envelope, errors);
   validateAttachments(envelope.attachments, errors);
   validateSignature(envelope.signature, errors);
 

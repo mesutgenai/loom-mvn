@@ -1,9 +1,25 @@
 import { canonicalizeJson } from "./canonical.js";
 import { LoomError } from "./errors.js";
-import { isIdentity } from "./ids.js";
+import { isIdentity, isIsoDateTime } from "./ids.js";
 import { verifyUtf8MessageSignature } from "./crypto.js";
 
+const ENVELOPE_TYPE_ACTIONS = {
+  message: "message.send@v1",
+  task: "task.send@v1",
+  approval: "approval.send@v1",
+  event: "event.send@v1",
+  notification: "notification.send@v1",
+  handoff: "handoff.send@v1",
+  data: "data.send@v1",
+  receipt: "receipt.send@v1",
+  workflow: "workflow.send@v1",
+  thread_op: "thread.op.execute@v1"
+};
+
 function parseIsoTime(value) {
+  if (!isIsoDateTime(value)) {
+    return null;
+  }
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -65,6 +81,26 @@ function normalizeAction(action) {
   return Array.from(new Set([normalized, noVersion]));
 }
 
+function normalizeActionList(actions) {
+  if (actions == null) {
+    return [];
+  }
+
+  const list = Array.isArray(actions) ? actions : [actions];
+  const normalized = [];
+  for (const entry of list) {
+    if (typeof entry !== "string") {
+      continue;
+    }
+    const trimmed = entry.trim();
+    if (!trimmed) {
+      continue;
+    }
+    normalized.push(trimmed);
+  }
+  return Array.from(new Set(normalized));
+}
+
 function scopePatternSubset(child, parent) {
   if (parent === "*") {
     return true;
@@ -100,14 +136,28 @@ export function scopeAllowsAction(scopeList, action) {
   return scopes.some((pattern) => actionCandidates.some((candidate) => scopePatternAllowsAction(pattern, candidate)));
 }
 
-export function resolveEnvelopeAction(envelope) {
-  const structuredIntent = envelope?.content?.structured?.intent;
-  if (typeof structuredIntent === "string" && structuredIntent.trim().length > 0) {
-    return structuredIntent.trim();
+function resolveEnvelopeActions(envelope, options = {}) {
+  const explicit = normalizeActionList(options.requiredActions || options.requiredAction);
+  if (explicit.length > 0) {
+    return explicit;
   }
 
-  const fallbackType = String(envelope?.type || "message").trim();
-  return `${fallbackType}.send@v1`;
+  const envelopeType = String(envelope?.type || "").trim();
+  const mapped = ENVELOPE_TYPE_ACTIONS[envelopeType];
+  if (mapped) {
+    return [mapped];
+  }
+
+  if (envelopeType.length > 0) {
+    return [`${envelopeType}.send@v1`];
+  }
+
+  return [];
+}
+
+export function resolveEnvelopeAction(envelope, options = {}) {
+  const actions = resolveEnvelopeActions(envelope, options);
+  return actions.length > 0 ? actions[0] : null;
 }
 
 function resolveDelegatorSigningKey(link, resolveIdentity, resolvePublicKey) {
@@ -269,11 +319,18 @@ export function verifyDelegationChainOrThrow(envelope, options = {}) {
     });
   }
 
-  const action = resolveEnvelopeAction(envelope);
-  if (!scopeAllowsAction(leaf.scope, action)) {
+  const requiredActions = resolveEnvelopeActions(envelope, options);
+  if (requiredActions.length === 0) {
+    throw new LoomError("DELEGATION_INVALID", "Delegation verification requires at least one server-derived action", 403, {
+      sender: envelope?.from?.identity || null
+    });
+  }
+
+  const allowed = requiredActions.some((action) => scopeAllowsAction(leaf.scope, action));
+  if (!allowed) {
     throw new LoomError("DELEGATION_INVALID", "Delegation scope does not permit envelope action", 403, {
       sender: envelope.from.identity,
-      action
+      required_actions: requiredActions
     });
   }
 
