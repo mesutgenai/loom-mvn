@@ -2,6 +2,25 @@
 
 This repository tracks **LOOM** (Linked Operations & Orchestrated Messaging).
 
+## Quick start
+
+Clone and run locally:
+
+```bash
+git clone https://github.com/mesutgenai/loom-mvn.git
+cd loom-mvn
+npm install
+npm start
+```
+
+Then open:
+
+- Live console UI: `http://127.0.0.1:8787/`
+- Ready check: `http://127.0.0.1:8787/ready`
+- Node document: `http://127.0.0.1:8787/.well-known/loom.json`
+
+For full account setup and send/receive walkthrough, jump to `Guided local setup (server + accounts + email)` below.
+
 ## Why This Exists
 
 Email infrastructure was designed for human-to-human messages in the 1980s protocol model (SMTP + MIME + IMAP folders). It still works for people, but agent workflows have different requirements:
@@ -93,7 +112,9 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 
 ## Current status
 
-- Current release is `v0.2.7` (see `CHANGELOG.md` for release-level change history).
+- Current release tag is `v0.2.7` (see `CHANGELOG.md` for release-level change history).
+- Repository package version is `0.2.7` (`package.json`).
+- npm publication is intentionally disabled (`"private": true`), so versioning is tracked in git tags/changelog rather than npm registry releases.
 - Protocol design docs are available in:
   - `CHANGELOG.md`
   - `LOOM-protocol-design.md`
@@ -236,6 +257,17 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `POST /v1/admin/persistence/restore` (admin token required, `confirm=restore`)
 
 ## Run
+
+From a fresh machine:
+
+```bash
+git clone https://github.com/mesutgenai/loom-mvn.git
+cd loom-mvn
+npm install
+npm start
+```
+
+If you are already in the repository:
 
 ```bash
 npm start
