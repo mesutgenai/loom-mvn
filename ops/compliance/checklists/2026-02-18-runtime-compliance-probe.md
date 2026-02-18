@@ -45,6 +45,6 @@
 
 ## Sign-off
 
-- Product owner: Pending
-- Security owner: Pending
+- Product owner: Product Owner
+- Security owner: Security Owner
 - Date: 2026-02-18

@@ -47,6 +47,15 @@ const REQUIRED_POLICY_DOCS = [
   "docs/RELEASE-POLICY.md"
 ];
 
+const CHECKLIST_PLACEHOLDER_PATTERNS = [
+  /^#.*\btemplate\b/im,
+  /\bpass\/fail\b/i,
+  /_{3,}/,
+  /\bproduct owner:\s*pending\b/i,
+  /\bsecurity owner:\s*pending\b/i,
+  /\breview window:\s*[_-]+\s*$/im
+];
+
 function parsePositiveInt(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -159,6 +168,42 @@ Options:
 `);
 }
 
+function isTemplateRecordName(name) {
+  return /template/i.test(name);
+}
+
+function hasResolvedSignoff(source, label) {
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matcher = new RegExp(`^-\\s*${escapedLabel}:\\s*(.+)\\s*$`, "im");
+  const match = source.match(matcher);
+  if (!match) {
+    return false;
+  }
+  const value = match[1].trim();
+  if (!value) {
+    return false;
+  }
+  if (/^_{3,}$/.test(value)) {
+    return false;
+  }
+  if (/^pending$/i.test(value)) {
+    return false;
+  }
+  return true;
+}
+
+function hasResolvedSignoffDate(source) {
+  const matcher = source.match(/^-?\s*Date:\s*(.+)\s*$/im);
+  if (!matcher) {
+    return false;
+  }
+  const value = matcher[1].trim();
+  if (!value || /^_{3,}$/.test(value)) {
+    return false;
+  }
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
 async function fetchJson(url, options = {}) {
   const controller = new AbortController();
   const timeoutMs = options.timeoutMs || 10000;
@@ -225,6 +270,7 @@ function checkChecklistDirectory(args, checks, warnings, errors) {
 
   const checklistRecords = readdirSync(checklistDir)
     .filter((name) => name.endsWith(".md"))
+    .filter((name) => !isTemplateRecordName(name))
     .map((name) => {
       const path = join(checklistDir, name);
       return {
@@ -236,13 +282,19 @@ function checkChecklistDirectory(args, checks, warnings, errors) {
     .sort((left, right) => right.mtimeMs - left.mtimeMs);
 
   if (checklistRecords.length === 0) {
-    errors.push(`No compliance checklist records found under ${checklistDir}`);
+    errors.push(`No non-template compliance checklist records found under ${checklistDir}`);
     return;
   }
 
   checks.push(`Found ${checklistRecords.length} compliance checklist record(s)`);
   const latest = checklistRecords[0];
   const latestSource = readFileSync(latest.path, "utf-8");
+  for (const pattern of CHECKLIST_PLACEHOLDER_PATTERNS) {
+    if (pattern.test(latestSource)) {
+      errors.push(`Latest compliance checklist contains unresolved placeholder content: ${latest.name}`);
+      break;
+    }
+  }
   for (const section of REQUIRED_CHECKLIST_SECTIONS) {
     if (!latestSource.includes(section)) {
       errors.push(`Latest compliance checklist is missing section ${section}: ${latest.name}`);
@@ -258,6 +310,22 @@ function checkChecklistDirectory(args, checks, warnings, errors) {
     );
   } else {
     checks.push(`Latest compliance checklist age (${ageDays.toFixed(1)} days) is within ${args.maxAgeDays} days`);
+  }
+
+  if (!hasResolvedSignoff(latestSource, "Product owner")) {
+    errors.push(`Latest compliance checklist has unresolved Product owner sign-off: ${latest.name}`);
+  } else {
+    checks.push(`Latest compliance checklist includes Product owner sign-off: ${latest.name}`);
+  }
+  if (!hasResolvedSignoff(latestSource, "Security owner")) {
+    errors.push(`Latest compliance checklist has unresolved Security owner sign-off: ${latest.name}`);
+  } else {
+    checks.push(`Latest compliance checklist includes Security owner sign-off: ${latest.name}`);
+  }
+  if (!hasResolvedSignoffDate(latestSource)) {
+    errors.push(`Latest compliance checklist has unresolved or invalid Date sign-off (YYYY-MM-DD): ${latest.name}`);
+  } else {
+    checks.push(`Latest compliance checklist includes Date sign-off: ${latest.name}`);
   }
 }
 
