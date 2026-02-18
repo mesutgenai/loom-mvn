@@ -248,6 +248,225 @@ Server defaults:
 - Live console UI: `http://127.0.0.1:8787/`
 - Node document: `http://127.0.0.1:8787/.well-known/loom.json`
 
+### Guided local setup (server + accounts + email)
+
+This walkthrough is intentionally step-by-step so you can run and inspect each phase.
+
+1) Install dependencies (Node 22+ required):
+
+```bash
+npm install
+```
+
+2) Create a local env file (dev-safe defaults):
+
+```bash
+cat > .env.local <<'EOF'
+HOST=127.0.0.1
+PORT=8787
+LOOM_NODE_ID=node.test
+LOOM_DOMAIN=127.0.0.1:8787
+LOOM_SMTP_MODE=stream
+LOOM_SMTP_DEFAULT_FROM=no-reply@node.test
+EOF
+```
+
+3) Start the server in one terminal:
+
+```bash
+set -a
+source .env.local
+set +a
+npm start
+```
+
+4) Check readiness from another terminal:
+
+```bash
+curl -sS http://127.0.0.1:8787/ready
+```
+
+5) Create two local agent accounts (identities + signing keys):
+
+```bash
+BASE_URL="http://127.0.0.1:8787"
+WORK="${TMPDIR:-/tmp}/loom-quickstart-$(date +%s)"
+mkdir -p "$WORK"
+
+WORK="$WORK" node --input-type=module <<'NODE'
+import { mkdirSync, writeFileSync } from "node:fs";
+import { generateSigningKeyPair } from "./src/protocol/crypto.js";
+
+const work = process.env.WORK;
+mkdirSync(work, { recursive: true });
+
+const actors = [
+  { name: "alice", identity: "loom://alice@node.test", display: "Alice", keyId: "k_sign_alice_1" },
+  { name: "bob", identity: "loom://bob@node.test", display: "Bob", keyId: "k_sign_bob_1" }
+];
+
+for (const actor of actors) {
+  const { publicKeyPem, privateKeyPem } = generateSigningKeyPair();
+  writeFileSync(`${work}/${actor.name}.private.pem`, privateKeyPem);
+  writeFileSync(
+    `${work}/${actor.name}.identity.json`,
+    JSON.stringify(
+      {
+        id: actor.identity,
+        display_name: actor.display,
+        signing_keys: [{ key_id: actor.keyId, public_key_pem: publicKeyPem }]
+      },
+      null,
+      2
+    )
+  );
+}
+NODE
+
+curl -sS -X POST "$BASE_URL/v1/identity" \
+  -H 'content-type: application/json' \
+  --data @"$WORK/alice.identity.json" > "$WORK/alice.identity.response.json"
+
+curl -sS -X POST "$BASE_URL/v1/identity" \
+  -H 'content-type: application/json' \
+  --data @"$WORK/bob.identity.json" > "$WORK/bob.identity.response.json"
+```
+
+6) Authenticate both accounts (challenge -> signed nonce -> token):
+
+```bash
+curl -sS -X POST "$BASE_URL/v1/auth/challenge" \
+  -H 'content-type: application/json' \
+  --data '{"identity":"loom://alice@node.test","key_id":"k_sign_alice_1"}' > "$WORK/alice.challenge.json"
+
+curl -sS -X POST "$BASE_URL/v1/auth/challenge" \
+  -H 'content-type: application/json' \
+  --data '{"identity":"loom://bob@node.test","key_id":"k_sign_bob_1"}' > "$WORK/bob.challenge.json"
+
+WORK="$WORK" node --input-type=module <<'NODE'
+import { readFileSync, writeFileSync } from "node:fs";
+import { signUtf8Message } from "./src/protocol/crypto.js";
+
+const work = process.env.WORK;
+
+function buildTokenRequest(name, identity, keyId) {
+  const challenge = JSON.parse(readFileSync(`${work}/${name}.challenge.json`, "utf8"));
+  const privateKeyPem = readFileSync(`${work}/${name}.private.pem`, "utf8");
+  const payload = {
+    identity,
+    key_id: keyId,
+    challenge_id: challenge.challenge_id,
+    signature: signUtf8Message(privateKeyPem, challenge.nonce)
+  };
+  writeFileSync(`${work}/${name}.token.request.json`, JSON.stringify(payload, null, 2));
+}
+
+buildTokenRequest("alice", "loom://alice@node.test", "k_sign_alice_1");
+buildTokenRequest("bob", "loom://bob@node.test", "k_sign_bob_1");
+NODE
+
+curl -sS -X POST "$BASE_URL/v1/auth/token" \
+  -H 'content-type: application/json' \
+  --data @"$WORK/alice.token.request.json" > "$WORK/alice.token.json"
+
+curl -sS -X POST "$BASE_URL/v1/auth/token" \
+  -H 'content-type: application/json' \
+  --data @"$WORK/bob.token.request.json" > "$WORK/bob.token.json"
+
+ALICE_TOKEN="$(node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(j.access_token)" "$WORK/alice.token.json")"
+BOB_TOKEN="$(node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(j.access_token)" "$WORK/bob.token.json")"
+```
+
+7) Send a signed LOOM envelope from Alice to Bob:
+
+```bash
+WORK="$WORK" node --input-type=module <<'NODE'
+import { readFileSync, writeFileSync } from "node:fs";
+import { signEnvelope } from "./src/protocol/crypto.js";
+import { generateUlid } from "./src/protocol/ulid.js";
+
+const work = process.env.WORK;
+const privateKeyPem = readFileSync(`${work}/alice.private.pem`, "utf8");
+const threadId = `thr_${generateUlid()}`;
+
+const envelope = signEnvelope(
+  {
+    loom: "1.1",
+    id: `env_${generateUlid()}`,
+    thread_id: threadId,
+    parent_id: null,
+    type: "message",
+    from: {
+      identity: "loom://alice@node.test",
+      display: "Alice",
+      key_id: "k_sign_alice_1",
+      type: "agent"
+    },
+    to: [{ identity: "loom://bob@node.test", role: "primary" }],
+    created_at: new Date().toISOString(),
+    priority: "normal",
+    content: {
+      human: { text: "Hello Bob from Alice", format: "markdown" },
+      structured: { intent: "message.general@v1", parameters: {} },
+      encrypted: false
+    },
+    attachments: []
+  },
+  privateKeyPem,
+  "k_sign_alice_1"
+);
+
+writeFileSync(`${work}/alice-to-bob.envelope.json`, JSON.stringify(envelope, null, 2));
+NODE
+
+curl -sS -X POST "$BASE_URL/v1/envelopes" \
+  -H "authorization: Bearer $ALICE_TOKEN" \
+  -H 'content-type: application/json' \
+  --data @"$WORK/alice-to-bob.envelope.json" > "$WORK/send.response.json"
+
+THREAD_ID="$(node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(j.thread_id)" "$WORK/send.response.json")"
+ENVELOPE_ID="$(node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(j.id)" "$WORK/send.response.json")"
+```
+
+8) Verify Bob can read the thread:
+
+```bash
+curl -sS "$BASE_URL/v1/threads/$THREAD_ID/envelopes" \
+  -H "authorization: Bearer $BOB_TOKEN" > "$WORK/bob.thread.json"
+
+node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));console.log('thread_id=',j.thread_id,'envelopes=',(j.envelopes||[]).length)" "$WORK/bob.thread.json"
+```
+
+9) Send that envelope out through the email relay:
+
+```bash
+curl -sS -X POST "$BASE_URL/v1/bridge/email/send" \
+  -H "authorization: Bearer $ALICE_TOKEN" \
+  -H 'content-type: application/json' \
+  --data "{\"envelope_id\":\"$ENVELOPE_ID\",\"to_email\":[\"bob@example.net\"],\"smtp_from\":\"no-reply@node.test\"}" \
+  > "$WORK/email.send.response.json"
+
+cat "$WORK/email.send.response.json"
+```
+
+Notes:
+- `LOOM_SMTP_MODE=stream` is for local testing; it validates the flow without delivering to a real external mailbox.
+- For real outbound delivery, switch to `LOOM_SMTP_MODE=smtp` and set SMTP provider credentials (`LOOM_SMTP_HOST`, `LOOM_SMTP_PORT`, `LOOM_SMTP_USER`, `LOOM_SMTP_PASS`, optionally `LOOM_SMTP_SECURE`).
+
+10) Optional gateway-style test (SMTP submit + IMAP view via API):
+
+```bash
+curl -sS -X POST "$BASE_URL/v1/gateway/smtp/submit" \
+  -H "authorization: Bearer $ALICE_TOKEN" \
+  -H 'content-type: application/json' \
+  --data '{"to":["bob@node.test"],"text":"hello via gateway api"}'
+
+curl -sS "$BASE_URL/v1/gateway/imap/folders/INBOX/messages?limit=10" \
+  -H "authorization: Bearer $BOB_TOKEN"
+```
+
+There is no separate mailbox provisioning step for local identities. If an identity exists as `loom://alice@node.test`, gateway-style email addressing resolves as `alice@node.test`.
+
 Optional persistence:
 
 - Set `LOOM_DATA_DIR=/absolute/path` to persist state and audit log between restarts.
