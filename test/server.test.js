@@ -126,6 +126,27 @@ test("API serves LOOM live dashboard at root path", async (t) => {
   assert.match(page.body, /LOOM Live Console/);
 });
 
+test("API emits x-loom-request-id and honors valid incoming request IDs", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const withProvided = await jsonRequest(`${baseUrl}/health`, {
+    headers: {
+      "x-request-id": "trace-client-abc123"
+    }
+  });
+  assert.equal(withProvided.response.status, 200);
+  assert.equal(withProvided.response.headers.get("x-loom-request-id"), "trace-client-abc123");
+
+  const generated = await jsonRequest(`${baseUrl}/health`);
+  assert.equal(generated.response.status, 200);
+  assert.match(generated.response.headers.get("x-loom-request-id") || "", /^req_[a-f0-9-]+$/i);
+});
+
 test("API can serve over native TLS HTTP/2", async (t) => {
   const { server } = createLoomServer({
     nodeId: "node.test",

@@ -226,7 +226,7 @@ test("wire SMTP gateway accepts AUTH and submits envelope into store", async (t)
   assert.equal(envelopes[0].from.identity, "loom://alice@node.test");
 });
 
-test("wire SMTP gateway rejects SMTPUTF8 ESMTP parameter", async (t) => {
+test("wire SMTP gateway supports SMTPUTF8 ESMTP parameter for gateway-compatible flows", async (t) => {
   const store = new LoomStore({ nodeId: "node.test" });
   const keys = generateSigningKeyPair();
   const token = createIdentityAndToken(store, "loom://alice@node.test", "k_sign_alice_1", keys);
@@ -257,19 +257,36 @@ test("wire SMTP gateway rejects SMTPUTF8 ESMTP parameter", async (t) => {
   await waitFor((line) => line.startsWith("220 "));
 
   socket.write("EHLO localhost\r\n");
+  await waitFor((line) => line.includes("SMTPUTF8"));
   await waitFor((line) => line.startsWith("250 SIZE "));
 
   const plain = Buffer.from(`\u0000loom://alice@node.test\u0000${token}`, "utf-8").toString("base64");
   socket.write(`AUTH PLAIN ${plain}\r\n`);
   await waitFor((line) => line.startsWith("235 "));
 
-  socket.write("MAIL FROM:<alice@node.test> SMTPUTF8\r\n");
-  await waitFor((line) => line.startsWith("504 5.5.4 SMTPUTF8 not supported"));
-
-  socket.write("MAIL FROM:<alice@node.test>\r\n");
+  socket.write("MAIL FROM:<alice@node.test> SMTPUTF8 BODY=8BITMIME\r\n");
   await waitFor((line) => line.startsWith("250 "));
   socket.write("RCPT TO:<bob@node.test> SMTPUTF8\r\n");
-  await waitFor((line) => line.startsWith("504 5.5.4 SMTPUTF8 not supported"));
+  await waitFor((line) => line.startsWith("250 "));
+
+  socket.write("DATA\r\n");
+  await waitFor((line) => line.startsWith("354 "));
+
+  socket.write("Subject: Wire SMTPUTF8 Test\r\n");
+  socket.write("To: bob@node.test\r\n");
+  socket.write("\r\n");
+  socket.write("Merhaba dünyadan selam\r\n");
+  socket.write(".\r\n");
+  await waitFor((line) => line.startsWith("250 "));
+
+  socket.write("QUIT\r\n");
+  await waitFor((line) => line.startsWith("221 "));
+
+  const threads = store.listThreads();
+  assert.equal(threads.length, 1);
+  const envelopes = store.getThreadEnvelopes(threads[0].id);
+  assert.equal(envelopes.length, 1);
+  assert.match(envelopes[0].content?.human?.text || "", /Merhaba/);
 });
 
 test("wire IMAP gateway supports LOGIN LIST SELECT FETCH flow", async (t) => {
@@ -566,6 +583,9 @@ test("wire IMAP gateway supports STARTTLS and extended mailbox commands", async 
   tlsSocket.write("a3 CAPABILITY\r\n");
   const capabilityLine = await waitForTls((line) => line.startsWith("* CAPABILITY "));
   assert.equal(capabilityLine.includes("STARTTLS"), false);
+  assert.equal(capabilityLine.includes("IDLE"), true);
+  assert.equal(capabilityLine.includes("MOVE"), true);
+  assert.equal(capabilityLine.includes("UNSELECT"), true);
   await waitForTls((line) => line.startsWith("a3 OK"));
 
   tlsSocket.write(`a4 LOGIN "loom://alice@node.test" "${token}"\r\n`);
@@ -592,14 +612,17 @@ test("wire IMAP gateway supports STARTTLS and extended mailbox commands", async 
   await waitForTls((line) => line.includes("FETCH (FLAGS (\\Seen"));
   await waitForTls((line) => line.startsWith("a9 OK"));
 
-  tlsSocket.write("a10 SEARCH UNSEEN\r\n");
+  tlsSocket.write("a10 EXPUNGE\r\n");
+  await waitForTls((line) => line.startsWith("a10 OK EXPUNGE completed"));
+
+  tlsSocket.write("a11 SEARCH UNSEEN\r\n");
   const unseenAfter = await waitForTls((line) => line.startsWith("* SEARCH"));
   assert.equal(unseenAfter.trim(), "* SEARCH");
-  await waitForTls((line) => line.startsWith("a10 OK"));
-
-  tlsSocket.write("a11 LOGOUT\r\n");
-  await waitForTls((line) => line.startsWith("* BYE"));
   await waitForTls((line) => line.startsWith("a11 OK"));
+
+  tlsSocket.write("a12 LOGOUT\r\n");
+  await waitForTls((line) => line.startsWith("* BYE"));
+  await waitForTls((line) => line.startsWith("a12 OK"));
 });
 
 test("wire gateway enforces global connection cap across SMTP and IMAP", async (t) => {

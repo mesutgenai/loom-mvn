@@ -671,6 +671,8 @@ function createSmtpGatewayServer(options) {
       if (startTlsEnabled && tlsContext && !state.secure) {
         capabilities.push("STARTTLS");
       }
+      capabilities.push("8BITMIME");
+      capabilities.push("SMTPUTF8");
       capabilities.push(`SIZE ${maxMessageBytes}`);
 
       writeLine(`250-${host}`);
@@ -958,10 +960,6 @@ function createSmtpGatewayServer(options) {
           return;
         }
         const from = parseSmtpPathWithParams(fromMatch[1]);
-        if (from.parameters.some((parameter) => String(parameter).trim().toUpperCase() === "SMTPUTF8")) {
-          writeLine("504 5.5.4 SMTPUTF8 not supported");
-          return;
-        }
         const fromAddress = from.address;
         if (!fromAddress) {
           writeLine("501 5.5.2 invalid sender");
@@ -984,10 +982,6 @@ function createSmtpGatewayServer(options) {
           return;
         }
         const to = parseSmtpPathWithParams(toMatch[1]);
-        if (to.parameters.some((parameter) => String(parameter).trim().toUpperCase() === "SMTPUTF8")) {
-          writeLine("504 5.5.4 SMTPUTF8 not supported");
-          return;
-        }
         const recipient = to.address;
         if (!recipient) {
           writeLine("501 5.5.2 invalid recipient");
@@ -1094,7 +1088,7 @@ function createImapGatewayServer(options) {
     };
 
     const capabilityTokens = () => {
-      const caps = ["IMAP4rev1", "UIDPLUS", "NAMESPACE", "ID"];
+      const caps = ["IMAP4rev1", "UIDPLUS", "NAMESPACE", "ID", "IDLE", "MOVE", "UNSELECT"];
       if (!requireSecureAuth || state.secure) {
         caps.push("AUTH=PLAIN", "AUTH=LOGIN");
       } else {
@@ -1483,6 +1477,18 @@ function createImapGatewayServer(options) {
 
       if (command === "CHECK") {
         writeLine(`${tag} OK CHECK completed`);
+        return;
+      }
+
+      if (command === "EXPUNGE") {
+        if (state.readOnly) {
+          writeLine(`${tag} NO Mailbox is read-only`);
+          return;
+        }
+        // LOOM mailbox state updates are applied eagerly on STORE/MOVE; EXPUNGE
+        // is accepted as a compatibility no-op for clients that expect it.
+        refreshSelectedMessages();
+        writeLine(`${tag} OK EXPUNGE completed`);
         return;
       }
 

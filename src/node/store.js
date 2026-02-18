@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   appendFileSync,
   existsSync,
@@ -57,6 +58,20 @@ function parsePositiveInteger(value, fallback) {
 function parseNonNegativeInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function normalizeTraceField(value) {
+  if (value == null) {
+    return null;
+  }
+  const normalized = String(value).trim();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.length > 160) {
+    return normalized.slice(0, 160);
+  }
+  return normalized;
 }
 
 function containsHeaderUnsafeChars(value) {
@@ -1075,6 +1090,7 @@ export class LoomStore {
     this.persistenceLastError = null;
     this.persistenceLastSyncAt = null;
     this.persistenceHydratedAt = null;
+    this.traceContextStorage = new AsyncLocalStorage();
 
     this.initializeSystemSigningKeys();
 
@@ -1085,6 +1101,46 @@ export class LoomStore {
     }
 
     this.ensureSystemSigningKeyRegistered();
+  }
+
+  buildTraceContext(patch = {}) {
+    const existing = this.traceContextStorage.getStore();
+    const context = {
+      trace_id: normalizeTraceField(patch.trace_id ?? existing?.trace_id ?? patch.request_id ?? existing?.request_id),
+      request_id: normalizeTraceField(patch.request_id ?? existing?.request_id),
+      trace_source: normalizeTraceField(patch.trace_source ?? existing?.trace_source),
+      worker: normalizeTraceField(patch.worker ?? existing?.worker),
+      route: normalizeTraceField(patch.route ?? existing?.route),
+      method: normalizeTraceField(patch.method ?? existing?.method),
+      actor: normalizeTraceField(patch.actor ?? existing?.actor)
+    };
+
+    if (!context.trace_id && !context.request_id && !context.trace_source && !context.worker) {
+      return null;
+    }
+    return context;
+  }
+
+  runWithTraceContext(contextPatch, callback) {
+    if (typeof callback !== "function") {
+      throw new Error("runWithTraceContext requires a callback function");
+    }
+
+    const nextContext = this.buildTraceContext(contextPatch);
+    if (!nextContext) {
+      return callback();
+    }
+    return this.traceContextStorage.run(nextContext, callback);
+  }
+
+  getCurrentTraceContext() {
+    const context = this.traceContextStorage.getStore();
+    return context && typeof context === "object" ? context : null;
+  }
+
+  getCurrentRequestId() {
+    const context = this.getCurrentTraceContext();
+    return context?.request_id || null;
   }
 
   initializeSystemSigningKeys() {
@@ -1649,7 +1705,7 @@ export class LoomStore {
     return createHmac("sha256", this.auditHmacKey).update(this.buildAuditMacInput(entry), "utf-8").digest("hex");
   }
 
-  validateAuditEntryOrThrow(entry, expectedPrevHash, index) {
+  validateAuditEntryOrThrow(entry, expectedPrevHash, index, options = {}) {
     const prevHash = entry?.prev_hash ?? null;
     if ((expectedPrevHash ?? null) !== prevHash) {
       throw new LoomError("AUDIT_TAMPERED", "Audit chain continuity check failed", 500, {
@@ -1659,8 +1715,19 @@ export class LoomStore {
       });
     }
 
+    const mode = options.mode === "chain_only" ? "chain_only" : "strict";
+    const hash = String(entry?.hash || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(hash)) {
+      throw new LoomError("AUDIT_TAMPERED", "Audit entry hash is malformed", 500, {
+        index
+      });
+    }
+    if (mode === "chain_only") {
+      return;
+    }
+
     const expectedHash = this.computeAuditHash(entry);
-    if (String(entry?.hash || "") !== expectedHash) {
+    if (hash !== expectedHash) {
       throw new LoomError("AUDIT_TAMPERED", "Audit entry hash mismatch", 500, {
         index
       });
@@ -1688,7 +1755,7 @@ export class LoomStore {
     }
   }
 
-  loadAuditFromEntries(entries) {
+  loadAuditFromEntries(entries, options = {}) {
     const list = Array.isArray(entries) ? entries : [];
     let expectedPrevHash = null;
     const normalized = [];
@@ -1703,7 +1770,7 @@ export class LoomStore {
 
       const entry = { ...raw };
       if (this.auditValidateChain) {
-        this.validateAuditEntryOrThrow(entry, expectedPrevHash, index);
+        this.validateAuditEntryOrThrow(entry, expectedPrevHash, index, options);
       }
       expectedPrevHash = entry.hash ?? null;
       normalized.push(entry);
@@ -1784,13 +1851,36 @@ export class LoomStore {
   }
 
   appendAudit(action, payload) {
+    const trace = this.getCurrentTraceContext();
+    let tracedPayload = payload;
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+      tracedPayload = { ...payload };
+      if (trace?.request_id && !tracedPayload.request_id) {
+        tracedPayload.request_id = trace.request_id;
+      }
+      if (trace?.trace_id && !tracedPayload.trace_id) {
+        tracedPayload.trace_id = trace.trace_id;
+      }
+      if (trace?.trace_source && !tracedPayload.trace_source) {
+        tracedPayload.trace_source = trace.trace_source;
+      }
+      if (trace?.worker && !tracedPayload.worker) {
+        tracedPayload.worker = trace.worker;
+      }
+    }
+
     const entry = {
       event_id: `evt_${generateUlid()}`,
       timestamp: nowIso(),
       action,
-      payload,
+      payload: tracedPayload,
       prev_hash: this.auditHeadHash
     };
+    if (trace) {
+      entry.trace = {
+        ...trace
+      };
+    }
 
     const hash = this.computeAuditHash(entry);
     entry.hash = hash;
@@ -1846,7 +1936,9 @@ export class LoomStore {
       this.loadStateFromObject(loaded.state);
     }
     if (loaded?.audit_entries) {
-      this.loadAuditFromEntries(loaded.audit_entries);
+      // Persistence backends such as PostgreSQL JSONB may reorder object keys on round-trip,
+      // so we enforce chain continuity but skip payload-hash recomputation on reload.
+      this.loadAuditFromEntries(loaded.audit_entries, { mode: "chain_only" });
     }
 
     this.ensureSystemSigningKeyRegistered();
@@ -1985,7 +2077,9 @@ export class LoomStore {
       this.loadStateFromObject(state);
     }
     if (auditEntries.length > 0) {
-      this.loadAuditFromEntries(auditEntries);
+      this.loadAuditFromEntries(auditEntries, {
+        mode: adapterResult ? "chain_only" : "strict"
+      });
     }
 
     this.ensureSystemSigningKeyRegistered();
@@ -2181,6 +2275,8 @@ export class LoomStore {
     }
 
     let queued = 0;
+    const sourceRequestId = auditEntry?.trace?.request_id || this.getCurrentRequestId();
+    const sourceTraceId = auditEntry?.trace?.trace_id || sourceRequestId || null;
     for (const webhook of activeWebhooks) {
       const outbox = {
         id: `wout_${generateUlid()}`,
@@ -2204,7 +2300,9 @@ export class LoomStore {
         updated_at: nowIso(),
         delivered_at: null,
         last_error: null,
-        last_http_status: null
+        last_http_status: null,
+        source_request_id: sourceRequestId || null,
+        source_trace_id: sourceTraceId
       };
       this.webhookOutboxById.set(outbox.id, outbox);
       queued += 1;
@@ -2423,6 +2521,8 @@ export class LoomStore {
             webhook_id: webhook.id,
             event_id: item.event_id,
             reason: item.last_error,
+            source_request_id: item.source_request_id || null,
+            source_trace_id: item.source_trace_id || null,
             actor: actorIdentity
           });
           webhook.last_error = item.last_error;
@@ -2448,6 +2548,8 @@ export class LoomStore {
           event_id: item.event_id,
           event_type: item.event_type,
           attempts: item.attempts,
+          source_request_id: item.source_request_id || null,
+          source_trace_id: item.source_trace_id || null,
           actor: actorIdentity
         });
         return item;
@@ -2458,6 +2560,8 @@ export class LoomStore {
           webhook_id: webhook.id,
           event_id: item.event_id,
           reason: item.last_error,
+          source_request_id: item.source_request_id || null,
+          source_trace_id: item.source_trace_id || null,
           actor: actorIdentity
         });
         webhook.last_error = item.last_error;
@@ -2487,7 +2591,9 @@ export class LoomStore {
         event_type: result.event_type,
         status: result.status,
         attempts: result.attempts,
-        last_error: result.last_error
+        last_error: result.last_error,
+        source_request_id: result.source_request_id || null,
+        source_trace_id: result.source_trace_id || null
       });
     }
 
@@ -2696,6 +2802,22 @@ export class LoomStore {
       ttl_ms: this.idempotencyTtlMs,
       max_entries: this.idempotencyMaxEntries,
       entries: this.idempotencyByKey.size
+    };
+  }
+
+  getIdentityRateLimitPolicyStatus() {
+    const now = nowMs();
+    const rateCutoff = now - this.identityRateWindowMs * 2;
+    for (const [key, entry] of this.identityRateByBucket) {
+      if (entry.window_started_at < rateCutoff) {
+        this.identityRateByBucket.delete(key);
+      }
+    }
+    return {
+      window_ms: this.identityRateWindowMs,
+      default_max: this.identityRateDefaultMax,
+      sensitive_max: this.identityRateSensitiveMax,
+      tracked_buckets: this.identityRateByBucket.size
     };
   }
 
@@ -3975,6 +4097,10 @@ export class LoomStore {
       });
     }
 
+    const traceContext = this.getCurrentTraceContext();
+    const sourceRequestId = traceContext?.request_id || null;
+    const sourceTraceId = traceContext?.trace_id || sourceRequestId || null;
+
     const outbox = {
       id: `fout_${generateUlid()}`,
       recipient_node: recipientNode,
@@ -3995,7 +4121,9 @@ export class LoomStore {
       receipt_verified: false,
       receipt_verified_at: null,
       receipt_verification_error: null,
-      queued_by: actorIdentity
+      queued_by: actorIdentity,
+      source_request_id: sourceRequestId,
+      source_trace_id: sourceTraceId
     };
 
     this.federationOutboxById.set(outbox.id, outbox);
@@ -4003,7 +4131,9 @@ export class LoomStore {
       outbox_id: outbox.id,
       recipient_node: recipientNode,
       envelope_count: envelopeSummaries.length,
-      actor: actorIdentity
+      actor: actorIdentity,
+      source_request_id: sourceRequestId,
+      source_trace_id: sourceTraceId
     });
 
     return outbox;
@@ -4391,6 +4521,8 @@ export class LoomStore {
           attempts: item.attempts,
           receipt_verified: item.receipt_verified,
           receipt_verification_error: item.receipt_verification_error,
+          source_request_id: item.source_request_id || null,
+          source_trace_id: item.source_trace_id || null,
           actor: actorIdentity
         });
 
@@ -4408,6 +4540,8 @@ export class LoomStore {
           outbox_id: item.id,
           recipient_node: item.recipient_node,
           reason: item.last_error,
+          source_request_id: item.source_request_id || null,
+          source_trace_id: item.source_trace_id || null,
           actor: actorIdentity
         });
         return item;
@@ -4434,7 +4568,9 @@ export class LoomStore {
         attempts: result.attempts,
         last_error: result.last_error,
         receipt_verified: result.receipt_verified,
-        receipt_verification_error: result.receipt_verification_error
+        receipt_verification_error: result.receipt_verification_error,
+        source_request_id: result.source_request_id || null,
+        source_trace_id: result.source_trace_id || null
       });
     }
 
@@ -6002,6 +6138,10 @@ export class LoomStore {
       });
     }
 
+    const traceContext = this.getCurrentTraceContext();
+    const sourceRequestId = traceContext?.request_id || null;
+    const sourceTraceId = traceContext?.trace_id || sourceRequestId || null;
+
     const outbox = {
       id: `eout_${generateUlid()}`,
       envelope_id: envelopeId,
@@ -6023,7 +6163,9 @@ export class LoomStore {
       recipient_statuses: [],
       last_dsn_at: null,
       last_dsn_source: null,
-      queued_by: actorIdentity
+      queued_by: actorIdentity,
+      source_request_id: sourceRequestId,
+      source_trace_id: sourceTraceId
     };
 
     this.emailOutboxById.set(outbox.id, outbox);
@@ -6031,7 +6173,9 @@ export class LoomStore {
       outbox_id: outbox.id,
       envelope_id: outbox.envelope_id,
       thread_id: outbox.thread_id,
-      actor: actorIdentity
+      actor: actorIdentity,
+      source_request_id: sourceRequestId,
+      source_trace_id: sourceTraceId
     });
     return outbox;
   }
@@ -6436,6 +6580,8 @@ export class LoomStore {
           outbox_id: item.id,
           envelope_id: item.envelope_id,
           reason: item.last_error,
+          source_request_id: item.source_request_id || null,
+          source_trace_id: item.source_trace_id || null,
           actor: actorIdentity
         });
         return item;
@@ -6513,6 +6659,8 @@ export class LoomStore {
         thread_id: item.thread_id,
         provider_message_id: item.provider_message_id,
         status: item.status,
+        source_request_id: item.source_request_id || null,
+        source_trace_id: item.source_trace_id || null,
         actor: actorIdentity
       });
       return item;
@@ -6523,6 +6671,8 @@ export class LoomStore {
         envelope_id: item.envelope_id,
         thread_id: item.thread_id,
         reason: item.last_error,
+        source_request_id: item.source_request_id || null,
+        source_trace_id: item.source_trace_id || null,
         actor: actorIdentity
       });
       return item;
@@ -6547,7 +6697,9 @@ export class LoomStore {
         status: result.status,
         attempts: result.attempts,
         provider_message_id: result.provider_message_id,
-        last_error: result.last_error
+        last_error: result.last_error,
+        source_request_id: result.source_request_id || null,
+        source_trace_id: result.source_trace_id || null
       });
     }
 

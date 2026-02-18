@@ -180,6 +180,47 @@ function requestUrl(req) {
   return new URL(req.url, `http://${authority}`);
 }
 
+function sanitizeRequestId(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.length > 160) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9._:-]+$/.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function getIncomingRequestId(req) {
+  const candidates = [
+    req.headers["x-loom-request-id"],
+    req.headers["x-request-id"],
+    req.headers["x-correlation-id"]
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      for (const entry of candidate) {
+        const normalized = sanitizeRequestId(entry);
+        if (normalized) {
+          return normalized;
+        }
+      }
+      continue;
+    }
+    const normalized = sanitizeRequestId(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
 function methodIs(req, method) {
   return req.method?.toUpperCase() === method;
 }
@@ -568,6 +609,15 @@ function createRateLimiter(config) {
 
   return {
     enabled,
+    getStatus() {
+      return {
+        enabled,
+        window_ms: windowMs,
+        default_max: defaultMax,
+        sensitive_max: sensitiveMax,
+        tracked_buckets: stateByKey.size
+      };
+    },
     enforce(req, path) {
       if (!enabled) {
         return;
@@ -1419,7 +1469,8 @@ export function createLoomServer(options = {}) {
       res.setHeader("strict-transport-security", "max-age=63072000; includeSubDomains");
     }
 
-    const reqId = `req_${randomUUID()}`;
+    const reqId = getIncomingRequestId(req) || `req_${randomUUID()}`;
+    res.setHeader("x-loom-request-id", reqId);
     const startedAt = Date.now();
     const method = String(req.method || "GET").toUpperCase();
     const clientIp = resolveClientIp(req, { trustProxyConfig });
@@ -1438,6 +1489,7 @@ export function createLoomServer(options = {}) {
       if (requestLogEnabled) {
         const entry = {
           timestamp: new Date().toISOString(),
+          request_id: reqId,
           req_id: reqId,
           method,
           path,
@@ -1459,20 +1511,21 @@ export function createLoomServer(options = {}) {
       }
     });
 
-    try {
-      path = requestPath(req);
-      rateLimiter.enforce(req, path);
-      if (requireHttpsFromProxy && !isRequestSecure(req, { requireHttpsFromProxy, trustProxyConfig })) {
-        throw new LoomError("CAPABILITY_DENIED", "HTTPS is required for this service", 403, {
-          field: "x-forwarded-proto"
-        });
-      }
+    const executeRequest = async () => {
+      try {
+        path = requestPath(req);
+        rateLimiter.enforce(req, path);
+        if (requireHttpsFromProxy && !isRequestSecure(req, { requireHttpsFromProxy, trustProxyConfig })) {
+          throw new LoomError("CAPABILITY_DENIED", "HTTPS is required for this service", 403, {
+            field: "x-forwarded-proto"
+          });
+        }
 
-      if (methodIs(req, "GET") && path === "/") {
-        res.setHeader("content-security-policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'");
-        sendHtml(res, 200, renderDashboardHtml());
-        return;
-      }
+        if (methodIs(req, "GET") && path === "/") {
+          res.setHeader("content-security-policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'");
+          sendHtml(res, 200, renderDashboardHtml());
+          return;
+        }
 
       if (methodIs(req, "GET") && path === "/favicon.ico") {
         res.writeHead(204);
@@ -1491,6 +1544,8 @@ export function createLoomServer(options = {}) {
         const emailOutbox = store.getEmailOutboxStats();
         const webhookOutbox = store.getWebhookOutboxStats();
         const federationInboundPolicy = store.getFederationInboundPolicyStatus();
+        const apiRateLimitPolicy = rateLimiter.getStatus();
+        const identityRateLimitPolicy = store.getIdentityRateLimitPolicyStatus();
 
         let pgCheck = null;
         if (store.persistenceAdapter && typeof store.persistenceAdapter.pool?.query === "function") {
@@ -1518,6 +1573,8 @@ export function createLoomServer(options = {}) {
             email: emailOutbox,
             webhook: webhookOutbox
           },
+          api_rate_limit_policy: apiRateLimitPolicy,
+          identity_rate_limit_policy: identityRateLimitPolicy,
           federation_inbound_policy: federationInboundPolicy,
           idempotency: store.getIdempotencyStatus(),
           email_relay: typeof emailRelay?.getStatus === "function" ? emailRelay.getStatus() : null,
@@ -1559,6 +1616,8 @@ export function createLoomServer(options = {}) {
         const emailOutbox = store.getEmailOutboxStats();
         const webhookOutbox = store.getWebhookOutboxStats();
         const federationInboundPolicy = store.getFederationInboundPolicyStatus();
+        const apiRateLimitPolicy = rateLimiter.getStatus();
+        const identityRateLimitPolicy = store.getIdentityRateLimitPolicyStatus();
         const federationGuards = await store.getFederationGuardStatus();
         const persistenceSchema = await store.getPersistenceSchemaStatus();
         const runtimeStatus = runtimeStatusProvider ? runtimeStatusProvider() : null;
@@ -1571,6 +1630,8 @@ export function createLoomServer(options = {}) {
             email: emailOutbox,
             webhook: webhookOutbox
           },
+          api_rate_limit_policy: apiRateLimitPolicy,
+          identity_rate_limit_policy: identityRateLimitPolicy,
           federation_inbound_policy: federationInboundPolicy,
           federation_guards: federationGuards,
           idempotency: store.getIdempotencyStatus(),
@@ -2498,15 +2559,31 @@ export function createLoomServer(options = {}) {
         return;
       }
 
-      throw new LoomError("ENVELOPE_NOT_FOUND", "Route not found", 404, {
-        method: req.method,
-        path
-      });
-    } catch (error) {
-      const { status, body } = toErrorResponse(error, reqId);
-      errorCode = body.error.code;
-      sendJson(res, status, body);
+        throw new LoomError("ENVELOPE_NOT_FOUND", "Route not found", 404, {
+          method: req.method,
+          path
+        });
+      } catch (error) {
+        const { status, body } = toErrorResponse(error, reqId);
+        errorCode = body.error.code;
+        sendJson(res, status, body);
+      }
+    };
+
+    if (typeof store.runWithTraceContext === "function") {
+      await store.runWithTraceContext(
+        {
+          trace_id: reqId,
+          request_id: reqId,
+          trace_source: "api",
+          method,
+          route: req.url || ""
+        },
+        executeRequest
+      );
+      return;
     }
+    await executeRequest();
   };
 
   const server = nativeTlsConfig.enabled

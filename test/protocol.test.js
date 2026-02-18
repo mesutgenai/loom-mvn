@@ -173,6 +173,87 @@ test("store ingests signed envelope and rejects duplicates", () => {
   assert.throws(() => store.ingestEnvelope(envelope), (error) => error?.code === "ENVELOPE_DUPLICATE");
 });
 
+test("store trace context propagates request and worker IDs into audit and outbox flows", async () => {
+  const { publicKeyPem, privateKeyPem } = generateSigningKeyPair();
+  const store = new LoomStore({ nodeId: "node.test" });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_trace_1", public_key_pem: publicKeyPem }]
+  });
+
+  const envelope = signEnvelope(
+    {
+      ...makeEnvelope(),
+      id: "env_01ARZ3NDEKTSV4RRFFQ69TRACE",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_trace_1",
+        type: "human"
+      }
+    },
+    privateKeyPem,
+    "k_sign_alice_trace_1"
+  );
+  store.ingestEnvelope(envelope);
+
+  const queueRequestId = "trace_api_queue_001";
+  const queued = await store.runWithTraceContext(
+    {
+      request_id: queueRequestId,
+      trace_id: queueRequestId,
+      trace_source: "api",
+      method: "POST",
+      route: "/v1/email/outbox"
+    },
+    () =>
+      store.queueEmailOutbox(
+        {
+          envelope_id: envelope.id,
+          to_email: ["bob@example.net"],
+          smtp_from: "alice@example.net"
+        },
+        "loom://alice@node.test"
+      )
+  );
+  assert.equal(queued.source_request_id, queueRequestId);
+  assert.equal(queued.source_trace_id, queueRequestId);
+
+  const relay = {
+    send: async () => ({
+      provider_message_id: "mock-1",
+      response: "250 OK",
+      accepted: ["bob@example.net"],
+      rejected: []
+    })
+  };
+
+  const processed = await store.runWithTraceContext(
+    {
+      trace_id: "trace_worker_email_001",
+      trace_source: "worker",
+      worker: "email_outbox",
+      actor: "system"
+    },
+    () => store.processEmailOutboxBatch(10, relay, "system")
+  );
+  assert.equal(processed.processed_count, 1);
+  assert.equal(processed.processed[0].source_request_id, queueRequestId);
+
+  const auditEntries = store.getAuditEntries(50);
+  const queueAudit = auditEntries.find((entry) => entry.action === "email.outbox.queue");
+  assert.equal(queueAudit?.payload?.request_id, queueRequestId);
+  assert.equal(queueAudit?.trace?.request_id, queueRequestId);
+  assert.equal(queueAudit?.trace?.trace_source, "api");
+
+  const deliveredAudit = auditEntries.find((entry) => entry.action === "email.outbox.process.delivered");
+  assert.equal(deliveredAudit?.payload?.source_request_id, queueRequestId);
+  assert.equal(deliveredAudit?.trace?.trace_source, "worker");
+  assert.equal(deliveredAudit?.trace?.worker, "email_outbox");
+});
+
 test("store persists state to disk when dataDir is configured", () => {
   const dataDir = mkdtempSync(join(tmpdir(), "loom-store-"));
   try {
@@ -348,14 +429,34 @@ test("store hydrates state and audit from external persistence adapter", async (
   seedStore.registerIdentity({
     id: "loom://alice@persisted.node",
     display_name: "Alice",
-    signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: persistedKeys.publicKeyPem }]
+      signing_keys: [{ key_id: "k_sign_alice_1", public_key_pem: persistedKeys.publicKeyPem }]
   });
+
+  const reorderedAuditEntries = seedStore.auditEntries.map((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return entry;
+    }
+    const payload =
+      entry.payload && typeof entry.payload === "object" && !Array.isArray(entry.payload)
+        ? Object.fromEntries(Object.entries(entry.payload).reverse())
+        : entry.payload;
+    return {
+      ...entry,
+      payload
+    };
+  });
+
+  const strictVerifier = new LoomStore({ nodeId: "strict.node" });
+  assert.throws(
+    () => strictVerifier.loadAuditFromEntries(reorderedAuditEntries),
+    (error) => error?.code === "AUDIT_TAMPERED"
+  );
 
   const adapter = {
     async loadStateAndAudit() {
       return {
         state: seedStore.toSerializableState(),
-        audit_entries: seedStore.auditEntries
+        audit_entries: reorderedAuditEntries
       };
     },
     async persistSnapshotAndAudit() {}

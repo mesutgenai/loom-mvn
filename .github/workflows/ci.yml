@@ -24,6 +24,72 @@ jobs:
       - name: Verify license file
         run: test -f LICENSE
 
+      - name: Secret hygiene check
+        run: npm run check:secrets
+
+      - name: Validate production baseline env example
+        run: npm run check:prod-env -- --env-file .env.production.example
+
+      - name: Validate federation outbound controls env example
+        run: npm run check:federation -- --env-file .env.production.example
+
+      - name: Validate inbound bridge hardening env example
+        run: npm run check:inbound-bridge -- --env-file .env.production.example
+
+      - name: Validate rate-limit policy env example
+        run: npm run check:rate-limits -- --env-file .env.production.example
+
+      - name: Validate outbox worker reliability env example
+        run: npm run check:outbox-workers -- --env-file .env.production.example
+
+      - name: Validate observability and alerting baseline
+        run: npm run check:observability -- --env-file .env.production.example
+
+      - name: Validate request tracing baseline
+        run: npm run check:tracing -- --env-file .env.production.example
+
+      - name: Validate threat model baseline
+        run: npm run check:threat-model
+
+      - name: Validate security testing program baseline
+        run: npm run check:security-program
+
+      - name: Validate capacity and chaos readiness baseline
+        run: npm run check:capacity-chaos
+
+      - name: Validate disaster recovery plan baseline
+        run: npm run check:dr-plan
+
+      - name: Validate access governance baseline
+        run: npm run check:access-governance
+
+      - name: Validate compliance controls baseline
+        run: npm run check:compliance -- --env-file .env.production.example
+
+      - name: Validate incident response readiness baseline
+        run: npm run check:incident-response
+
+      - name: Validate release gate baseline
+        run: npm run check:release-gates
+
+      - name: Verify compliance drill CLI
+        run: npm run drill:compliance -- --help
+
+      - name: Verify compliance gate CLI
+        run: npm run gate:compliance -- --help
+
+      - name: Verify release gate CLI
+        run: npm run gate:release -- --help
+
+      - name: Verify federation interop drill CLI
+        run: npm run drill:federation-interop -- --help
+
+      - name: Verify federation interop matrix drill CLI
+        run: npm run drill:federation-interop-matrix -- --help
+
+      - name: Verify federation interop evidence checker CLI
+        run: npm run check:federation-interop -- --help
+
       - name: Install dependencies
         run: npm ci
 

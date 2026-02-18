@@ -103,6 +103,25 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `docs/DEVELOPMENT-PLAN.md`
   - `docs/STABILITY.md`
   - `docs/RELEASE-POLICY.md`
+  - `docs/PRODUCTION-READINESS.md`
+  - `docs/DEPLOYMENT-BASELINE.md`
+  - `docs/FEDERATION-CONTROLS.md`
+  - `docs/FEDERATION-INTEROP-DRILL.md`
+  - `docs/INBOUND-BRIDGE-HARDENING.md`
+  - `docs/INCIDENT-RESPONSE-ONCALL.md`
+  - `docs/OBSERVABILITY-ALERTING.md`
+  - `docs/OUTBOX-WORKER-RELIABILITY.md`
+  - `docs/RATE-LIMIT-POLICY.md`
+  - `docs/RELEASE-CHECKLIST.md`
+  - `docs/REQUEST-TRACING.md`
+  - `docs/THREAT-MODEL.md`
+  - `docs/SECURITY-TESTING-PROGRAM.md`
+  - `docs/CAPACITY-CHAOS-TESTS.md`
+  - `docs/DISASTER-RECOVERY-PLAN.md`
+  - `docs/ACCESS-GOVERNANCE.md`
+  - `docs/COMPLIANCE-CONTROLS.md`
+  - `docs/IMAP-COMPATIBILITY-MATRIX.md`
+  - `docs/SECRETS-KEY-ROTATION.md`
   - `docs/OPEN-SOURCE-STRATEGY.md`
   - `docs/POSTGRES-OPERATIONS.md`
 - Community and governance docs:
@@ -402,14 +421,178 @@ Production baseline:
 npm test
 ```
 
+Production env validation:
+
+```bash
+npm run check:prod-env -- --env-file .env.production
+```
+
+Secret hygiene validation:
+
+```bash
+npm run check:secrets
+```
+
+PostgreSQL persistence readiness validation:
+
+```bash
+npm run check:pg -- --env-file .env.production --expected-schema 3
+```
+
+Federation outbound-control validation:
+
+```bash
+npm run check:federation -- --env-file .env.production
+```
+
+Inbound bridge hardening validation:
+
+```bash
+npm run check:inbound-bridge -- --env-file .env.production
+```
+
+Focused inbound bridge negative tests:
+
+```bash
+npm run test:inbound-bridge-hardening
+```
+
+Rate-limit policy validation:
+
+```bash
+npm run check:rate-limits -- --env-file .env.production
+```
+
+Rate-limit probe run (staging/pre-prod):
+
+```bash
+npm run probe:rate-limits -- --base-url https://<loom-host> --expect-default-max 1000 --expect-sensitive-max 160
+```
+
+Outbox worker reliability validation:
+
+```bash
+npm run check:outbox-workers -- --env-file .env.production
+```
+
+Observability and alerting validation:
+
+```bash
+npm run check:observability -- --env-file .env.production
+```
+
+Request tracing validation:
+
+```bash
+npm run check:tracing -- --env-file .env.production
+```
+
+Threat model validation:
+
+```bash
+npm run check:threat-model
+```
+
+Security testing program validation:
+
+```bash
+npm run check:security-program
+```
+
+Capacity/chaos readiness validation:
+
+```bash
+npm run check:capacity-chaos
+```
+
+Disaster recovery plan validation:
+
+```bash
+npm run check:dr-plan
+```
+
+Access governance validation:
+
+```bash
+npm run check:access-governance
+```
+
+Compliance controls validation:
+
+```bash
+npm run check:compliance
+```
+
+Compliance runtime evidence drill:
+
+```bash
+npm run drill:compliance -- --base-url https://<loom-host> --admin-token <admin-token> --bearer-token <audit-bearer-token>
+```
+
+Compliance drill with automatic temporary audit-token bootstrap:
+
+```bash
+npm run drill:compliance -- --base-url https://<loom-host> --admin-token <admin-token> --bootstrap-audit-token
+```
+
+Compliance gate (static check + runtime drill):
+
+```bash
+npm run gate:compliance -- --base-url https://<loom-host> --admin-token <admin-token> --bootstrap-audit-token
+```
+
+Incident response/on-call readiness validation:
+
+```bash
+npm run check:incident-response
+```
+
+Release gate baseline validation:
+
+```bash
+npm run check:release-gates
+```
+
+End-to-end release gate (runs full pre-deploy validation sequence):
+
+```bash
+npm run gate:release -- --env-file .env.production --base-url https://<loom-host> --admin-token <admin-token> --bootstrap-audit-token
+```
+
+Federation interop drill:
+
+```bash
+npm run drill:federation-interop -- --base-url https://<loom-host> --admin-token <admin-token> --remote-node-id <external-node-id>
+```
+
+Federation interop matrix drill (staging + pre-prod):
+
+```bash
+npm run drill:federation-interop-matrix -- --targets-file ops/federation/interop-targets.example.json --required-targets staging,preprod
+```
+
+Federation interop evidence validation:
+
+```bash
+npm run check:federation-interop -- --required-targets staging,preprod --max-age-hours 168
+```
+
+Persistence backup/restore drill:
+
+```bash
+npm run drill:persistence -- --base-url https://<loom-host> --execute-restore
+```
+
 ## Notes
 
 - This is a protocol-development scaffold, not production-ready.
 - `package.json` intentionally keeps `"private": true` to prevent accidental npm publication; source remains fully open in this repository under Apache-2.0.
 - Legacy compatibility now includes both API-level gateway behavior (`/v1/gateway/*` + bridge/relay) and an optional wire-level gateway daemon (SMTP + IMAP + optional STARTTLS + extended mailbox commands). Full parity with all enterprise IMAP/SMTP extensions is still a separate hardening track.
-- Wire SMTP currently rejects the `SMTPUTF8` ESMTP parameter (`504 5.5.4`); UTF-8 submission profiles should use the API surface until SMTPUTF8 support is implemented.
+- Wire SMTP now advertises and accepts the `SMTPUTF8` ESMTP parameter for gateway-compatible flows.
 - Inbound internet-email authentication (SPF/DKIM/DMARC verification and policy enforcement) is expected to run in an upstream MTA; the MVN inbound bridge route should remain private unless explicitly confirmed.
 - Current wire IMAP limitation: `COPY`/`UID COPY` are intentionally rejected because LOOM mailbox state currently models a single effective folder per thread participant.
+- Wire IMAP compatibility profile and extension coverage are tracked in `docs/IMAP-COMPATIBILITY-MATRIX.md`.
+- Compliance control mapping (audit export + retention + policy links) is tracked in `docs/COMPLIANCE-CONTROLS.md`.
 - Federation abuse/rate-policy hardening is implemented for baseline operations; deeper interoperability coverage can be extended.
 - Production hardening included in this MVP baseline: payload-size guard, sensitive-route rate limiting, and automatic outbox worker loop.
 - Operational surfaces included: `/ready`, Prometheus `/metrics`, `/v1/admin/status`, outbound email relay outbox with worker automation.

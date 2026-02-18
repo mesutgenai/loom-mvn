@@ -13,6 +13,8 @@ Release and governance references:
 - License: `LICENSE`
 - Stability policy: `docs/STABILITY.md`
 - Release policy: `docs/RELEASE-POLICY.md`
+- Compliance controls package: `docs/COMPLIANCE-CONTROLS.md`
+- IMAP compatibility matrix: `docs/IMAP-COMPATIBILITY-MATRIX.md`
 
 ## Normative Surface
 
@@ -22,10 +24,11 @@ Release and governance references:
 - Federation delivery requires signed requests and nonce/timestamp replay checks.
 - Email outbox supports per-recipient DSN-style status updates via `POST /v1/email/outbox/{id}/dsn`.
 - Outbound MIME rendering maps LOOM envelope attachments (blob-backed) into SMTP relay attachments.
+- Wire SMTP advertises and accepts `SMTPUTF8`/`8BITMIME` ESMTP parameters for gateway-compatible submission flows.
 
 ## Out of Scope (Current)
 
-- SMTPUTF8 wire submission profile (wire SMTP returns `504 5.5.4 SMTPUTF8 not supported`).
+- Full EAI identity mapping parity (for example arbitrary UTF-8 mailbox local-parts that cannot map to valid LOOM identities).
 - Full enterprise IMAP extension parity.
 - Native inbound SPF/DKIM/DMARC verification in MVN (expected upstream MTA responsibility).
 
@@ -42,7 +45,7 @@ The following tests are the baseline vectors and regression checks:
 - `test/server.test.js`
   - API-level protocol routes and DSN outbox update behavior.
 - `test/wire_gateway.test.js`
-  - Wire SMTP/IMAP behavior, STARTTLS, parser hardening, SMTPUTF8 rejection.
+  - Wire SMTP/IMAP behavior, STARTTLS, parser hardening, SMTPUTF8 support.
 
 Run all vectors:
 

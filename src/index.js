@@ -3,6 +3,7 @@ import { createEmailRelayFromEnv } from "./node/email_relay.js";
 import { createPostgresPersistenceFromEnv } from "./node/persistence_postgres.js";
 import { createWireGatewayFromEnv } from "./node/wire_gateway.js";
 import { parseBoolean, parseHostAllowlist } from "./node/env.js";
+import { randomUUID } from "node:crypto";
 
 function isPublicBindHost(value) {
   const normalized = String(value || "")
@@ -214,6 +215,71 @@ let isWebhookOutboxProcessing = false;
 let webhookOutboxBackoffUntil = 0;
 let webhookOutboxBackoffMs = 0;
 
+function buildWorkerTraceId(worker) {
+  const normalizedWorker = String(worker || "worker")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `trace_${normalizedWorker || "worker"}_${randomUUID()}`;
+}
+
+async function runWithWorkerTrace(worker, callback) {
+  const traceId = buildWorkerTraceId(worker);
+  const context = {
+    trace_id: traceId,
+    trace_source: "worker",
+    worker,
+    actor: "system"
+  };
+  if (typeof store.runWithTraceContext !== "function") {
+    const result = await callback();
+    return { traceId, result };
+  }
+  const result = await store.runWithTraceContext(context, callback);
+  return { traceId, result };
+}
+
+function logWorkerBatchProcessed(worker, traceId, result) {
+  if (!result || Number(result.processed_count || 0) <= 0) {
+    return;
+  }
+
+  const processed = Array.isArray(result.processed) ? result.processed : [];
+  const sourceRequestIds = Array.from(
+    new Set(
+      processed
+        .map((item) => (item && typeof item === "object" ? item.source_request_id : null))
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+  const sourceTraceIds = Array.from(
+    new Set(
+      processed
+        .map((item) => (item && typeof item === "object" ? item.source_trace_id : null))
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+  const outboxIds = processed
+    .map((item) => (item && typeof item === "object" ? item.outbox_id : null))
+    .filter(Boolean)
+    .slice(0, 20);
+
+  // eslint-disable-next-line no-console
+  console.log(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: "worker.batch.processed",
+      worker,
+      trace_id: traceId,
+      processed_count: result.processed_count,
+      outbox_ids: outboxIds,
+      source_request_ids: sourceRequestIds,
+      source_trace_ids: sourceTraceIds
+    })
+  );
+}
+
 function startFederationOutboxWorker() {
   if (!Number.isFinite(federationOutboxAutoProcessIntervalMs) || federationOutboxAutoProcessIntervalMs <= 0) {
     runtimeStatus.federation_outbox_worker.enabled = false;
@@ -236,17 +302,16 @@ function startFederationOutboxWorker() {
     runtimeStatus.federation_outbox_worker.last_run_at = new Date().toISOString();
     runtimeStatus.federation_outbox_worker.runs_total += 1;
     try {
-      const result = await store.processFederationOutboxBatch(federationOutboxAutoProcessBatchSize, null);
+      const { traceId, result } = await runWithWorkerTrace("federation_outbox", () =>
+        store.processFederationOutboxBatch(federationOutboxAutoProcessBatchSize, "system")
+      );
       runtimeStatus.federation_outbox_worker.last_processed_count = result.processed_count;
       runtimeStatus.federation_outbox_worker.last_error = null;
       runtimeStatus.federation_outbox_worker.last_error_at = null;
       federationOutboxBackoffMs = 0;
       federationOutboxBackoffUntil = 0;
       runtimeStatus.federation_outbox_worker.batch_backoff_ms = 0;
-      if (result.processed_count > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`LOOM federation outbox worker processed ${result.processed_count} item(s)`);
-      }
+      logWorkerBatchProcessed("federation_outbox", traceId, result);
     } catch (error) {
       runtimeStatus.federation_outbox_worker.last_error = error?.message || "Unknown federation outbox worker error";
       runtimeStatus.federation_outbox_worker.last_error_at = new Date().toISOString();
@@ -300,17 +365,16 @@ function startEmailOutboxWorker() {
     runtimeStatus.email_outbox_worker.runs_total += 1;
 
     try {
-      const result = await store.processEmailOutboxBatch(emailOutboxAutoProcessBatchSize, emailRelay, null);
+      const { traceId, result } = await runWithWorkerTrace("email_outbox", () =>
+        store.processEmailOutboxBatch(emailOutboxAutoProcessBatchSize, emailRelay, "system")
+      );
       runtimeStatus.email_outbox_worker.last_processed_count = result.processed_count;
       runtimeStatus.email_outbox_worker.last_error = null;
       runtimeStatus.email_outbox_worker.last_error_at = null;
       emailOutboxBackoffMs = 0;
       emailOutboxBackoffUntil = 0;
       runtimeStatus.email_outbox_worker.batch_backoff_ms = 0;
-      if (result.processed_count > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`LOOM email outbox worker processed ${result.processed_count} item(s)`);
-      }
+      logWorkerBatchProcessed("email_outbox", traceId, result);
     } catch (error) {
       runtimeStatus.email_outbox_worker.last_error = error?.message || "Unknown email outbox worker error";
       runtimeStatus.email_outbox_worker.last_error_at = new Date().toISOString();
@@ -359,17 +423,16 @@ function startWebhookOutboxWorker() {
     runtimeStatus.webhook_outbox_worker.runs_total += 1;
 
     try {
-      const result = await store.processWebhookOutboxBatch(webhookOutboxAutoProcessBatchSize, "system");
+      const { traceId, result } = await runWithWorkerTrace("webhook_outbox", () =>
+        store.processWebhookOutboxBatch(webhookOutboxAutoProcessBatchSize, "system")
+      );
       runtimeStatus.webhook_outbox_worker.last_processed_count = result.processed_count;
       runtimeStatus.webhook_outbox_worker.last_error = null;
       runtimeStatus.webhook_outbox_worker.last_error_at = null;
       webhookOutboxBackoffMs = 0;
       webhookOutboxBackoffUntil = 0;
       runtimeStatus.webhook_outbox_worker.batch_backoff_ms = 0;
-      if (result.processed_count > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`LOOM webhook outbox worker processed ${result.processed_count} item(s)`);
-      }
+      logWorkerBatchProcessed("webhook_outbox", traceId, result);
     } catch (error) {
       runtimeStatus.webhook_outbox_worker.last_error = error?.message || "Unknown webhook outbox worker error";
       runtimeStatus.webhook_outbox_worker.last_error_at = new Date().toISOString();

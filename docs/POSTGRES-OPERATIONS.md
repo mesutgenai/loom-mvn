@@ -27,6 +27,8 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
 
 ## Startup Checks
 
+0. (Recommended) run direct Postgres readiness preflight:
+   - `npm run check:pg -- --env-file .env.production --expected-schema 3`
 1. Start LOOM and confirm readiness:
    - `curl -sS http://127.0.0.1:8787/ready`
 2. Confirm persistence schema status:
@@ -37,7 +39,18 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
    - Current schema target is `3` (`src/node/persistence_postgres.js`).
    - Verify `loom_outbox_claims` exists for distributed outbox workers.
 
+The `check:pg` script validates:
+
+- DB connectivity with `LOOM_PG_URL`
+- required LOOM tables
+- schema version (`loom_meta.schema_version`)
+- presence of state row for configured `LOOM_PG_STATE_KEY` (warn-only if first boot)
+
 ## Backup Drill
+
+Automated drill command:
+
+- `npm run drill:persistence -- --base-url https://<loom-host> --execute-restore`
 
 1. Export backup:
    - `curl -sS "http://127.0.0.1:8787/v1/admin/persistence/backup?include_audit=true" -H "x-loom-admin-token: $LOOM_ADMIN_TOKEN" > loom-backup.json`
@@ -52,6 +65,14 @@ This runbook is for operating LOOM with PostgreSQL-backed persistence.
    - `curl -sS -X POST http://127.0.0.1:8787/v1/admin/persistence/restore -H "x-loom-admin-token: $LOOM_ADMIN_TOKEN" -H "content-type: application/json" --data-binary @loom-restore.json`
 3. Re-check status:
    - `curl -sS http://127.0.0.1:8787/v1/admin/status -H "x-loom-admin-token: $LOOM_ADMIN_TOKEN"`
+
+## Drill Evidence Artifacts
+
+- The automated drill writes evidence to `scripts/output/persistence-drills/<drill-id>/`:
+  - `report.json` (machine-readable drill result)
+  - `summary.md` (human-readable drill summary)
+  - `backup.json` (optional; can be disabled with `--write-backup false`)
+- Archive `summary.md` and `report.json` in your ops evidence store for each scheduled drill.
 
 ## Distributed Outbox Workers
 

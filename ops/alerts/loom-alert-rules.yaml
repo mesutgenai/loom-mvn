@@ -1,0 +1,78 @@
+groups:
+  - name: loom-availability
+    rules:
+      - alert: LoomReadyProbeFailing
+        expr: min_over_time(probe_success{job="loom-ready"}[5m]) < 1
+        for: 5m
+        labels:
+          severity: critical
+          service: loom
+        annotations:
+          summary: "LOOM readiness probe failing"
+          description: "/ready blackbox probe has been failing for at least 5 minutes."
+
+      - alert: LoomAdminStatusProbeFailing
+        expr: min_over_time(probe_success{job="loom-admin-status"}[5m]) < 1
+        for: 5m
+        labels:
+          severity: critical
+          service: loom
+        annotations:
+          summary: "LOOM admin status probe failing"
+          description: "/v1/admin/status blackbox probe has been failing for at least 5 minutes."
+
+  - name: loom-outbox-lag
+    rules:
+      - alert: LoomFederationOutboxLagHigh
+        expr: loom_federation_outbox_lag_ms > 60000
+        for: 10m
+        labels:
+          severity: warning
+          service: loom
+        annotations:
+          summary: "Federation outbox lag is elevated"
+          description: "Federation outbox lag has exceeded 60s for 10 minutes."
+
+      - alert: LoomEmailOutboxLagHigh
+        expr: loom_email_outbox_lag_ms > 60000
+        for: 10m
+        labels:
+          severity: warning
+          service: loom
+        annotations:
+          summary: "Email outbox lag is elevated"
+          description: "Email outbox lag has exceeded 60s for 10 minutes."
+
+      - alert: LoomWebhookOutboxLagHigh
+        expr: loom_webhook_outbox_lag_ms > 60000
+        for: 10m
+        labels:
+          severity: warning
+          service: loom
+        annotations:
+          summary: "Webhook outbox lag is elevated"
+          description: "Webhook outbox lag has exceeded 60s for 10 minutes."
+
+  - name: loom-auth-signals
+    rules:
+      - alert: LoomAuthErrorSpike
+        expr: sum(rate(loom_errors_total{code=~"AUTH_.*|CAPABILITY_DENIED|RATE_LIMIT_EXCEEDED"}[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: loom
+        annotations:
+          summary: "Auth-related errors are spiking"
+          description: "Auth and capability-denied error rate is elevated for at least 10 minutes."
+
+  - name: loom-persistence
+    rules:
+      - alert: LoomPersistenceFailures
+        expr: (loom_persistence_enabled == 1) and ((loom_persistence_last_error > 0) or (increase(loom_persistence_writes_failed[10m]) > 0))
+        for: 5m
+        labels:
+          severity: critical
+          service: loom
+        annotations:
+          summary: "LOOM persistence errors detected"
+          description: "Persistence reports active errors or failed writes while persistence is enabled."

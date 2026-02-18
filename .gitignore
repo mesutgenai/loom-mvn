@@ -2,6 +2,10 @@ node_modules/
 .loom-data/
 scripts/output/
 .DS_Store
+.env
+.env.*
+!.env.example
+!.env.production.example
 *.log
 *.tmp
 *.bak
