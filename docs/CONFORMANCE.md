@@ -1,4 +1,4 @@
-# LOOM MVN v1.1 Conformance Profile (v0.2.6)
+# LOOM MVN v1.1 Conformance Profile (v0.2.7)
 
 This document defines the current conformance surface implemented by this MVN and the test vectors that gate protocol behavior.
 

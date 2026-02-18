@@ -31,11 +31,15 @@ Use the matrix runner for required environment coverage in one command:
 
 ```bash
 npm run drill:federation-interop-matrix -- \
-  --targets-file ops/federation/interop-targets.example.json \
+  --targets-file ops/federation/interop-targets.json \
   --required-targets staging,preprod
 ```
 
-Target config template:
+Target config (production):
+
+- `ops/federation/interop-targets.json`
+
+Target config template (bootstrap/reference):
 
 - `ops/federation/interop-targets.example.json`
 
@@ -73,8 +77,19 @@ Command:
 ```bash
 npm run check:federation-interop -- \
   --required-targets staging,preprod \
-  --max-age-hours 168
+  --max-age-hours 168 \
+  --expected-targets-file ops/federation/interop-targets.json
 ```
+
+## Failure Diagnostics
+
+When a matrix target fails before protocol assertions run, inspect the per-target
+`failure` field in report JSON or matrix summary. Failures now include actionable
+network detail, for example:
+
+- DNS: `code=ENOTFOUND`, `syscall=getaddrinfo`, `address=<host>`
+- TLS: `tls=certificate-validation-failed`
+- Timeout: `Request timed out after <ms>`
 
 ## Staging / Pre-Prod Usage
 

@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+No unreleased changes yet.
+
+## v0.2.7 - 2026-02-18
+
 Governance and trust-signal alignment updates:
 
 - Added contribution/governance docs: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`.
@@ -57,12 +61,22 @@ Governance and trust-signal alignment updates:
   - `scripts/run_release_gate.js` and `npm run gate:release` for single-command pre-deploy validation orchestration
   - `docs/RELEASE-CHECKLIST.md` with required release gates and rollback template
   - Strengthened release-gate checker coverage for compliance commands (`check:compliance`, `drill:compliance`, `gate:compliance`), `gate:release`, and required package script wiring
+  - Strengthened release-gate checker coverage for access-governance command/script/CI wiring (`check:access-governance`)
+  - Hardened `gate:release` to require runtime `--base-url`, `--admin-token`, and `--bearer-token` inputs and removed skip-path options for strict production validation
+  - `gate:release` now rejects example/template interop target files (`*.example.*`) to prevent accidental release runs against placeholder config
+  - Wired release-gate runtime arguments through federation/inbound/rate-limit/outbox/observability/tracing/compliance checks so runtime probes are exercised during release runs
 - Added federation interop drill artifacts:
   - `scripts/run_federation_interop_drill.js` and `npm run drill:federation-interop`
   - `docs/FEDERATION-INTEROP-DRILL.md` for challenge + deliver + receipt + replay guard drill workflow
 - Added federation interop matrix/evidence artifacts:
   - `scripts/run_federation_interop_matrix.js` and `npm run drill:federation-interop-matrix`
   - `scripts/check_federation_interop_evidence.js` and `npm run check:federation-interop`
+  - `scripts/check_federation_interop_targets.js` and `npm run check:federation-targets` for required-target config validation (HTTPS, non-loopback, distinct origins)
+  - Interop drill/matrix failures now include detailed network diagnostics (DNS code/syscall/address, timeout, TLS classification) to make environment blockers actionable
+  - Federation interop evidence checks now require non-local HTTPS target URLs by default, fail when required targets share the same origin, and can enforce origin matching against an expected targets file
+  - Federation interop URL validation now blocks known loopback-alias domains (`nip.io`, `sslip.io`, `localtest.me`, `lvh.me`) in both targets and evidence checks
+  - Added concrete production interop target config (`ops/federation/interop-targets.json`) and updated matrix/check defaults to use it
+  - Added regression tests for interop evidence target-origin matching and release-gate example-target-file rejection (`test/release_gate_hardening.test.js`)
   - `ops/federation/interop-targets.example.json` target template for staging/pre-prod interop runs
 - Added structured request-tracing artifacts:
   - `docs/REQUEST-TRACING.md` runbook and evidence checklist
@@ -88,10 +102,13 @@ Governance and trust-signal alignment updates:
 - Added access governance artifacts:
   - `docs/ACCESS-GOVERNANCE.md` least-privilege and periodic access-review policy
   - `scripts/check_access_governance.js` and `npm run check:access-governance`
+  - Access governance checker now ignores template records and requires concrete inventory rows plus resolved reviewer sign-offs
+  - `ops/access/reviews/2026-02-18-access-review.md` non-template access review evidence record
   - `ops/access/reviews/2026-02-18-access-review-template.md` review evidence template
 - Added compliance controls package artifacts:
   - `docs/COMPLIANCE-CONTROLS.md` audit export + retention policy + control mapping runbook
   - `scripts/check_compliance_controls.js` and `npm run check:compliance`
+  - Compliance checker now ignores template records and requires resolved product/security/date sign-offs in latest non-template evidence
   - `scripts/run_compliance_probe.js` and `npm run drill:compliance` for runtime compliance evidence capture
   - `scripts/run_compliance_gate.js` and `npm run gate:compliance` to run compliance check + runtime drill as a single operator gate
   - Compliance drill now supports `--bootstrap-audit-token` to auto-create a temporary local identity + bearer token for `/v1/audit` probing
@@ -107,7 +124,7 @@ Governance and trust-signal alignment updates:
   - Added `EXPUNGE` command acceptance for client compatibility (compatibility no-op in current mailbox-state model).
   - Updated wire IMAP tests for new capability/EXPUNGE coverage.
 - Added GitHub issue templates (`bug report`, `feature request`) and issue config routing users to support/security resources.
-- Aligned docs with current release line (`v0.2.6`) in `README.md` and `docs/CONFORMANCE.md`.
+- Aligned docs with current release line (`v0.2.7`) in `README.md` and `docs/CONFORMANCE.md`.
 - Updated `SECURITY.md` support scope to `0.2.x` + `main` and documented target fix SLAs by severity.
 
 ## v0.2.6 - 2026-02-17

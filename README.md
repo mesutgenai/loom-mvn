@@ -93,7 +93,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 
 ## Current status
 
-- Current release is `v0.2.6` (see `CHANGELOG.md` for release-level change history).
+- Current release is `v0.2.7` (see `CHANGELOG.md` for release-level change history).
 - Protocol design docs are available in:
   - `CHANGELOG.md`
   - `LOOM-protocol-design.md`
@@ -556,7 +556,7 @@ npm run check:release-gates
 End-to-end release gate (runs full pre-deploy validation sequence):
 
 ```bash
-npm run gate:release -- --env-file .env.production --base-url https://<loom-host> --admin-token <admin-token> --bootstrap-audit-token
+npm run gate:release -- --env-file .env.production --base-url https://<loom-host> --admin-token <admin-token> --bearer-token <audit-bearer-token> --interop-targets-file ops/federation/interop-targets.json
 ```
 
 Federation interop drill:
@@ -568,13 +568,19 @@ npm run drill:federation-interop -- --base-url https://<loom-host> --admin-token
 Federation interop matrix drill (staging + pre-prod):
 
 ```bash
-npm run drill:federation-interop-matrix -- --targets-file ops/federation/interop-targets.example.json --required-targets staging,preprod
+npm run drill:federation-interop-matrix -- --targets-file ops/federation/interop-targets.json --required-targets staging,preprod
+```
+
+Federation interop target config validation (non-local, distinct staging/preprod origins):
+
+```bash
+npm run check:federation-targets -- --targets-file ops/federation/interop-targets.json --required-targets staging,preprod
 ```
 
 Federation interop evidence validation:
 
 ```bash
-npm run check:federation-interop -- --required-targets staging,preprod --max-age-hours 168
+npm run check:federation-interop -- --required-targets staging,preprod --max-age-hours 168 --expected-targets-file ops/federation/interop-targets.json
 ```
 
 Persistence backup/restore drill:
