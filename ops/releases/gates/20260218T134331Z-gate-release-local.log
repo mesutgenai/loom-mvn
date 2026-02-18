@@ -1,0 +1,585 @@
+
+> loom-mvn@0.2.6 gate:release
+> node scripts/run_release_gate.js --env-file /tmp/loom-gate-20260218T134331Z-k6jg/gate.env --base-url http://127.0.0.1:8787 --admin-token <redacted-admin-token> --bootstrap-audit-token
+
+
+[release-gate] Release checklist wiring checks
+
+Release gate summary:
+  - PASS: Release artifact present: CHANGELOG.md
+  - PASS: Release artifact present: docs/CONFORMANCE.md
+  - PASS: Release artifact present: docs/RELEASE-CHECKLIST.md
+  - PASS: CHANGELOG.md includes `## Unreleased` section
+  - PASS: CHANGELOG.md contains versioned release entries
+  - PASS: Release checklist gate present: CI and test suite green
+  - PASS: Release checklist gate present: Conformance checks passed
+  - PASS: Release checklist gate present: Changelog updated
+  - PASS: Release checklist gate present: Rollback plan documented
+  - PASS: Release checklist validation command present: npm run gate:release
+  - PASS: Release checklist validation command present: npm run check:release-gates
+  - PASS: Release checklist validation command present: npm run check:prod-env
+  - PASS: Release checklist validation command present: npm run check:secrets
+  - PASS: Release checklist validation command present: npm run check:compliance
+  - PASS: Release checklist validation command present: npm run drill:compliance
+  - PASS: Release checklist validation command present: npm run gate:compliance
+  - PASS: package.json includes script: test
+  - PASS: package.json includes script: check:release-gates
+  - PASS: package.json includes script: check:prod-env
+  - PASS: package.json includes script: check:secrets
+  - PASS: package.json includes script: check:compliance
+  - PASS: package.json includes script: drill:compliance
+  - PASS: package.json includes script: gate:compliance
+  - PASS: package.json includes script: gate:release
+  - PASS: CI workflow includes release-gate validation step
+  - PASS: CI workflow includes compliance gate CLI verification
+  - PASS: CI workflow includes release gate CLI verification
+
+PASSED: release gate checks succeeded.
+
+[release-gate] Production env baseline
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Production env validation summary:
+  - PASS: LOOM_PUBLIC_SERVICE=true
+  - PASS: Public TLS mode is configured
+  - PASS: LOOM_REQUIRE_HTTPS_FROM_PROXY=true
+  - PASS: Trusted proxy headers are configured
+  - PASS: LOOM_ADMIN_TOKEN is set
+  - PASS: LOOM_PG_URL is set
+  - PASS: Metrics remain authenticated (LOOM_METRICS_PUBLIC=false)
+  - PASS: Demo public reads disabled
+  - PASS: Inbound bridge route is enabled
+  - PASS: LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true
+  - PASS: Inbound bridge admin-token gate enabled
+  - PASS: Strict inbound auth-results/DMARC/reject policy enabled
+  - PASS: LOOM_FEDERATION_HOST_ALLOWLIST configured
+  - PASS: LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST configured
+  - PASS: LOOM_WEBHOOK_HOST_ALLOWLIST configured
+  - PASS: LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST configured
+  - WARN: LOOM_PG_SSL is disabled; enable TLS for managed/remote PostgreSQL.
+
+PASSED: production env checks succeeded.
+
+[release-gate] Secret hygiene
+Secret hygiene check passed. No obvious committed secrets detected.
+
+[release-gate] Postgres readiness
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Postgres readiness summary:
+  - PASS: Connected to PostgreSQL: postgresql://loom@127.0.0.1:55432/loom
+  - PASS: DB ping ok: timestamp returned
+  - PASS: All required tables present (8)
+  - PASS: schema_version=3
+  - PASS: State row present for state_key="default"
+  - WARN: LOOM_PG_SSL is not enabled; enable TLS for non-local database connections.
+
+PASSED: Postgres readiness checks succeeded.
+
+[release-gate] Federation controls
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Federation controls summary:
+  - PASS: LOOM_PUBLIC_SERVICE=true
+  - PASS: Static allowlist policy checks passed
+  - WARN: Runtime federation node audit skipped (no --base-url/--bearer-token provided).
+
+PASSED: federation outbound control checks succeeded.
+
+[release-gate] Inbound bridge hardening
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Inbound bridge hardening summary:
+  - PASS: LOOM_PUBLIC_SERVICE=true
+  - PASS: LOOM_BRIDGE_EMAIL_INBOUND_ENABLED=true
+  - PASS: LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true
+  - PASS: Inbound bridge admin token gate is enabled
+  - PASS: Strict public inbound bridge auth policy is enabled
+  - WARN: Runtime inbound bridge probe skipped (no --base-url/--bearer-token provided).
+
+PASSED: inbound bridge hardening checks succeeded.
+
+[release-gate] Rate-limit policy
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Rate-limit policy summary:
+  - PASS: LOOM_PUBLIC_SERVICE=true
+  - PASS: API sensitive/default rate relationship is valid
+  - PASS: Identity sensitive/default rate relationship is valid
+  - PASS: Federation node/global rate relationship is valid
+  - WARN: Runtime policy check skipped (both --base-url and --admin-token are required).
+
+PASSED: rate-limit policy checks succeeded.
+
+[release-gate] Outbox worker reliability
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Outbox worker reliability summary:
+  - PASS: LOOM_PUBLIC_SERVICE=true
+  - PASS: federation worker interval configured (5000ms)
+  - PASS: federation worker batch size configured (20)
+  - PASS: email worker interval configured (5000ms)
+  - PASS: email worker batch size configured (20)
+  - PASS: webhook worker interval configured (5000ms)
+  - PASS: webhook worker batch size configured (20)
+  - PASS: LOOM_OUTBOX_WORKER_ID is set for distributed worker coordination
+  - PASS: LOOM_OUTBOX_CLAIM_LEASE_MS is aligned with worker intervals (60000ms)
+  - WARN: Runtime worker check skipped (both --base-url and --admin-token are required).
+
+PASSED: outbox worker reliability checks succeeded.
+
+[release-gate] Observability and alerting
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Observability and alerting summary:
+  - PASS: LOOM_PUBLIC_SERVICE=true
+  - PASS: LOOM_METRICS_PUBLIC=false (authenticated scrape mode)
+  - PASS: Admin token available for authenticated scrape
+  - PASS: Alert rule file present: /Users/mesut/Desktop/email++/ops/alerts/loom-alert-rules.yaml
+  - PASS: Alert rule present: LoomReadyProbeFailing
+  - PASS: Alert rule present: LoomAdminStatusProbeFailing
+  - PASS: Alert rule present: LoomFederationOutboxLagHigh
+  - PASS: Alert rule present: LoomEmailOutboxLagHigh
+  - PASS: Alert rule present: LoomWebhookOutboxLagHigh
+  - PASS: Alert rule present: LoomAuthErrorSpike
+  - PASS: Alert rule present: LoomPersistenceFailures
+  - WARN: Runtime endpoint checks skipped (no --base-url/LOOM_BASE_URL provided).
+
+PASSED: observability and alerting checks succeeded.
+
+[release-gate] Incident response readiness
+
+Incident response readiness summary:
+  - PASS: Incident runbook present: /Users/mesut/Desktop/email++/docs/INCIDENT-RESPONSE-ONCALL.md
+  - PASS: Runbook section present: On-Call Rotation
+  - PASS: Runbook section present: Severity Matrix
+  - PASS: Runbook section present: Incident Lifecycle
+  - PASS: Runbook section present: Security Incident Playbook
+  - PASS: Runbook section present: Availability Incident Playbook
+  - PASS: Runbook section present: Communications
+  - PASS: Runbook section present: Drill Program
+  - PASS: Incident drill notes present (1)
+  - PASS: Latest drill note: /Users/mesut/Desktop/email++/ops/incidents/drills/2026-02-18-sev1-availability-tabletop.md
+
+PASSED: incident response readiness checks succeeded.
+
+[release-gate] Request tracing
+
+Request tracing summary:
+  - PASS: Tracing artifact present: docs/REQUEST-TRACING.md
+  - PASS: Tracing artifact present: src/node/server.js
+  - PASS: Tracing artifact present: src/node/store.js
+  - PASS: Tracing artifact present: src/index.js
+  - PASS: Server sets x-loom-request-id header
+  - PASS: Server request logs include request_id field
+  - PASS: Store exposes runWithTraceContext
+  - PASS: Store propagates source_request_id for outbox flows
+  - PASS: Worker batch logs include structured tracing marker
+  - PASS: LOOM_REQUEST_LOG_ENABLED=true in provided env file
+  - PASS: LOOM_REQUEST_LOG_FORMAT=json in provided env file
+
+PASSED: request tracing checks succeeded.
+
+[release-gate] Threat model
+
+Threat model summary:
+  - PASS: Threat model present: /Users/mesut/Desktop/email++/docs/THREAT-MODEL.md
+  - PASS: Section present: # LOOM Threat Model
+  - PASS: Section present: ## Scope
+  - PASS: Section present: ## Assets
+  - PASS: Section present: ## Trust Boundaries
+  - PASS: Section present: ## STRIDE Analysis
+  - PASS: Section present: ## Mitigation Mapping
+  - PASS: Section present: ## Review Cadence
+  - PASS: STRIDE term present: Spoofing
+  - PASS: STRIDE term present: Tampering
+  - PASS: STRIDE term present: Repudiation
+  - PASS: STRIDE term present: Information Disclosure
+  - PASS: STRIDE term present: Denial of Service
+  - PASS: STRIDE term present: Elevation Of Privilege
+  - PASS: Threat model review age (0.6 days) is within 120 days
+
+PASSED: threat model checks succeeded.
+
+[release-gate] Security testing program
+
+Security testing program summary:
+  - PASS: Security program artifact present: docs/SECURITY-TESTING-PROGRAM.md
+  - PASS: Security program artifact present: .github/workflows/security.yml
+  - PASS: Security program artifact present: ops/security/findings-tracker-template.md
+  - PASS: Security program artifact present: scripts/check_secrets_hygiene.js
+  - PASS: Security program section present: Dependency scanning
+  - PASS: Security program section present: Static analysis (SAST)
+  - PASS: Security program section present: Periodic penetration testing
+  - PASS: Security program section present: Triage SLAs
+  - PASS: Security program includes severity SLA table
+  - PASS: security workflow includes npm audit step
+  - PASS: security workflow includes check:secrets step
+  - PASS: security workflow includes CodeQL initialization
+  - PASS: security workflow includes scheduled execution
+
+PASSED: security testing program checks succeeded.
+
+[release-gate] Capacity and chaos
+
+Capacity/chaos readiness summary:
+  - PASS: Capacity/chaos runbook present: /Users/mesut/Desktop/email++/docs/CAPACITY-CHAOS-TESTS.md
+  - PASS: Runbook section present: ## Load Scenarios
+  - PASS: Runbook section present: ## Chaos Scenarios
+  - PASS: Runbook section present: ## Pass Criteria
+  - PASS: Runbook section present: ## Evidence
+  - PASS: Found 1 chaos report(s)
+  - PASS: Latest chaos report age (0.2 days) is within 180 days
+  - PASS: Latest chaos report includes Key Results: 2026-02-18-baseline-capacity-chaos.md
+  - PASS: Latest chaos report includes Scenarios Executed: 2026-02-18-baseline-capacity-chaos.md
+
+PASSED: capacity/chaos readiness checks succeeded.
+
+[release-gate] Disaster recovery plan
+
+Disaster recovery plan summary:
+  - PASS: DR plan present: /Users/mesut/Desktop/email++/docs/DISASTER-RECOVERY-PLAN.md
+  - PASS: DR plan includes: RTO
+  - PASS: DR plan includes: RPO
+  - PASS: DR plan includes: ## Failover Procedure
+  - PASS: DR plan includes: ## Data Consistency Checks
+  - PASS: DR plan includes: ## Drill Cadence
+  - PASS: Found 1 DR report(s)
+  - PASS: Latest DR report age (0.2 days) is within 180 days
+  - PASS: Latest DR report includes Outcomes: 2026-02-18-dr-tabletop.md
+
+PASSED: disaster recovery plan checks succeeded.
+
+[release-gate] Access governance
+
+Access governance summary:
+  - PASS: Access governance doc present: /Users/mesut/Desktop/email++/docs/ACCESS-GOVERNANCE.md
+  - PASS: Access governance doc includes: least-privilege
+  - PASS: Access governance doc includes: Quarterly access review
+  - PASS: Access governance doc includes: Joiner/mover/leaver
+  - PASS: Access governance doc includes: Audit trail
+  - PASS: Access governance doc includes: break-glass
+  - PASS: Found 1 access review record(s)
+  - PASS: Latest access review age (0.2 days) is within 180 days
+  - PASS: Latest access review includes Access Inventory: 2026-02-18-access-review-template.md
+
+PASSED: access governance checks succeeded.
+
+[release-gate] Compliance controls
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Compliance controls summary:
+  - PASS: Compliance controls doc present: /Users/mesut/Desktop/email++/docs/COMPLIANCE-CONTROLS.md
+  - PASS: Compliance controls section present: # LOOM Compliance Controls
+  - PASS: Compliance controls section present: ## Compliance Scope
+  - PASS: Compliance controls section present: ## Audit Export Controls
+  - PASS: Compliance controls section present: ## Retention Policy
+  - PASS: Compliance controls section present: ## Policy Control Mapping
+  - PASS: Compliance controls section present: ## Evidence And Review Cadence
+  - PASS: Compliance controls section present: ## Validation Command
+  - PASS: Compliance controls reference present: /v1/admin/persistence/backup
+  - PASS: Compliance controls reference present: /v1/audit
+  - PASS: Compliance controls reference present: LOOM_AUDIT_HMAC_KEY
+  - PASS: Compliance controls reference present: LOOM_AUDIT_REQUIRE_MAC_VALIDATION
+  - PASS: Compliance controls reference present: LOOM_AUDIT_VALIDATE_CHAIN
+  - PASS: Compliance controls reference present: docs/ACCESS-GOVERNANCE.md
+  - PASS: Compliance controls reference present: docs/SECRETS-KEY-ROTATION.md
+  - PASS: Compliance controls reference present: docs/RELEASE-POLICY.md
+  - PASS: Compliance controls reference present: npm run check:compliance
+  - PASS: Compliance controls reference present: npm run drill:compliance
+  - PASS: Compliance controls reference present: npm run gate:compliance
+  - PASS: Compliance controls includes Last reviewed date: 2026-02-18
+  - PASS: Found 2 compliance checklist record(s)
+  - PASS: Latest compliance checklist section present: ## Scope
+  - PASS: Latest compliance checklist section present: ## Audit Export Validation
+  - PASS: Latest compliance checklist section present: ## Retention Validation
+  - PASS: Latest compliance checklist section present: ## Policy Control Validation
+  - PASS: Latest compliance checklist section present: ## Sign-off
+  - PASS: Latest compliance checklist age (0.0 days) is within 180 days
+  - PASS: Policy doc present: docs/ACCESS-GOVERNANCE.md
+  - PASS: Policy doc present: docs/SECRETS-KEY-ROTATION.md
+  - PASS: Policy doc present: docs/INBOUND-BRIDGE-HARDENING.md
+  - PASS: Policy doc present: docs/RATE-LIMIT-POLICY.md
+  - PASS: Policy doc present: docs/SECURITY-TESTING-PROGRAM.md
+  - PASS: Policy doc present: docs/RELEASE-POLICY.md
+  - PASS: Production readiness marks P2-03 as DONE
+  - PASS: Release checklist includes npm run check:compliance
+  - PASS: Release checklist includes npm run drill:compliance
+  - PASS: Release checklist includes npm run gate:compliance
+  - PASS: package.json includes scripts.check:compliance
+  - PASS: package.json includes scripts.drill:compliance
+  - PASS: package.json includes scripts.gate:compliance
+  - WARN: Runtime compliance probes skipped (no --base-url provided).
+
+PASSED: compliance controls checks succeeded.
+
+[release-gate] Compliance gate
+
+[compliance-gate] Compliance static/runtime checks
+Loaded env file: /tmp/loom-gate-20260218T134331Z-k6jg/gate.env
+
+Compliance controls summary:
+  - PASS: Compliance controls doc present: /Users/mesut/Desktop/email++/docs/COMPLIANCE-CONTROLS.md
+  - PASS: Compliance controls section present: # LOOM Compliance Controls
+  - PASS: Compliance controls section present: ## Compliance Scope
+  - PASS: Compliance controls section present: ## Audit Export Controls
+  - PASS: Compliance controls section present: ## Retention Policy
+  - PASS: Compliance controls section present: ## Policy Control Mapping
+  - PASS: Compliance controls section present: ## Evidence And Review Cadence
+  - PASS: Compliance controls section present: ## Validation Command
+  - PASS: Compliance controls reference present: /v1/admin/persistence/backup
+  - PASS: Compliance controls reference present: /v1/audit
+  - PASS: Compliance controls reference present: LOOM_AUDIT_HMAC_KEY
+  - PASS: Compliance controls reference present: LOOM_AUDIT_REQUIRE_MAC_VALIDATION
+  - PASS: Compliance controls reference present: LOOM_AUDIT_VALIDATE_CHAIN
+  - PASS: Compliance controls reference present: docs/ACCESS-GOVERNANCE.md
+  - PASS: Compliance controls reference present: docs/SECRETS-KEY-ROTATION.md
+  - PASS: Compliance controls reference present: docs/RELEASE-POLICY.md
+  - PASS: Compliance controls reference present: npm run check:compliance
+  - PASS: Compliance controls reference present: npm run drill:compliance
+  - PASS: Compliance controls reference present: npm run gate:compliance
+  - PASS: Compliance controls includes Last reviewed date: 2026-02-18
+  - PASS: Found 2 compliance checklist record(s)
+  - PASS: Latest compliance checklist section present: ## Scope
+  - PASS: Latest compliance checklist section present: ## Audit Export Validation
+  - PASS: Latest compliance checklist section present: ## Retention Validation
+  - PASS: Latest compliance checklist section present: ## Policy Control Validation
+  - PASS: Latest compliance checklist section present: ## Sign-off
+  - PASS: Latest compliance checklist age (0.0 days) is within 180 days
+  - PASS: Policy doc present: docs/ACCESS-GOVERNANCE.md
+  - PASS: Policy doc present: docs/SECRETS-KEY-ROTATION.md
+  - PASS: Policy doc present: docs/INBOUND-BRIDGE-HARDENING.md
+  - PASS: Policy doc present: docs/RATE-LIMIT-POLICY.md
+  - PASS: Policy doc present: docs/SECURITY-TESTING-PROGRAM.md
+  - PASS: Policy doc present: docs/RELEASE-POLICY.md
+  - PASS: Production readiness marks P2-03 as DONE
+  - PASS: Release checklist includes npm run check:compliance
+  - PASS: Release checklist includes npm run drill:compliance
+  - PASS: Release checklist includes npm run gate:compliance
+  - PASS: package.json includes scripts.check:compliance
+  - PASS: package.json includes scripts.drill:compliance
+  - PASS: package.json includes scripts.gate:compliance
+  - PASS: /v1/admin/persistence/backup runtime probe succeeded
+  - PASS: Backup payload includes audit_entries (2)
+  - PASS: Backup payload includes exported_at timestamp
+  - PASS: Backup payload includes schema_version
+  - PASS: /v1/admin/status runtime probe succeeded
+  - PASS: /v1/admin/status includes api_rate_limit_policy
+  - PASS: /v1/admin/status includes identity_rate_limit_policy
+  - PASS: /v1/admin/status includes federation_inbound_policy
+  - WARN: User audit runtime probe skipped (no --bearer-token provided).
+
+PASSED: compliance controls checks succeeded.
+
+[compliance-gate] Compliance runtime drill
+Compliance runtime drill report: /Users/mesut/Desktop/email++/scripts/output/compliance-drills/compliance-20260218T134339Z/report.json
+Compliance runtime drill summary: /Users/mesut/Desktop/email++/scripts/output/compliance-drills/compliance-20260218T134339Z/summary.md
+Compliance runtime drill result: PASS
+
+[compliance-gate] PASS
+
+[release-gate] Federation interop evidence
+
+Federation interop evidence summary:
+  - PASS: Using matrix report: /Users/mesut/Desktop/email++/scripts/output/federation-interop-matrix/interop-matrix-20260218T134337Z/report.json
+  - PASS: Matrix report contains 2 target run(s)
+  - PASS: Matrix report indicates overall success
+  - PASS: Matrix report age (0.00h) is within 168h
+  - PASS: Required target passed: staging
+  - PASS: Target staging assertion passed: challenge_issue_passed
+  - PASS: Target staging assertion passed: delivery_passed
+  - PASS: Target staging assertion passed: receipt_signature_verified
+  - PASS: Target staging assertion passed: replay_guard_passed
+  - PASS: Required target passed: preprod
+  - PASS: Target preprod assertion passed: challenge_issue_passed
+  - PASS: Target preprod assertion passed: delivery_passed
+  - PASS: Target preprod assertion passed: receipt_signature_verified
+  - PASS: Target preprod assertion passed: replay_guard_passed
+
+PASSED: federation interop evidence checks succeeded.
+
+[release-gate] Test suite
+
+> loom-mvn@0.2.6 test
+> node --test
+
+✔ conformance vectors: canonical JSON golden outputs (0.760041ms)
+✔ conformance vectors: canonical JSON rejects lone surrogates (0.194292ms)
+✔ conformance vectors: envelope signing canonicalization is stable (2.54825ms)
+✔ email relay enables DKIM config when complete options are provided (6.876792ms)
+✔ email relay rejects partial DKIM configuration (0.216791ms)
+✔ email relay loads DKIM private key from file (13.736916ms)
+✔ email relay maps rendered attachments into nodemailer mail payload (0.437459ms)
+✔ email relay rejects invalid attachment base64 payloads (0.234708ms)
+✔ ingestEnvelope rejects unsigned envelopes before consuming daily quota (7.012959ms)
+✔ federation delivery isolates per-envelope errors and accepts valid envelopes (1.85575ms)
+✔ federation delivery throws original error when all envelopes fail (0.693375ms)
+✔ reserveIdempotencySlot plants in-flight sentinel and blocks concurrent access (0.307833ms)
+✔ reserveIdempotencySlot release() clears the sentinel on failure (0.170708ms)
+✔ reserveIdempotencySlot rejects mismatched payload hash (0.166875ms)
+✔ email relay decodeBase64Content accepts standard base64 with padding (20.809583ms)
+✔ email relay decodeBase64Content accepts base64 without padding (2.573292ms)
+✔ email relay decodeBase64Content rejects invalid base64 characters (0.217583ms)
+✔ server includes HSTS header when requireHttpsFromProxy is configured (15.98825ms)
+✔ server includes CSP header on dashboard HTML response (5.293875ms)
+✔ validateThreadDag returns valid for a linear thread (0.073083ms)
+✔ validateThreadDag detects cycles (0.041834ms)
+✔ canonicalThreadOrder preserves topological + chronological ordering with sortedInsert (0.147792ms)
+✔ canonicalThreadOrder handles orphan envelopes (0.050667ms)
+✔ canonicalThreadOrder throws on cycle (0.077916ms)
+✔ server rejects malformed bearer token with extra segments gracefully (3.875583ms)
+✔ ingestEnvelope rejects when outbox backpressure limit is exceeded (0.794667ms)
+✔ ingestEnvelope allows envelopes when backpressure is disabled (default) (0.576334ms)
+✔ outbox stats include lag_ms for queued items (0.134792ms)
+✔ outbox stats show zero lag when no queued items (0.123458ms)
+✔ email and webhook outbox stats also include lag_ms (0.099875ms)
+✔ /ready endpoint includes postgres check as null when no adapter configured (1.834292ms)
+✔ /ready endpoint returns 503 when postgres health check fails (1.237917ms)
+✔ /ready endpoint returns 200 when postgres health check succeeds (2.033833ms)
+✔ claimOutboxItemForProcessing prevents double-claim within lease window (0.348792ms)
+✔ releaseOutboxItemClaim clears the in-memory lease (0.144208ms)
+✔ claimOutboxItemForProcessing returns false for null item (0.101542ms)
+✔ /metrics endpoint includes outbox lag metrics (3.196875ms)
+✔ shutdown propagates flush failure as non-zero exit intent (0.209834ms)
+✔ ULID module includes single-thread constraint documentation (0.378958ms)
+✔ federation quarantine uses immutable array for thread labels (0.9755ms)
+✔ canonical envelope excludes signature and meta (0.890333ms)
+✔ canonical JSON uses deterministic member ordering and rejects unsupported values (0.208167ms)
+✔ signed envelope verifies; tampered envelope fails verification (1.940167ms)
+✔ shape validation rejects recipient lists without primary role (1.727459ms)
+✔ store ingests signed envelope and rejects duplicates (2.3995ms)
+✔ store trace context propagates request and worker IDs into audit and outbox flows (1.611792ms)
+✔ store persists state to disk when dataDir is configured (25.06975ms)
+✔ store persists federation nonce replay cache across restart (42.80825ms)
+✔ store signs audit entries with HMAC and rejects tampered audit chains (0.656791ms)
+✔ store persists snapshots to external persistence adapter (0.440292ms)
+✔ store hydrates state and audit from external persistence adapter (0.447792ms)
+✔ store rejects cyclic thread DAG additions (0.955208ms)
+✔ thread retrieval uses canonical DAG rendering order (1.8365ms)
+✔ proof-of-key challenge and token exchange returns usable access token (0.604792ms)
+✔ store rejects envelope submission when actor identity mismatches envelope sender (0.341458ms)
+✔ store rejects envelope signed by key not in sender identity keyset (0.395ms)
+✔ store rejects envelope when from.key_id and signature.key_id differ (0.304334ms)
+✔ agent envelope with valid delegation chain is accepted (1.139833ms)
+✔ agent identity cannot bypass delegation by mislabeling from.type (0.326125ms)
+✔ agent envelope fails when delegation chain exceeds max_sub_delegation_depth (0.966917ms)
+✔ agent envelope fails when delegation is revoked (0.889ms)
+✔ thread_op requires capability token for non-owner and consumes single-use capability (9.460709ms)
+✔ federated non-owner thread_op rejects legacy presentation capability tokens (1.210625ms)
+✔ identity and timestamp validators enforce canonical protocol format (0.043417ms)
+✔ envelope validation enforces type-intent consistency and bcc audience mode (0.10525ms)
+✔ delegation authorization uses server-required action context (1.12825ms)
+✔ thread canonical order prioritizes rooted messages over orphaned pending-parent envelopes (0.627042ms)
+✔ email outbox processing honors persistence claim lock semantics (1.499666ms)
+✔ maintenance sweep evicts expired access tokens and refresh tokens (0.348125ms)
+✔ maintenance sweep evicts used and expired auth challenges (0.151417ms)
+✔ maintenance sweep evicts stale identity rate limit buckets (0.13675ms)
+✔ maintenance sweep caps consumedPortableCapabilityIds to configured max (0.192959ms)
+✔ maintenance sweep caps revokedDelegationIds to configured max (0.185083ms)
+✔ maintenance sweep does not remove entries that are still valid (0.128084ms)
+✔ maintenance sweep delegates to existing federation nonce cleanup (0.101208ms)
+✔ maintenance sweep returns swept count reflecting total evictions (0.099ms)
+✔ outbox worker backoff formula doubles on consecutive failures and caps at 5 minutes (0.050209ms)
+✔ persistState uses atomic write pattern and produces no leftover tmp file (19.769958ms)
+✔ persistState survives reload after atomic write (21.89575ms)
+✔ registerIdentity enforces maxLocalIdentities limit (0.45675ms)
+✔ registerIdentity enforces maxRemoteIdentities limit (0.371542ms)
+✔ registerIdentity allows overwrite even at limit (does not block updates) (0.300333ms)
+✔ createDelegation enforces maxDelegationsTotal limit (0.950833ms)
+✔ createDelegation enforces maxDelegationsPerIdentity limit (0.715625ms)
+✔ API serves LOOM live dashboard at root path (22.483625ms)
+✔ API emits x-loom-request-id and honors valid incoming request IDs (7.224875ms)
+✔ API can serve over native TLS HTTP/2 (15.862041ms)
+✔ API node document advertises identity resolve URL (6.40175ms)
+✔ API rejects request bodies larger than configured max (2.049459ms)
+✔ API can disable public identity signup (2.642375ms)
+✔ API enforces local-domain identity registration and gated remote imports (3.194958ms)
+✔ API rejects reserved/system signing key ids during identity registration (1.86525ms)
+✔ API rejects cross-identity key_id reuse during identity registration (3.099875ms)
+✔ API can require proof-of-key for identity registration (5.885334ms)
+✔ API supports owner-authenticated identity key rotation and blocks non-owner updates (14.107959ms)
+✔ API blocks auth challenge for imported remote identities (3.427209ms)
+✔ API can disable bridge and gateway send routes (2.68175ms)
+✔ API enforces rate limit on sensitive auth routes (2.9115ms)
+✔ API enforces per-identity rate limit in addition to per-IP limits (3.588333ms)
+✔ API enforces per-identity daily envelope quota (5.358917ms)
+✔ API enforces thread recipient fanout cap (3.081584ms)
+✔ API does not trust x-forwarded-for for rate limit buckets by default (2.144542ms)
+✔ API can trust x-forwarded-for when explicitly enabled (2.288417ms)
+✔ API trusts x-forwarded-for only when proxy source is allowlisted (2.135625ms)
+✔ API ignores x-forwarded-for when proxy source is not allowlisted (1.704875ms)
+✔ API rejects invalid trusted proxy allowlist configuration (0.311ms)
+✔ API enforces HTTPS via trusted proxy headers when configured (2.147583ms)
+✔ API requires trusted proxy configuration for strict proxy HTTPS mode (0.158959ms)
+✔ API rejects metadata webhook targets even when private network access is enabled (2.624917ms)
+✔ API refuses public inbound bridge exposure without explicit confirmation (0.209459ms)
+✔ API rejects inbound bridge admin requirement without configured admin token (0.151541ms)
+✔ API applies strict inbound bridge auth defaults on public service (0.149625ms)
+✔ API refuses weak inbound bridge auth policy on public service without explicit confirmation (0.143709ms)
+✔ API requires admin token for inbound bridged email when configured (4.513084ms)
+✔ API exposes readiness and protects admin operational endpoints (3.232833ms)
+✔ API enforces auth for envelope submission and supports proof-of-key login (6.76525ms)
+✔ API requires authentication for thread and envelope reads by default (4.585834ms)
+✔ API supports delegation create/list/revoke for authenticated delegator (5.645917ms)
+✔ API supports blob create/upload/complete/download (6.292875ms)
+✔ API enforces blob part size and count limits (4.568084ms)
+✔ API enforces per-identity blob daily count quota (4.928ms)
+✔ API enforces per-identity daily blob byte quota on complete (4.244458ms)
+✔ API enforces per-identity total blob byte quota on complete (5.199ms)
+✔ API accepts signed federation delivery from trusted node (5.262708ms)
+✔ API auto-resolves remote sender identity during federation delivery (6.94425ms)
+✔ API rejects unsigned remote identity documents during federation auto-resolve by default (4.312333ms)
+✔ API can disable signed remote identity requirement for federation auto-resolve compatibility (21.860417ms)
+✔ API enforces remote identity host allowlist during federation auto-resolve (15.858125ms)
+✔ API rejects federated envelopes whose sender identity domain mismatches sender node (7.382625ms)
+✔ API rejects inbound federation when node policy is deny (3.871ms)
+✔ API marks inbound federation threads as quarantined when node policy is quarantine (3.881833ms)
+✔ API rejects inbound federation delivery when envelope batch exceeds configured max (4.887584ms)
+✔ API rate-limits inbound federation requests per trusted node (6.395709ms)
+✔ API auto-quarantines federation node after repeated failed inbound verification (8.63275ms)
+✔ API auto-denies federation node after repeated failed inbound verification (6.068834ms)
+✔ API processes outbound federation outbox and delivers to remote node (13.125417ms)
+✔ API can require signed federation receipts for outbound delivery (8.690375ms)
+✔ API bootstraps federation node trust from node discovery document (6.865708ms)
+✔ API rejects federation bootstrap to private network by default (3.491791ms)
+✔ API enforces federation bootstrap host allowlist (3.922542ms)
+✔ API requires admin token for insecure federation node transport settings when configured (4.368958ms)
+✔ API rejects webhook private-network targets unless explicitly allowed (1.437125ms)
+✔ API enforces webhook outbound host allowlist (2.546375ms)
+✔ API supports bridge and gateway email surfaces (8.596125ms)
+✔ API quarantines inbound bridged email when auth policy marks message as unverified (7.938042ms)
+✔ API can reject inbound bridged email when auth failure rejection is enabled (3.414875ms)
+✔ API hardens SMTP and IMAP parsing for edge-case address and header formats (6.32575ms)
+✔ API hides BCC recipients from non-sender IMAP recipient views (7.059333ms)
+✔ API supports per-user mailbox state without mutating other participants (6.975833ms)
+✔ API supports capability presentation token in header for thread operations (10.894ms)
+✔ API can require portable capability payloads for non-owner thread operations (8.093542ms)
+✔ API supports outbound email relay outbox queue and process (9.052834ms)
+✔ API accepts DSN updates for email outbox items and enforces recipient matching (6.280542ms)
+✔ API exposes dead-letter outbox and supports admin requeue (9.799625ms)
+✔ API supports idempotency key replay and conflict detection (6.166375ms)
+✔ API supports webhook receipt delivery with signed callback (6.917417ms)
+✔ API supports admin persistence schema backup and restore endpoints (5.183083ms)
+✔ API enforces federation challenge escalation and single-use challenge tokens (8.210792ms)
+✔ API enforces distributed federation node rate guard on first request in a window (4.700333ms)
+✔ wire gateway refuses authenticated mode without TLS by default (2.20525ms)
+✔ wire gateway refuses insecure auth override on public bind without explicit confirmation (6.553666ms)
+✔ wire SMTP gateway accepts AUTH and submits envelope into store (14.594875ms)
+✔ wire SMTP gateway supports SMTPUTF8 ESMTP parameter for gateway-compatible flows (5.385125ms)
+✔ wire IMAP gateway supports LOGIN LIST SELECT FETCH flow (4.401334ms)
+✔ wire IMAP gateway supports IDLE, APPEND, MOVE, UID MOVE, and sectioned FETCH (6.425667ms)
+✔ wire SMTP gateway supports STARTTLS upgrade (6.00975ms)
+✔ wire IMAP gateway supports STARTTLS and extended mailbox commands (5.870292ms)
+✔ wire gateway enforces global connection cap across SMTP and IMAP (1.682792ms)
+✔ wire SMTP gateway enforces message size during DATA streaming (3.143583ms)
+✔ wire gateway closes oversized unterminated SMTP line buffers (1.158833ms)
+ℹ tests 170
+ℹ suites 0
+ℹ pass 170
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 565.202541
+
+[release-gate] PASS

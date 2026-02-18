@@ -1,0 +1,10 @@
+2026-02-18 13:43:35.683 WET [73704] LOG:  starting PostgreSQL 14.20 (Homebrew) on aarch64-apple-darwin25.1.0, compiled by Apple clang version 17.0.0 (clang-1700.4.4.1), 64-bit
+2026-02-18 13:43:35.683 WET [73704] LOG:  listening on IPv4 address "127.0.0.1", port 55432
+2026-02-18 13:43:35.685 WET [73704] LOG:  listening on Unix socket "/tmp/.s.PGSQL.55432"
+2026-02-18 13:43:35.691 WET [73705] LOG:  database system was shut down at 2026-02-18 13:43:35 WET
+2026-02-18 13:43:35.695 WET [73704] LOG:  database system is ready to accept connections
+2026-02-18 13:43:40.350 WET [73704] LOG:  received fast shutdown request
+2026-02-18 13:43:40.351 WET [73704] LOG:  aborting any active transactions
+2026-02-18 13:43:40.353 WET [73704] LOG:  background worker "logical replication launcher" (PID 73711) exited with exit code 1
+2026-02-18 13:43:40.353 WET [73706] LOG:  shutting down
+2026-02-18 13:43:40.377 WET [73704] LOG:  database system is shut down
