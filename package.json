@@ -16,5 +16,6 @@
     "dev": "node --watch src/index.js",
     "test": "node --test",
     "samples": "node scripts/make_sample_payloads.js"
-  }
+  },
+  "license": "Apache-2.0"
 }

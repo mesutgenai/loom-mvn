@@ -1,4 +1,4 @@
-# LOOM MVN v1.1 Conformance Profile (v0.2.5)
+# LOOM MVN v1.1 Conformance Profile (v0.2.6)
 
 This document defines the current conformance surface implemented by this MVN and the test vectors that gate protocol behavior.
 
@@ -11,6 +11,8 @@ Release and governance references:
 - Changelog: `CHANGELOG.md`
 - CI workflow: `.github/workflows/ci.yml`
 - License: `LICENSE`
+- Stability policy: `docs/STABILITY.md`
+- Release policy: `docs/RELEASE-POLICY.md`
 
 ## Normative Surface
 

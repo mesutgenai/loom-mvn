@@ -82,6 +82,41 @@ export class LoomPostgresPersistence {
         ON loom_audit (created_at DESC)
       `);
 
+      // Protect audit log from accidental or malicious deletion/update.
+      // RLS policies are no-ops if the connecting role is a superuser, but
+      // guard against application-level credentials that lack superuser.
+      await client.query(`ALTER TABLE loom_audit ENABLE ROW LEVEL SECURITY`);
+      await client.query(`
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_policies WHERE tablename = 'loom_audit' AND policyname = 'audit_insert_only'
+          ) THEN
+            CREATE POLICY audit_insert_only ON loom_audit FOR ALL
+              USING (true) WITH CHECK (true);
+          END IF;
+        END $$
+      `);
+      await client.query(`
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_policies WHERE tablename = 'loom_audit' AND policyname = 'audit_no_delete'
+          ) THEN
+            CREATE POLICY audit_no_delete ON loom_audit FOR DELETE
+              USING (false);
+          END IF;
+        END $$
+      `);
+      await client.query(`
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_policies WHERE tablename = 'loom_audit' AND policyname = 'audit_no_update'
+          ) THEN
+            CREATE POLICY audit_no_update ON loom_audit FOR UPDATE
+              USING (false);
+          END IF;
+        END $$
+      `);
+
       await client.query(`
         CREATE TABLE IF NOT EXISTS loom_federation_rate_events (
           id BIGSERIAL PRIMARY KEY,

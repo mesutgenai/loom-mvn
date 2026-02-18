@@ -2,7 +2,10 @@
 
 ## Supported Versions
 
-Security fixes are currently applied to the latest code on `main` (`0.1.x` development line).
+Security fixes are currently applied to:
+
+- Latest code on `main` (current `0.2.x` development line).
+- Most recent tagged release in `0.2.x` when a hotfix can be safely backported.
 
 ## Reporting A Vulnerability
 
@@ -23,7 +26,10 @@ If private advisory reporting is unavailable, open a minimal GitHub issue withou
 
 - Initial triage response target: 3 business days.
 - Status update target: within 7 business days after triage.
-- Fix timeline depends on severity and exploitability.
+- Fix target by severity (from confirmed triage date):
+  - Critical: patch or mitigation within 72 hours.
+  - High: patch or mitigation within 7 calendar days.
+  - Medium/Low: next scheduled patch release (target within 30 days).
 
 ## Scope Notes
 

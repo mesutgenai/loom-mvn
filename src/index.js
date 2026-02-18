@@ -222,7 +222,7 @@ function startFederationOutboxWorker() {
 
   runtimeStatus.federation_outbox_worker.enabled = true;
 
-  federationOutboxTimer = setInterval(async () => {
+  federationOutboxTimer = setInterval(() => {
     if (isFederationOutboxProcessing) {
       return;
     }
@@ -231,6 +231,7 @@ function startFederationOutboxWorker() {
     }
 
     isFederationOutboxProcessing = true;
+    void (async () => {
     runtimeStatus.federation_outbox_worker.in_progress = true;
     runtimeStatus.federation_outbox_worker.last_run_at = new Date().toISOString();
     runtimeStatus.federation_outbox_worker.runs_total += 1;
@@ -258,6 +259,7 @@ function startFederationOutboxWorker() {
       isFederationOutboxProcessing = false;
       runtimeStatus.federation_outbox_worker.in_progress = false;
     }
+    })();
   }, federationOutboxAutoProcessIntervalMs);
 
   federationOutboxTimer.unref?.();
@@ -283,7 +285,7 @@ function startEmailOutboxWorker() {
 
   runtimeStatus.email_outbox_worker.enabled = true;
 
-  emailOutboxTimer = setInterval(async () => {
+  emailOutboxTimer = setInterval(() => {
     if (isEmailOutboxProcessing) {
       return;
     }
@@ -292,6 +294,7 @@ function startEmailOutboxWorker() {
     }
 
     isEmailOutboxProcessing = true;
+    void (async () => {
     runtimeStatus.email_outbox_worker.in_progress = true;
     runtimeStatus.email_outbox_worker.last_run_at = new Date().toISOString();
     runtimeStatus.email_outbox_worker.runs_total += 1;
@@ -320,6 +323,7 @@ function startEmailOutboxWorker() {
       isEmailOutboxProcessing = false;
       runtimeStatus.email_outbox_worker.in_progress = false;
     }
+    })();
   }, emailOutboxAutoProcessIntervalMs);
 
   emailOutboxTimer.unref?.();
@@ -340,7 +344,7 @@ function startWebhookOutboxWorker() {
 
   runtimeStatus.webhook_outbox_worker.enabled = true;
 
-  webhookOutboxTimer = setInterval(async () => {
+  webhookOutboxTimer = setInterval(() => {
     if (isWebhookOutboxProcessing) {
       return;
     }
@@ -349,6 +353,7 @@ function startWebhookOutboxWorker() {
     }
 
     isWebhookOutboxProcessing = true;
+    void (async () => {
     runtimeStatus.webhook_outbox_worker.in_progress = true;
     runtimeStatus.webhook_outbox_worker.last_run_at = new Date().toISOString();
     runtimeStatus.webhook_outbox_worker.runs_total += 1;
@@ -377,6 +382,7 @@ function startWebhookOutboxWorker() {
       isWebhookOutboxProcessing = false;
       runtimeStatus.webhook_outbox_worker.in_progress = false;
     }
+    })();
   }, webhookOutboxAutoProcessIntervalMs);
 
   webhookOutboxTimer.unref?.();
@@ -460,11 +466,13 @@ async function initializePersistence() {
 }
 
 async function flushAndClosePersistence() {
+  let flushFailed = false;
   try {
     await store.flushPersistenceQueueNow(15000);
   } catch (error) {
+    flushFailed = true;
     // eslint-disable-next-line no-console
-    console.error("LOOM persistence flush failed", error);
+    console.error("LOOM persistence flush failed — potential data loss", error);
   }
 
   if (postgresPersistence?.close) {
@@ -475,6 +483,8 @@ async function flushAndClosePersistence() {
       console.error("LOOM postgres persistence close failed", error);
     }
   }
+
+  return { flushFailed };
 }
 
 let shuttingDown = false;
@@ -498,7 +508,7 @@ async function shutdown(signal, exitCode = 0) {
   // eslint-disable-next-line no-console
   console.log(`Received ${signal}, shutting down LOOM MVN...`);
 
-  await flushAndClosePersistence();
+  const { flushFailed } = await flushAndClosePersistence();
 
   await new Promise((resolve) => {
     if (!server.listening) {
@@ -511,7 +521,7 @@ async function shutdown(signal, exitCode = 0) {
     });
   });
 
-  process.exit(exitCode);
+  process.exit(flushFailed ? 1 : exitCode);
 }
 
 process.once("SIGINT", () => {

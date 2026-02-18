@@ -617,12 +617,12 @@ function getBearerToken(req) {
     return null;
   }
 
-  const [scheme, token] = String(authorization).split(" ");
-  if (!scheme || scheme.toLowerCase() !== "bearer" || !token) {
+  const parts = String(authorization).split(" ", 2);
+  if (!parts[0] || parts[0].toLowerCase() !== "bearer" || !parts[1]) {
     return null;
   }
 
-  return token;
+  return parts[1];
 }
 
 function getCapabilityPresentationToken(req) {
@@ -838,6 +838,9 @@ function formatMetricsPrometheus(
   lines.push(`loom_federation_outbox_delivered ${federationOutbox.delivered}`);
   lines.push(`loom_federation_outbox_failed ${federationOutbox.failed}`);
   lines.push(`loom_federation_outbox_retry_scheduled ${federationOutbox.retry_scheduled}`);
+  lines.push("# HELP loom_federation_outbox_lag_ms Age of the oldest queued federation outbox item in milliseconds.");
+  lines.push("# TYPE loom_federation_outbox_lag_ms gauge");
+  lines.push(`loom_federation_outbox_lag_ms ${federationOutbox.lag_ms || 0}`);
 
   lines.push("# HELP loom_email_outbox_total Total outbound email outbox items.");
   lines.push("# TYPE loom_email_outbox_total gauge");
@@ -846,6 +849,9 @@ function formatMetricsPrometheus(
   lines.push(`loom_email_outbox_delivered ${emailOutbox.delivered}`);
   lines.push(`loom_email_outbox_failed ${emailOutbox.failed}`);
   lines.push(`loom_email_outbox_retry_scheduled ${emailOutbox.retry_scheduled}`);
+  lines.push("# HELP loom_email_outbox_lag_ms Age of the oldest queued email outbox item in milliseconds.");
+  lines.push("# TYPE loom_email_outbox_lag_ms gauge");
+  lines.push(`loom_email_outbox_lag_ms ${emailOutbox.lag_ms || 0}`);
 
   lines.push("# HELP loom_webhook_outbox_total Total webhook outbox items.");
   lines.push("# TYPE loom_webhook_outbox_total gauge");
@@ -854,6 +860,9 @@ function formatMetricsPrometheus(
   lines.push(`loom_webhook_outbox_delivered ${webhookOutbox.delivered}`);
   lines.push(`loom_webhook_outbox_failed ${webhookOutbox.failed}`);
   lines.push(`loom_webhook_outbox_retry_scheduled ${webhookOutbox.retry_scheduled}`);
+  lines.push("# HELP loom_webhook_outbox_lag_ms Age of the oldest queued webhook outbox item in milliseconds.");
+  lines.push("# TYPE loom_webhook_outbox_lag_ms gauge");
+  lines.push(`loom_webhook_outbox_lag_ms ${webhookOutbox.lag_ms || 0}`);
 
   if (idempotencyStatus) {
     lines.push("# HELP loom_idempotency_entries Number of active idempotency records.");
@@ -1257,7 +1266,16 @@ export function createLoomServer(options = {}) {
       maxLocalIdentities,
       maxRemoteIdentities,
       maxDelegationsPerIdentity,
-      maxDelegationsTotal
+      maxDelegationsTotal,
+      outboxBackpressureMax: Math.max(
+        0,
+        Math.floor(
+          parsePositiveNumber(
+            options.outboxBackpressureMax ?? process.env.LOOM_OUTBOX_BACKPRESSURE_MAX,
+            0
+          )
+        )
+      )
     });
   const maxBodyBytes = parsePositiveNumber(
     options.maxBodyBytes ?? process.env.LOOM_MAX_BODY_BYTES,
@@ -1397,6 +1415,9 @@ export function createLoomServer(options = {}) {
     res.setHeader("x-content-type-options", "nosniff");
     res.setHeader("x-frame-options", "DENY");
     res.setHeader("cache-control", "no-store");
+    if (nativeTlsConfig.enabled || requireHttpsFromProxy) {
+      res.setHeader("strict-transport-security", "max-age=63072000; includeSubDomains");
+    }
 
     const reqId = `req_${randomUUID()}`;
     const startedAt = Date.now();
@@ -1448,6 +1469,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "GET") && path === "/") {
+        res.setHeader("content-security-policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'");
         sendHtml(res, 200, renderDashboardHtml());
         return;
       }
@@ -1469,14 +1491,27 @@ export function createLoomServer(options = {}) {
         const emailOutbox = store.getEmailOutboxStats();
         const webhookOutbox = store.getWebhookOutboxStats();
         const federationInboundPolicy = store.getFederationInboundPolicyStatus();
-        sendJson(res, 200, {
-          ok: true,
+
+        let pgCheck = null;
+        if (store.persistenceAdapter && typeof store.persistenceAdapter.pool?.query === "function") {
+          try {
+            await store.persistenceAdapter.pool.query("SELECT 1");
+            pgCheck = "ok";
+          } catch {
+            pgCheck = "error";
+          }
+        }
+
+        const allChecksOk = pgCheck !== "error";
+        sendJson(res, allChecksOk ? 200 : 503, {
+          ok: allChecksOk,
           service: "loom-mvn",
           timestamp: new Date().toISOString(),
           uptime_s: metrics.snapshot().uptime_s,
           checks: {
             http: "ok",
-            store: "ok"
+            store: "ok",
+            postgres: pgCheck
           },
           outbox: {
             federation: federationOutbox,

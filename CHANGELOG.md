@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+Governance and trust-signal alignment updates:
+
+- Added contribution/governance docs: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`.
+- Added lifecycle policy docs: `docs/STABILITY.md`, `docs/RELEASE-POLICY.md`, `docs/OPEN-SOURCE-STRATEGY.md`.
+- Added GitHub issue templates (`bug report`, `feature request`) and issue config routing users to support/security resources.
+- Aligned docs with current release line (`v0.2.6`) in `README.md` and `docs/CONFORMANCE.md`.
+- Updated `SECURITY.md` support scope to `0.2.x` + `main` and documented target fix SLAs by severity.
+
 ## v0.2.6 - 2026-02-17
 
 Production hardening, memory safety, and operational resilience:
@@ -69,7 +79,6 @@ Security and interoperability updates:
   - New `test/conformance_vectors.test.js`.
   - Added DSN, claim-lock, attachment mapping, and SMTPUTF8 tests.
 - Repository governance and delivery hardening:
-  - Added `LICENSE` (MIT).
+  - Added `LICENSE` (Apache-2.0).
   - Added GitHub Actions CI workflow at `.github/workflows/ci.yml`.
   - Added `docs/CONFORMANCE.md`.
-

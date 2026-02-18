@@ -996,6 +996,7 @@ export class LoomStore {
     this.blobDailyCountMax = Math.max(0, parseNonNegativeInteger(options.blobDailyCountMax, 0));
     this.blobDailyBytesMax = Math.max(0, parseNonNegativeInteger(options.blobDailyBytesMax, 0));
     this.blobIdentityTotalBytesMax = Math.max(0, parseNonNegativeInteger(options.blobIdentityTotalBytesMax, 0));
+    this.outboxBackpressureMax = Math.max(0, parseNonNegativeInteger(options.outboxBackpressureMax, 0));
     this.identityEnvelopeUsageByDay = new Map();
     this.identityBlobUsageByDay = new Map();
     this.identityBlobTotalBytes = new Map();
@@ -2235,7 +2236,8 @@ export class LoomStore {
       failed: 0,
       retry_scheduled: 0,
       oldest_queued_at: null,
-      newest_queued_at: null
+      newest_queued_at: null,
+      lag_ms: 0
     };
 
     for (const item of this.webhookOutboxById.values()) {
@@ -2258,6 +2260,10 @@ export class LoomStore {
       } else if (item.status === "failed") {
         stats.failed += 1;
       }
+    }
+
+    if (stats.oldest_queued_at) {
+      stats.lag_ms = Math.max(0, nowMs() - Date.parse(stats.oldest_queued_at));
     }
 
     return stats;
@@ -2573,6 +2579,79 @@ export class LoomStore {
     };
   }
 
+  /**
+   * Atomically reserve an idempotency slot so that concurrent async
+   * operations with the same key are serialized.  Returns null if the slot
+   * cannot be reserved (e.g. missing key), an object with `replay` if a
+   * completed response already exists, or an object with a `finalize`
+   * callback that MUST be called with (status, body) once the operation
+   * completes (or `release` on failure).
+   */
+  reserveIdempotencySlot(scope, key, requestHash) {
+    const normalizedKey = this.normalizeIdempotencyKey(key);
+    if (!scope || !normalizedKey) {
+      return null;
+    }
+
+    this.cleanupIdempotencyCache();
+    const cacheKey = this.buildIdempotencyCacheKey(scope, normalizedKey);
+    const existing = this.idempotencyByKey.get(cacheKey);
+
+    if (existing) {
+      if (existing._inflight) {
+        // Another request is already in-flight for this key — treat as replay
+        // (the caller should retry or return 409).
+        throw new LoomError("IDEMPOTENCY_CONFLICT", "Idempotency key is currently being processed", 409, {
+          scope,
+          key: normalizedKey
+        });
+      }
+      if (existing.request_hash !== requestHash) {
+        throw new LoomError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with different payload", 409, {
+          scope,
+          key: normalizedKey
+        });
+      }
+      return { replay: { status: existing.status, body: existing.body } };
+    }
+
+    // Plant an in-flight sentinel synchronously so no other tick can claim
+    // the same slot.
+    const sentinel = {
+      _inflight: true,
+      key: normalizedKey,
+      scope,
+      request_hash: requestHash,
+      created_at: nowIso(),
+      expires_at: new Date(nowMs() + this.idempotencyTtlMs).toISOString()
+    };
+    this.idempotencyByKey.set(cacheKey, sentinel);
+
+    return {
+      finalize: (status, body) => {
+        const code = Number(status);
+        if (!Number.isFinite(code) || code < 200 || code >= 500) {
+          this.idempotencyByKey.delete(cacheKey);
+          return null;
+        }
+        const record = {
+          key: normalizedKey,
+          scope,
+          request_hash: requestHash,
+          status: code,
+          body,
+          created_at: sentinel.created_at,
+          expires_at: sentinel.expires_at
+        };
+        this.idempotencyByKey.set(cacheKey, record);
+        return record;
+      },
+      release: () => {
+        this.idempotencyByKey.delete(cacheKey);
+      }
+    };
+  }
+
   storeIdempotencyResponse(scope, key, requestHash, status, body) {
     const normalizedKey = this.normalizeIdempotencyKey(key);
     if (!scope || !normalizedKey) {
@@ -2587,7 +2666,7 @@ export class LoomStore {
     this.cleanupIdempotencyCache();
     const cacheKey = this.buildIdempotencyCacheKey(scope, normalizedKey);
     const existing = this.idempotencyByKey.get(cacheKey);
-    if (existing) {
+    if (existing && !existing._inflight) {
       if (existing.request_hash !== requestHash) {
         throw new LoomError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with different payload", 409, {
           scope,
@@ -3755,44 +3834,67 @@ export class LoomStore {
     }
 
     const accepted = [];
+    const rejected = [];
     const quarantined = verifiedNode.policy === "quarantine";
     for (const envelope of wrapper.envelopes) {
-      await this.ensureFederatedSenderIdentity(envelope, verifiedNode);
+      try {
+        await this.ensureFederatedSenderIdentity(envelope, verifiedNode);
 
-      const envelopeWithPolicyMeta = quarantined
-        ? {
-            ...envelope,
-            meta: {
-              ...(envelope.meta || {}),
-              federation: {
-                ...(envelope.meta?.federation || {}),
-                source_node: verifiedNode.node_id,
-                policy: "quarantine"
+        const envelopeWithPolicyMeta = quarantined
+          ? {
+              ...envelope,
+              meta: {
+                ...(envelope.meta || {}),
+                federation: {
+                  ...(envelope.meta?.federation || {}),
+                  source_node: verifiedNode.node_id,
+                  policy: "quarantine"
+                }
               }
             }
+          : envelope;
+
+        const stored = this.ingestEnvelope(envelopeWithPolicyMeta, {
+          actorIdentity: envelopeWithPolicyMeta?.from?.identity,
+          federated: true,
+          federationNode: verifiedNode
+        });
+
+        if (quarantined) {
+          const thread = this.threadsById.get(stored.thread_id);
+          if (thread && !thread.labels.includes("sys.quarantine")) {
+            thread.labels = [...thread.labels, "sys.quarantine"];
+            thread.updated_at = nowIso();
           }
-        : envelope;
-
-      const stored = this.ingestEnvelope(envelopeWithPolicyMeta, {
-        actorIdentity: envelopeWithPolicyMeta?.from?.identity,
-        federated: true,
-        federationNode: verifiedNode
-      });
-
-      if (quarantined) {
-        const thread = this.threadsById.get(stored.thread_id);
-        if (thread && !thread.labels.includes("sys.quarantine")) {
-          thread.labels.push("sys.quarantine");
-          thread.updated_at = nowIso();
         }
-      }
 
-      accepted.push(stored.id);
+        accepted.push(stored.id);
+      } catch (envelopeError) {
+        rejected.push({
+          envelope_id: envelope?.id || null,
+          error: envelopeError?.code || envelopeError?.message || "UNKNOWN",
+          _error: envelopeError
+        });
+      }
+    }
+
+    if (accepted.length === 0 && rejected.length > 0) {
+      // If every envelope was rejected, re-throw the first original error
+      // so callers see the real status code and error code.
+      const firstError = rejected[0]._error;
+      if (firstError) {
+        throw firstError;
+      }
+      throw new LoomError("ENVELOPE_INVALID", "All envelopes in federation delivery were rejected", 400, {
+        rejected_count: rejected.length,
+        rejected: rejected.map(({ envelope_id, error }) => ({ envelope_id, error }))
+      });
     }
 
     this.persistAndAudit("federation.deliver", {
       sender_node: verifiedNode.node_id,
       accepted_count: accepted.length,
+      rejected_count: rejected.length,
       policy: verifiedNode.policy
     });
 
@@ -3801,13 +3903,15 @@ export class LoomStore {
       delivery_id: deliveryId || `fdel_${generateUlid()}`,
       sender_node: this.nodeId,
       recipient_node: verifiedNode.node_id,
-      status: "accepted",
+      status: rejected.length > 0 ? "partial" : "accepted",
       accepted_envelope_ids: accepted
     });
 
     return {
       sender_node: verifiedNode.node_id,
       accepted_count: accepted.length,
+      rejected_count: rejected.length,
+      rejected: rejected.length > 0 ? rejected.map(({ envelope_id, error }) => ({ envelope_id, error })) : undefined,
       accepted_envelope_ids: accepted,
       receipt
     };
@@ -3926,7 +4030,8 @@ export class LoomStore {
       failed: 0,
       retry_scheduled: 0,
       oldest_queued_at: null,
-      newest_queued_at: null
+      newest_queued_at: null,
+      lag_ms: 0
     };
 
     for (const item of this.federationOutboxById.values()) {
@@ -3949,6 +4054,10 @@ export class LoomStore {
       } else if (item.status === "failed") {
         stats.failed += 1;
       }
+    }
+
+    if (stats.oldest_queued_at) {
+      stats.lag_ms = Math.max(0, nowMs() - Date.parse(stats.oldest_queued_at));
     }
 
     return stats;
@@ -5948,7 +6057,8 @@ export class LoomStore {
       failed: 0,
       retry_scheduled: 0,
       oldest_queued_at: null,
-      newest_queued_at: null
+      newest_queued_at: null,
+      lag_ms: 0
     };
 
     for (const item of this.emailOutboxById.values()) {
@@ -5971,6 +6081,10 @@ export class LoomStore {
       } else if (item.status === "failed") {
         stats.failed += 1;
       }
+    }
+
+    if (stats.oldest_queued_at) {
+      stats.lag_ms = Math.max(0, nowMs() - Date.parse(stats.oldest_queued_at));
     }
 
     return stats;
@@ -6242,7 +6356,23 @@ export class LoomStore {
   }
 
   async claimOutboxItemForProcessing(kind, item) {
-    if (!item || !this.persistenceAdapter || typeof this.persistenceAdapter.claimOutboxItem !== "function") {
+    if (!item) {
+      return false;
+    }
+
+    // In-memory lease guard — prevents double-processing within the same
+    // process even when no persistence adapter is configured.
+    const leaseKey = `${kind}:${item.id}`;
+    const existingLease = this._outboxLeases?.get(leaseKey);
+    if (existingLease && existingLease > Date.now()) {
+      return false;
+    }
+    if (!this._outboxLeases) {
+      this._outboxLeases = new Map();
+    }
+    this._outboxLeases.set(leaseKey, Date.now() + this.outboxClaimLeaseMs);
+
+    if (!this.persistenceAdapter || typeof this.persistenceAdapter.claimOutboxItem !== "function") {
       return true;
     }
 
@@ -6253,11 +6383,23 @@ export class LoomStore {
       leaseMs: this.outboxClaimLeaseMs,
       workerId: this.outboxWorkerId
     });
-    return claim?.claimed !== false;
+    if (claim?.claimed === false) {
+      this._outboxLeases.delete(leaseKey);
+      return false;
+    }
+    return true;
   }
 
   async releaseOutboxItemClaim(kind, item) {
-    if (!item || !this.persistenceAdapter || typeof this.persistenceAdapter.releaseOutboxClaim !== "function") {
+    if (!item) {
+      return;
+    }
+
+    // Clear in-memory lease.
+    const leaseKey = `${kind}:${item.id}`;
+    this._outboxLeases?.delete(leaseKey);
+
+    if (!this.persistenceAdapter || typeof this.persistenceAdapter.releaseOutboxClaim !== "function") {
       return;
     }
     await this.persistenceAdapter.releaseOutboxClaim({
@@ -8862,11 +9004,27 @@ export class LoomStore {
       });
     }
 
-    this.enforceEnvelopeDailyQuota(actorIdentity, envelope.created_at);
-
+    // Verify signature before spending any rate-limit or quota budget so that
+    // unauthenticated envelopes cannot exhaust another identity's quotas.
     verifyEnvelopeSignature(envelope, (keyId, signedEnvelope) =>
       this.resolveEnvelopeSignaturePublicKey(signedEnvelope, keyId, context)
     );
+
+    this.enforceEnvelopeDailyQuota(actorIdentity, envelope.created_at);
+
+    // Backpressure: reject new envelopes when outbox queues exceed the
+    // configured high-water mark so the node doesn't accumulate unbounded
+    // outbox state.
+    if (this.outboxBackpressureMax > 0) {
+      const outboxDepth =
+        this.federationOutboxById.size + this.emailOutboxById.size + this.webhookOutboxById.size;
+      if (outboxDepth >= this.outboxBackpressureMax) {
+        throw new LoomError("SERVICE_OVERLOADED", "Outbox backpressure limit reached — try again later", 503, {
+          outbox_depth: outboxDepth,
+          backpressure_max: this.outboxBackpressureMax
+        });
+      }
+    }
 
     if (authoritativeSenderType === "agent") {
       const contextRequiredActions = Array.isArray(context.requiredActions)

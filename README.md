@@ -93,7 +93,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 
 ## Current status
 
-- Current release is `v0.2.5` (see `CHANGELOG.md` for release-level change history).
+- Current release is `v0.2.6` (see `CHANGELOG.md` for release-level change history).
 - Protocol design docs are available in:
   - `CHANGELOG.md`
   - `LOOM-protocol-design.md`
@@ -101,10 +101,17 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `LOOM-Protocol-Spec-v1.1.md`
   - `docs/CONFORMANCE.md`
   - `docs/DEVELOPMENT-PLAN.md`
+  - `docs/STABILITY.md`
+  - `docs/RELEASE-POLICY.md`
+  - `docs/OPEN-SOURCE-STRATEGY.md`
   - `docs/POSTGRES-OPERATIONS.md`
+- Community and governance docs:
+  - `CONTRIBUTING.md`
+  - `CODE_OF_CONDUCT.md`
+  - `SUPPORT.md`
 - A first **Minimum Viable Node (MVN)** implementation with optional disk persistence is in `src/`.
 - Repository baseline now includes:
-  - `LICENSE` (MIT)
+  - `LICENSE` (Apache-2.0)
   - GitHub Actions CI workflow (`.github/workflows/ci.yml`)
 
 ## MVN features implemented
@@ -398,6 +405,7 @@ npm test
 ## Notes
 
 - This is a protocol-development scaffold, not production-ready.
+- `package.json` intentionally keeps `"private": true` to prevent accidental npm publication; source remains fully open in this repository under Apache-2.0.
 - Legacy compatibility now includes both API-level gateway behavior (`/v1/gateway/*` + bridge/relay) and an optional wire-level gateway daemon (SMTP + IMAP + optional STARTTLS + extended mailbox commands). Full parity with all enterprise IMAP/SMTP extensions is still a separate hardening track.
 - Wire SMTP currently rejects the `SMTPUTF8` ESMTP parameter (`504 5.5.4`); UTF-8 submission profiles should use the API surface until SMTPUTF8 support is implemented.
 - Inbound internet-email authentication (SPF/DKIM/DMARC verification and policy enforcement) is expected to run in an upstream MTA; the MVN inbound bridge route should remain private unless explicitly confirmed.

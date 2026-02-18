@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a protocol, implementation, or docs improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem first, then the proposed solution.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What limitation or pain point are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What change should be made?
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Any breaking behavior, migration notes, or interop concerns?
+      placeholder: "None / additive / breaking"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

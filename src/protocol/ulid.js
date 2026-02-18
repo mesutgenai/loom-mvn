@@ -1,3 +1,13 @@
+/**
+ * ULID generator with monotonic guarantees.
+ *
+ * IMPORTANT — Single-thread / single-process only.
+ * The module-level `lastTimestamp` and `lastRandom` state is NOT safe for
+ * use from Node.js Worker threads or across clustered processes. If you
+ * adopt worker_threads or cluster mode, each isolate must use its own ULID
+ * generator instance, or you must introduce external synchronization (e.g.
+ * a shared Atomics buffer or database sequence).
+ */
 import { randomBytes } from "node:crypto";
 
 const ENCODING = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";

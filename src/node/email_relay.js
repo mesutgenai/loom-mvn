@@ -110,12 +110,23 @@ function decodeBase64Content(value, field) {
       field
     });
   }
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || normalized.length % 4 !== 0) {
+  // Validate character set only; padding may legitimately be absent after
+  // whitespace stripping, so we rely on Buffer.from to handle that correctly.
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
     throw new LoomError("ENVELOPE_INVALID", `${field} must be valid base64`, 400, {
       field
     });
   }
-  return Buffer.from(normalized, "base64");
+  const buf = Buffer.from(normalized, "base64");
+  // Verify round-trip: re-encode and strip padding to detect corrupt input.
+  const roundTrip = buf.toString("base64").replace(/=+$/, "");
+  const strippedInput = normalized.replace(/=+$/, "");
+  if (roundTrip !== strippedInput) {
+    throw new LoomError("ENVELOPE_INVALID", `${field} must be valid base64`, 400, {
+      field
+    });
+  }
+  return buf;
 }
 
 function normalizeRenderedAttachments(attachments) {

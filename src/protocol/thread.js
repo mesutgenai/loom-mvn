@@ -20,6 +20,26 @@ function compareQueueIds(idA, idB, byId, orphanSet) {
   return compareEnvelopeOrder(byId.get(idA), byId.get(idB));
 }
 
+/**
+ * Insert `id` into a sorted array using binary search so that the array
+ * stays sorted according to the provided comparator without re-sorting the
+ * entire array on every insertion (O(log n) search + O(n) splice instead
+ * of O(n log n) full sort).
+ */
+function sortedInsert(arr, id, cmp) {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (cmp(id, arr[mid]) < 0) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  arr.splice(lo, 0, id);
+}
+
 export function analyzeThreadGraph(envelopes) {
   const byId = new Map();
   for (const envelope of envelopes) {
@@ -63,15 +83,14 @@ export function analyzeThreadGraph(envelopes) {
 export function validateThreadDag(envelopes) {
   const { byId, childrenByParent, indegree, orphanIds } = analyzeThreadGraph(envelopes);
   const orphanSet = new Set(orphanIds);
+  const cmp = (idA, idB) => compareQueueIds(idA, idB, byId, orphanSet);
 
   const queue = [];
   for (const [id, degree] of indegree.entries()) {
     if (degree === 0) {
-      queue.push(id);
+      sortedInsert(queue, id, cmp);
     }
   }
-
-  queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
 
   let seen = 0;
   while (queue.length > 0) {
@@ -82,11 +101,9 @@ export function validateThreadDag(envelopes) {
       const nextDegree = indegree.get(childId) - 1;
       indegree.set(childId, nextDegree);
       if (nextDegree === 0) {
-        queue.push(childId);
+        sortedInsert(queue, childId, cmp);
       }
     }
-
-    queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
   }
 
   const hasCycle = seen !== envelopes.length;
@@ -112,15 +129,14 @@ export function assertThreadDagOrThrow(envelopes) {
 export function canonicalThreadOrder(envelopes) {
   const { byId, childrenByParent, indegree, orphanIds } = analyzeThreadGraph(envelopes);
   const orphanSet = new Set(orphanIds);
+  const cmp = (idA, idB) => compareQueueIds(idA, idB, byId, orphanSet);
 
   const queue = [];
   for (const [id, degree] of indegree.entries()) {
     if (degree === 0) {
-      queue.push(id);
+      sortedInsert(queue, id, cmp);
     }
   }
-
-  queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
 
   const ordered = [];
 
@@ -132,11 +148,9 @@ export function canonicalThreadOrder(envelopes) {
       const nextDegree = indegree.get(childId) - 1;
       indegree.set(childId, nextDegree);
       if (nextDegree === 0) {
-        queue.push(childId);
+        sortedInsert(queue, childId, cmp);
       }
     }
-
-    queue.sort((idA, idB) => compareQueueIds(idA, idB, byId, orphanSet));
   }
 
   if (ordered.length !== envelopes.length) {
