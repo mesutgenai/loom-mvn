@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 
 import { generateSigningKeyPair, signEnvelope, signUtf8Message, verifyUtf8MessageSignature } from "../src/protocol/crypto.js";
 import { generateUlid } from "../src/protocol/ulid.js";
+import { describeNetworkRequestError } from "./lib/network_error_detail.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
 const DEFAULT_OUTPUT_DIR = "scripts/output/federation-interop-drills";
@@ -129,24 +130,30 @@ function normalizeBaseUrl(raw) {
 
 async function requestJson(baseUrl, path, options = {}) {
   const url = new URL(path, baseUrl).toString();
+  const method = options.method || "GET";
   const controller = new AbortController();
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, {
-      method: options.method || "GET",
-      headers: options.headers || {},
-      body: options.body,
-      signal: controller.signal
-    });
-    const text = await response.text();
-    let json = null;
     try {
-      json = text ? JSON.parse(text) : null;
-    } catch {
-      json = null;
+      const response = await fetch(url, {
+        method,
+        headers: options.headers || {},
+        body: options.body,
+        signal: controller.signal
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+      return { url, response, status: response.status, text, json };
+    } catch (error) {
+      const message = describeNetworkRequestError({ error, method, url, timeoutMs });
+      throw new Error(message, { cause: error });
     }
-    return { url, response, status: response.status, text, json };
   } finally {
     clearTimeout(timer);
   }

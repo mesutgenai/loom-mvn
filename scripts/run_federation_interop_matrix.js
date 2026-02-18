@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 
-const DEFAULT_TARGETS_FILE = "ops/federation/interop-targets.example.json";
+const DEFAULT_TARGETS_FILE = "ops/federation/interop-targets.json";
 const DEFAULT_MATRIX_OUTPUT_DIR = "scripts/output/federation-interop-matrix";
 const DEFAULT_DRILL_OUTPUT_DIR = "scripts/output/federation-interop-drills";
 const DEFAULT_TIMEOUT_MS = 15000;

@@ -72,6 +72,9 @@ jobs:
       - name: Validate release gate baseline
         run: npm run check:release-gates
 
+      - name: Validate federation interop target baseline
+        run: npm run check:federation-targets -- --targets-file ops/federation/interop-targets.json --required-targets staging,preprod
+
       - name: Verify compliance drill CLI
         run: npm run drill:compliance -- --help
 

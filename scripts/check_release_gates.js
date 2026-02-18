@@ -7,7 +7,8 @@ import { resolve } from "node:path";
 const REQUIRED_FILES = [
   "CHANGELOG.md",
   "docs/CONFORMANCE.md",
-  "docs/RELEASE-CHECKLIST.md"
+  "docs/RELEASE-CHECKLIST.md",
+  "ops/federation/interop-targets.json"
 ];
 
 const REQUIRED_CHECKLIST_LINES = [
@@ -20,8 +21,10 @@ const REQUIRED_CHECKLIST_LINES = [
 const REQUIRED_RELEASE_CHECKLIST_COMMANDS = [
   "npm run gate:release",
   "npm run check:release-gates",
+  "npm run check:federation-targets",
   "npm run check:prod-env",
   "npm run check:secrets",
+  "npm run check:access-governance",
   "npm run check:compliance",
   "npm run drill:compliance",
   "npm run gate:compliance"
@@ -30,8 +33,10 @@ const REQUIRED_RELEASE_CHECKLIST_COMMANDS = [
 const REQUIRED_PACKAGE_SCRIPTS = [
   "test",
   "check:release-gates",
+  "check:federation-targets",
   "check:prod-env",
   "check:secrets",
+  "check:access-governance",
   "check:compliance",
   "drill:compliance",
   "gate:compliance",
@@ -96,6 +101,16 @@ function main() {
         checks.push(`Release checklist validation command present: ${command}`);
       }
     }
+    if (!checklist.includes("--interop-targets-file")) {
+      errors.push("docs/RELEASE-CHECKLIST.md is missing --interop-targets-file in release gate command.");
+    } else {
+      checks.push("Release checklist includes --interop-targets-file in release gate command");
+    }
+    if (!checklist.includes("--expected-targets-file")) {
+      errors.push("docs/RELEASE-CHECKLIST.md is missing --expected-targets-file in interop evidence command.");
+    } else {
+      checks.push("Release checklist includes --expected-targets-file in interop evidence command");
+    }
   }
 
   if (existsSync(resolve("package.json"))) {
@@ -115,10 +130,20 @@ function main() {
 
   if (existsSync(resolve(".github/workflows/ci.yml"))) {
     const workflow = readFileSync(resolve(".github/workflows/ci.yml"), "utf-8");
+    if (!workflow.includes("npm run check:federation-targets")) {
+      warnings.push("CI workflow does not include `npm run check:federation-targets`.");
+    } else {
+      checks.push("CI workflow includes federation interop target validation step");
+    }
     if (!workflow.includes("npm run check:release-gates")) {
       warnings.push("CI workflow does not include `npm run check:release-gates`.");
     } else {
       checks.push("CI workflow includes release-gate validation step");
+    }
+    if (!workflow.includes("npm run check:access-governance")) {
+      warnings.push("CI workflow does not include access governance validation step.");
+    } else {
+      checks.push("CI workflow includes access governance validation step");
     }
     if (!workflow.includes("npm run gate:compliance -- --help")) {
       warnings.push("CI workflow does not include compliance gate CLI verification.");
@@ -132,6 +157,35 @@ function main() {
     }
   } else {
     warnings.push("CI workflow file not found (.github/workflows/ci.yml).");
+  }
+
+  if (existsSync(resolve("scripts/run_release_gate.js"))) {
+    const releaseGateScript = readFileSync(resolve("scripts/run_release_gate.js"), "utf-8");
+    const forbiddenSkipFlags = [
+      "--skip-pg",
+      "--skip-federation-interop",
+      "--skip-compliance-gate",
+      "--skip-tests"
+    ];
+    for (const flag of forbiddenSkipFlags) {
+      if (releaseGateScript.includes(flag)) {
+        errors.push(`scripts/run_release_gate.js still exposes forbidden skip flag: ${flag}`);
+      } else {
+        checks.push(`Release gate omits skip flag: ${flag}`);
+      }
+    }
+    if (!releaseGateScript.includes("--interop-targets-file")) {
+      errors.push("scripts/run_release_gate.js is missing --interop-targets-file support.");
+    } else {
+      checks.push("Release gate includes --interop-targets-file support");
+    }
+    if (!releaseGateScript.includes("must reference a concrete environment file")) {
+      errors.push("scripts/run_release_gate.js is missing example/template interop targets guard.");
+    } else {
+      checks.push("Release gate blocks example/template interop targets files");
+    }
+  } else {
+    warnings.push("Release gate script not found (scripts/run_release_gate.js).");
   }
 
   if (args.enforceCleanTree) {

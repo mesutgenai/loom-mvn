@@ -1,0 +1,16 @@
+{
+  "targets": [
+    {
+      "name": "staging",
+      "base_url": "https://loom-staging.internal",
+      "admin_token_env": "LOOM_ADMIN_TOKEN_STAGING",
+      "remote_node_id": "interop-peer.staging.internal"
+    },
+    {
+      "name": "preprod",
+      "base_url": "https://loom-preprod.internal",
+      "admin_token_env": "LOOM_ADMIN_TOKEN_PREPROD",
+      "remote_node_id": "interop-peer.preprod.internal"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "name": "loom-mvn",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "private": true,
   "description": "LOOM Protocol v1.1 Minimum Viable Node scaffold",
   "type": "module",
@@ -26,6 +26,7 @@
     "check:observability": "node scripts/check_observability_alerting.js",
     "check:incident-response": "node scripts/check_incident_response_readiness.js",
     "check:release-gates": "node scripts/check_release_gates.js",
+    "check:federation-targets": "node scripts/check_federation_interop_targets.js",
     "check:federation-interop": "node scripts/check_federation_interop_evidence.js",
     "check:tracing": "node scripts/check_request_tracing.js",
     "check:threat-model": "node scripts/check_threat_model.js",

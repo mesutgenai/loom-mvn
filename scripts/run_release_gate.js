@@ -2,20 +2,6 @@
 
 import { spawnSync } from "node:child_process";
 
-function parseBoolean(value, defaultValue = false) {
-  if (value == null) {
-    return defaultValue;
-  }
-  const normalized = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  return defaultValue;
-}
-
 function parsePositiveInt(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -41,15 +27,11 @@ function parseArgs(argv) {
     baseUrl: process.env.LOOM_BASE_URL || null,
     adminToken: process.env.LOOM_ADMIN_TOKEN || null,
     bearerToken: process.env.LOOM_COMPLIANCE_AUDIT_BEARER_TOKEN || process.env.LOOM_FEDERATION_AUDIT_BEARER_TOKEN || null,
-    bootstrapAuditToken: parseBoolean(process.env.LOOM_COMPLIANCE_BOOTSTRAP_AUDIT_TOKEN, false),
+    interopTargetsFile: process.env.LOOM_INTEROP_TARGETS_FILE || "ops/federation/interop-targets.json",
     expectedSchema: parsePositiveInt(process.env.LOOM_DRILL_EXPECTED_SCHEMA, 3),
     requiredTargets: parseList(process.env.LOOM_INTEROP_REQUIRED_TARGETS, ["staging", "preprod"]),
     maxAgeHours: parsePositiveInt(process.env.LOOM_INTEROP_EVIDENCE_MAX_AGE_HOURS, 168),
     timeoutMs: parsePositiveInt(process.env.LOOM_DRILL_TIMEOUT_MS, 15000),
-    skipPg: false,
-    skipFederationInterop: false,
-    skipComplianceGate: false,
-    skipTests: false,
     help: false
   };
 
@@ -79,14 +61,9 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
-    if (arg === "--bootstrap-audit-token") {
-      const next = argv[i + 1];
-      if (next && !next.startsWith("--")) {
-        args.bootstrapAuditToken = parseBoolean(next, true);
-        i += 1;
-      } else {
-        args.bootstrapAuditToken = true;
-      }
+    if (arg === "--interop-targets-file" && i + 1 < argv.length) {
+      args.interopTargetsFile = argv[i + 1];
+      i += 1;
       continue;
     }
     if (arg === "--expected-schema" && i + 1 < argv.length) {
@@ -109,22 +86,6 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
-    if (arg === "--skip-pg") {
-      args.skipPg = true;
-      continue;
-    }
-    if (arg === "--skip-federation-interop") {
-      args.skipFederationInterop = true;
-      continue;
-    }
-    if (arg === "--skip-compliance-gate") {
-      args.skipComplianceGate = true;
-      continue;
-    }
-    if (arg === "--skip-tests") {
-      args.skipTests = true;
-      continue;
-    }
   }
 
   return args;
@@ -138,23 +99,18 @@ Runs production release validation checks in sequence (wrapping release checklis
 
 Options:
   --env-file <path>             Environment file for env-backed checks (required)
-  --base-url <url>              Runtime base URL for compliance gate
-  --admin-token <token>         Admin token for compliance gate
-  --bearer-token <token>        Bearer token for /v1/audit compliance probe
-  --bootstrap-audit-token       Bootstrap temporary audit token for compliance gate when bearer token is omitted
+  --base-url <url>              Runtime base URL for all runtime probes (required)
+  --admin-token <token>         Admin token for runtime probes and compliance gate (required)
+  --bearer-token <token>        Bearer token for /v1/audit and federation runtime probes (required)
+  --interop-targets-file <path> Federation interop target config file (default: ops/federation/interop-targets.json)
   --expected-schema <int>       Expected postgres schema version for check:pg (default: 3)
   --required-targets <csv>      Required targets for federation interop evidence (default: staging,preprod)
   --max-age-hours <int>         Max federation interop evidence age in hours (default: 168)
-  --timeout-ms <int>            Timeout for compliance runtime probes (default: 15000)
-  --skip-pg                     Skip check:pg
-  --skip-federation-interop     Skip check:federation-interop
-  --skip-compliance-gate        Skip gate:compliance
-  --skip-tests                  Skip npm test
+  --timeout-ms <int>            Timeout for runtime probes (default: 15000)
   -h, --help                    Show help
 
 Examples:
-  npm run gate:release -- --env-file .env.production --base-url https://loom.example.com --admin-token <token> --bootstrap-audit-token
-  npm run gate:release -- --env-file .env.production --base-url http://127.0.0.1:8787 --admin-token <token> --bootstrap-audit-token --skip-pg --skip-federation-interop
+  npm run gate:release -- --env-file .env.production --base-url https://loom.example.com --admin-token <token> --bearer-token <token> --interop-targets-file ops/federation/interop-targets.json
 `);
 }
 
@@ -202,84 +158,152 @@ function main() {
     process.exit(1);
   }
 
+  const baseUrl = String(args.baseUrl || "").trim();
+  const adminToken = String(args.adminToken || "").trim();
+  const bearerToken = String(args.bearerToken || "").trim();
+  const interopTargetsFile = String(args.interopTargetsFile || "").trim();
+  if (!baseUrl) {
+    console.error("ERROR: --base-url is required.");
+    process.exit(1);
+  }
+  if (!adminToken) {
+    console.error("ERROR: --admin-token is required.");
+    process.exit(1);
+  }
+  if (!bearerToken) {
+    console.error("ERROR: --bearer-token is required.");
+    process.exit(1);
+  }
+  if (!interopTargetsFile) {
+    console.error("ERROR: --interop-targets-file is required.");
+    process.exit(1);
+  }
+  if (/\.example(\.|$)/i.test(interopTargetsFile)) {
+    console.error(
+      "ERROR: --interop-targets-file must reference a concrete environment file, not an example/template file."
+    );
+    process.exit(1);
+  }
+
   try {
     runNodeStep("Release checklist wiring checks", "scripts/check_release_gates.js");
+    runNodeStep("Federation interop target configuration", "scripts/check_federation_interop_targets.js", [
+      "--targets-file",
+      interopTargetsFile,
+      "--required-targets",
+      args.requiredTargets.join(",")
+    ]);
     runNodeStep("Production env baseline", "scripts/verify_production_env.js", ["--env-file", args.envFile]);
     runNodeStep("Secret hygiene", "scripts/check_secrets_hygiene.js");
+    runNodeStep("Postgres readiness", "scripts/check_postgres_readiness.js", [
+      "--env-file",
+      args.envFile,
+      "--expected-schema",
+      String(args.expectedSchema)
+    ]);
 
-    if (!args.skipPg) {
-      runNodeStep("Postgres readiness", "scripts/check_postgres_readiness.js", [
-        "--env-file",
-        args.envFile,
-        "--expected-schema",
-        String(args.expectedSchema)
-      ]);
-    } else {
-      console.log("\n[release-gate] Skipping Postgres readiness (--skip-pg)");
-    }
-
-    runNodeStep("Federation controls", "scripts/check_federation_controls.js", ["--env-file", args.envFile]);
-    runNodeStep("Inbound bridge hardening", "scripts/check_inbound_bridge_hardening.js", ["--env-file", args.envFile]);
-    runNodeStep("Rate-limit policy", "scripts/check_rate_limit_policy.js", ["--env-file", args.envFile]);
-    runNodeStep("Outbox worker reliability", "scripts/check_outbox_workers.js", ["--env-file", args.envFile]);
-    runNodeStep("Observability and alerting", "scripts/check_observability_alerting.js", ["--env-file", args.envFile]);
+    runNodeStep("Federation controls", "scripts/check_federation_controls.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--bearer-token",
+      bearerToken,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
+    runNodeStep("Inbound bridge hardening", "scripts/check_inbound_bridge_hardening.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--bearer-token",
+      bearerToken,
+      "--admin-token",
+      adminToken,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
+    runNodeStep("Rate-limit policy", "scripts/check_rate_limit_policy.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--admin-token",
+      adminToken,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
+    runNodeStep("Outbox worker reliability", "scripts/check_outbox_workers.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--admin-token",
+      adminToken,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
+    runNodeStep("Observability and alerting", "scripts/check_observability_alerting.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--admin-token",
+      adminToken,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
     runNodeStep("Incident response readiness", "scripts/check_incident_response_readiness.js");
-    runNodeStep("Request tracing", "scripts/check_request_tracing.js", ["--env-file", args.envFile]);
+    runNodeStep("Request tracing", "scripts/check_request_tracing.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
     runNodeStep("Threat model", "scripts/check_threat_model.js");
     runNodeStep("Security testing program", "scripts/check_security_testing_program.js");
     runNodeStep("Capacity and chaos", "scripts/check_capacity_chaos_readiness.js");
     runNodeStep("Disaster recovery plan", "scripts/check_disaster_recovery_plan.js");
     runNodeStep("Access governance", "scripts/check_access_governance.js");
-    runNodeStep("Compliance controls", "scripts/check_compliance_controls.js", ["--env-file", args.envFile]);
+    runNodeStep("Compliance controls", "scripts/check_compliance_controls.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--admin-token",
+      adminToken,
+      "--bearer-token",
+      bearerToken,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
 
-    if (!args.skipComplianceGate) {
-      if (!String(args.baseUrl || "").trim()) {
-        throw new Error("Compliance gate requires --base-url (or pass --skip-compliance-gate).");
-      }
-      if (!String(args.adminToken || "").trim()) {
-        throw new Error("Compliance gate requires --admin-token (or pass --skip-compliance-gate).");
-      }
-      const complianceArgs = [
-        "scripts/run_compliance_gate.js",
-        "--env-file",
-        args.envFile,
-        "--base-url",
-        args.baseUrl,
-        "--admin-token",
-        args.adminToken,
-        "--timeout-ms",
-        String(args.timeoutMs)
-      ];
-      if (String(args.bearerToken || "").trim()) {
-        complianceArgs.push("--bearer-token", args.bearerToken);
-      } else if (args.bootstrapAuditToken) {
-        complianceArgs.push("--bootstrap-audit-token");
-      } else {
-        throw new Error(
-          "Compliance gate requires --bearer-token or --bootstrap-audit-token (or pass --skip-compliance-gate)."
-        );
-      }
-      runNodeStep("Compliance gate", complianceArgs[0], complianceArgs.slice(1));
-    } else {
-      console.log("\n[release-gate] Skipping compliance gate (--skip-compliance-gate)");
-    }
+    runNodeStep("Compliance gate", "scripts/run_compliance_gate.js", [
+      "--env-file",
+      args.envFile,
+      "--base-url",
+      baseUrl,
+      "--admin-token",
+      adminToken,
+      "--bearer-token",
+      bearerToken,
+      "--timeout-ms",
+      String(args.timeoutMs)
+    ]);
 
-    if (!args.skipFederationInterop) {
-      runNodeStep("Federation interop evidence", "scripts/check_federation_interop_evidence.js", [
-        "--required-targets",
-        args.requiredTargets.join(","),
-        "--max-age-hours",
-        String(args.maxAgeHours)
-      ]);
-    } else {
-      console.log("\n[release-gate] Skipping federation interop evidence (--skip-federation-interop)");
-    }
+    runNodeStep("Federation interop evidence", "scripts/check_federation_interop_evidence.js", [
+      "--required-targets",
+      args.requiredTargets.join(","),
+      "--max-age-hours",
+      String(args.maxAgeHours),
+      "--expected-targets-file",
+      interopTargetsFile
+    ]);
 
-    if (!args.skipTests) {
-      runShellStep("Test suite", resolveNpmCommand(), ["test"]);
-    } else {
-      console.log("\n[release-gate] Skipping test suite (--skip-tests)");
-    }
+    runShellStep("Test suite", resolveNpmCommand(), ["test"]);
 
     console.log("\n[release-gate] PASS");
   } catch (error) {
