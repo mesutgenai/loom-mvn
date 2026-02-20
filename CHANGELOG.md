@@ -6,6 +6,94 @@ All notable changes to this project are documented in this file.
 
 No unreleased changes yet.
 
+## v0.2.9 - 2026-02-20
+
+Release-readiness hardening based on deep research protocol assessment.
+Addresses interoperability, security, and engineering gaps across
+canonical JSON, signatures, delegation, replay, E2EE, and threading.
+
+### Breaking Changes
+
+- **Signature context prefix**: Envelope signatures now include a
+  `LOOM-ENVELOPE-SIG-v1\0` context prefix before the canonical payload.
+  Verification has a legacy fallback window for envelopes without a
+  `signature.context` field. Delegation signatures use
+  `LOOM-DELEGATION-SIG-v1\0`. Nodes running < v0.2.9 will reject
+  context-prefixed signatures; coordinate upgrades across federated peers.
+- **Delegation `created_at` required**: `verifyDelegationLinkOrThrow` now
+  rejects links missing `created_at` or with `created_at` more than 5
+  minutes in the future. Existing links without `created_at` will fail
+  validation.
+- **Delegation chain depth limit**: Chains longer than 10 links (default)
+  are rejected. Configurable via `options.maxChainLength`.
+
+### New Features
+
+- **RFC 8785 JCS number serialization**: `canonicalizeJson` now handles
+  `-0`, integer formatting, and exponent normalization per RFC 8785
+  Section 3.2.2.3 for cross-language determinism.
+- **Sliding window replay protection**: New `replayMode: "sliding_window"`
+  option (default remains `"strict"`) tolerates out-of-order delivery
+  within a 64-counter window. Enable via store constructor option
+  `replayMode: "sliding_window"` or per-ingest context override.
+- **Envelope `from.device_id`**: Optional field (1-128 chars) for
+  multi-device replay state partitioning. Replay state is now keyed by
+  `senderIdentity:deviceId` instead of `senderIdentity` alone.
+- **Capability Proof-of-Possession (PoP)**: Sensitive thread operations
+  (`encryption.epoch@v1`, `encryption.rotate@v1`, `delegation.revoked@v1`,
+  `capability.revoked@v1`, `thread.delegate@v1`, `thread.link@v1`) require
+  a PoP signature when the capability token has a `cnf.key_id` binding.
+- **Thread size limits**: Configurable `threadMaxEnvelopesPerThread`
+  (default 10000) and `threadMaxPendingParents` (default 500) store
+  options. Override per-ingest via `context.threadLimits`.
+- **E2EE security property labels**: All E2EE profiles now carry
+  `security_properties` metadata (`forward_secrecy`, `post_compromise_security`,
+  `confidentiality`). MLS profile `loom-e2ee-mls-1` reserved as
+  placeholder with `status: "reserved"`.
+- **Envelope JSON Schema**: Published `envelope-v1.1.schema.json`
+  (draft 2020-12) as informational reference for cross-language
+  implementations.
+- **Root delegator type binding**: Delegation chain verification rejects
+  chains where the root delegator is an `agent` identity type (configurable
+  via `options.enforceRootDelegatorType`).
+
+### Performance
+
+- **Thread DAG O(1) dequeue**: Replaced `queue.shift()` with index pointer
+  in `validateThreadDag` and `canonicalThreadOrder`, reducing BFS dequeue
+  from O(n) to O(1).
+
+### Upgrade Notes
+
+1. **Signature context**: During the migration window, the verifier tries
+   context-prefixed verification first, then falls back to legacy if the
+   envelope lacks `signature.context`. Plan to remove the fallback in a
+   future release. Regenerate any cached/persisted signatures.
+2. **Delegation links**: Ensure all delegation links have a valid
+   `created_at` ISO-8601 timestamp. Links without this field will be
+   rejected.
+3. **Replay mode**: The default replay mode is `"strict"` (monotonically
+   increasing counters). If your deployment has store-and-forward delivery
+   that may reorder envelopes, set `replayMode: "sliding_window"` in the
+   store constructor.
+4. **Device ID**: The `from.device_id` field is optional. If present, it
+   partitions replay state per-device. Multi-device agents should set this
+   field to avoid replay counter conflicts.
+5. **Thread limits**: Default limits are generous (10000 envelopes, 500
+   pending parents). Override via store constructor or per-ingest context
+   if your deployment requires different bounds.
+6. **JSON Schema**: The schema file is informational. In-code validation
+   remains authoritative via `validateEnvelopeShape`. The schema is
+   published for external tooling and cross-language implementations.
+
+### Conformance Vectors Added
+
+- `test/fixtures/conformance/jcs-number-serialization-v1.json`
+- `test/fixtures/conformance/signature-context-v1.json`
+- `test/fixtures/conformance/delegation-chain-v1.json`
+- `test/fixtures/conformance/replay-sliding-window-v1.json`
+- `test/fixtures/conformance/capability-pop-v1.json`
+
 ## v0.2.8 - 2026-02-20
 
 Agent-first protocol reboot, federation trust hardening, and wire/content-policy upgrades:

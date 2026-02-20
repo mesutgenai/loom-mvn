@@ -117,5 +117,18 @@ jobs:
             fi
           done
 
+      - name: Verify version consistency (README + constants match package.json)
+        run: |
+          PKG_VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('package.json','utf8')).version)")
+          if ! grep -q "v${PKG_VERSION}" README.md; then
+            echo "ERROR: README.md does not reference v${PKG_VERSION}"
+            exit 1
+          fi
+          CONST_VERSION=$(node -e "import('./src/protocol/constants.js').then(m=>console.log(m.LOOM_RELEASE_VERSION))")
+          if [ "$CONST_VERSION" != "$PKG_VERSION" ]; then
+            echo "ERROR: LOOM_RELEASE_VERSION ($CONST_VERSION) != package.json ($PKG_VERSION)"
+            exit 1
+          fi
+
       - name: Dependency audit (high+)
         run: npm audit --audit-level=high
