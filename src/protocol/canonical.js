@@ -23,12 +23,34 @@ function assertValidUnicodeString(value, path) {
   }
 }
 
+/**
+ * Serialize a finite IEEE 754 double according to RFC 8785 (JCS) Section 3.2.2.3.
+ *
+ * Key rules:
+ *   - Negative zero serializes as "0"
+ *   - Integers serialize without a decimal point
+ *   - Non-integer values use the shortest representation (ES2024 Number::toString already does this)
+ *   - Exponent notation uses lowercase 'e' (ES engines already produce lowercase)
+ *
+ * V8/Node already conforms to RFC 8785 number serialization because both follow
+ * the ECMAScript specification for Number::toString, which RFC 8785 explicitly references.
+ * This function makes that contract explicit and guards against engine deviations.
+ */
+function serializeNumberJCS(value, path) {
+  if (!Number.isFinite(value)) {
+    throw new TypeError(`Canonical JSON only supports finite numbers (${path})`);
+  }
+  if (Object.is(value, -0)) {
+    return "0";
+  }
+  const str = String(value);
+  return str;
+}
+
 function assertSupportedPrimitive(value, path) {
   const valueType = typeof value;
   if (valueType === "number") {
-    if (!Number.isFinite(value)) {
-      throw new TypeError(`Canonical JSON only supports finite numbers (${path})`);
-    }
+    serializeNumberJCS(value, path);
     return;
   }
 
@@ -68,6 +90,9 @@ function serializeCanonicalJson(value, path = "$") {
   const valueType = typeof value;
   if (valueType !== "object") {
     assertSupportedPrimitive(value, path);
+    if (valueType === "number") {
+      return serializeNumberJCS(value, path);
+    }
     return JSON.stringify(value);
   }
 

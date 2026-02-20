@@ -1,0 +1,73 @@
+{
+  "spec": "loom.signature-context.v1",
+  "description": "Envelope signature context prefix vectors for cross-language verification",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA/a5xAWqH939g7Gsav4onzdbxUQWEW5VORgdO9nwNLtY=\n-----END PUBLIC KEY-----\n",
+  "canonical_json": "{\"attachments\":[],\"content\":{\"encrypted\":false,\"human\":{\"format\":\"markdown\",\"text\":\"Test vector\"},\"structured\":{\"intent\":\"message.general@v1\",\"parameters\":{}}},\"created_at\":\"2026-01-01T00:00:00.000Z\",\"from\":{\"display\":\"Alice\",\"identity\":\"loom://alice@node.test\",\"key_id\":\"k_sign_test_1\",\"type\":\"human\"},\"id\":\"env_01JTEST00000000000000000A\",\"loom\":\"1.1\",\"parent_id\":null,\"priority\":\"normal\",\"thread_id\":\"thr_01JTEST00000000000000000A\",\"to\":[{\"identity\":\"loom://bob@node.test\",\"role\":\"primary\"}],\"type\":\"message\"}",
+  "context_prefix": "LOOM-ENVELOPE-SIG-v1\u0000",
+  "vectors": [
+    {
+      "id": "context-prefixed",
+      "envelope": {
+        "loom": "1.1",
+        "id": "env_01JTEST00000000000000000A",
+        "thread_id": "thr_01JTEST00000000000000000A",
+        "parent_id": null,
+        "type": "message",
+        "from": {
+          "identity": "loom://alice@node.test",
+          "display": "Alice",
+          "key_id": "k_sign_test_1",
+          "type": "human"
+        },
+        "to": [{ "identity": "loom://bob@node.test", "role": "primary" }],
+        "created_at": "2026-01-01T00:00:00.000Z",
+        "priority": "normal",
+        "content": {
+          "human": { "text": "Test vector", "format": "markdown" },
+          "structured": { "intent": "message.general@v1", "parameters": {} },
+          "encrypted": false
+        },
+        "attachments": [],
+        "signature": {
+          "algorithm": "Ed25519",
+          "key_id": "k_sign_test_1",
+          "value": "GeH89Y2xIyce_v_rAF5FwWnFg5JiO90WrSGTPui5eStIHcQiy2LF0rH0WqvUSWVblrMzAbnP7yVzcMdhTHYIDw",
+          "context": "LOOM-ENVELOPE-SIG-v1"
+        }
+      },
+      "should_verify": true
+    },
+    {
+      "id": "legacy-no-context",
+      "envelope": {
+        "loom": "1.1",
+        "id": "env_01JTEST00000000000000000A",
+        "thread_id": "thr_01JTEST00000000000000000A",
+        "parent_id": null,
+        "type": "message",
+        "from": {
+          "identity": "loom://alice@node.test",
+          "display": "Alice",
+          "key_id": "k_sign_test_1",
+          "type": "human"
+        },
+        "to": [{ "identity": "loom://bob@node.test", "role": "primary" }],
+        "created_at": "2026-01-01T00:00:00.000Z",
+        "priority": "normal",
+        "content": {
+          "human": { "text": "Test vector", "format": "markdown" },
+          "structured": { "intent": "message.general@v1", "parameters": {} },
+          "encrypted": false
+        },
+        "attachments": [],
+        "signature": {
+          "algorithm": "Ed25519",
+          "key_id": "k_sign_test_1",
+          "value": "GwAtDNFu8-7DqXNIdMbosEQBQn3AzJFoaqbi6cu0mSnZg9j8IjpLCGVzthTOu08yycSiZb0gcbKXf0i2X7G5CA"
+        }
+      },
+      "should_verify": true,
+      "note": "Legacy envelope without context prefix; must verify via fallback"
+    }
+  ]
+}

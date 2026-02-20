@@ -3,6 +3,8 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } 
 import { canonicalizeEnvelope } from "./canonical.js";
 import { LoomError } from "./errors.js";
 
+const ENVELOPE_SIGNATURE_CONTEXT = "LOOM-ENVELOPE-SIG-v1\0";
+
 export function toBase64Url(input) {
   return Buffer.from(input)
     .toString("base64")
@@ -34,17 +36,21 @@ export function derivePublicKeyPemFromPrivateKeyPem(privateKeyPem) {
   return publicKey.export({ type: "spki", format: "pem" }).toString();
 }
 
-export function signEnvelope(envelope, privateKeyPem, keyId) {
+export function signEnvelope(envelope, privateKeyPem, keyId, options = {}) {
+  const useContext = options.signatureContext !== null;
+  const context = useContext ? (options.signatureContext ?? ENVELOPE_SIGNATURE_CONTEXT) : "";
   const privateKey = createPrivateKey(privateKeyPem);
   const canonical = canonicalizeEnvelope(envelope);
-  const signatureBytes = sign(null, Buffer.from(canonical, "utf-8"), privateKey);
+  const message = context + canonical;
+  const signatureBytes = sign(null, Buffer.from(message, "utf-8"), privateKey);
 
   return {
     ...envelope,
     signature: {
       algorithm: "Ed25519",
       key_id: keyId,
-      value: toBase64Url(signatureBytes)
+      value: toBase64Url(signatureBytes),
+      ...(useContext ? { context: "LOOM-ENVELOPE-SIG-v1" } : {})
     }
   };
 }
@@ -84,7 +90,15 @@ export function verifyEnvelopeSignature(envelope, keyResolver) {
   const canonical = canonicalizeEnvelope(envelope);
   const signatureBytes = fromBase64Url(signature.value);
 
-  const valid = verify(null, Buffer.from(canonical, "utf-8"), publicKey, signatureBytes);
+  // Try context-prefixed verification first
+  const contextMessage = ENVELOPE_SIGNATURE_CONTEXT + canonical;
+  let valid = verify(null, Buffer.from(contextMessage, "utf-8"), publicKey, signatureBytes);
+
+  // Legacy fallback for envelopes signed without context prefix
+  if (!valid && !signature.context) {
+    valid = verify(null, Buffer.from(canonical, "utf-8"), publicKey, signatureBytes);
+  }
+
   if (!valid) {
     throw new LoomError("SIGNATURE_INVALID", "Envelope signature verification failed", 401, {
       field: "signature.value"

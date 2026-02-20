@@ -1,0 +1,24 @@
+{
+  "spec": "loom.jcs-number-serialization.v1",
+  "description": "RFC 8785 JCS number serialization vectors for cross-language verification",
+  "vectors": [
+    { "id": "zero", "input": 0, "expected": "0" },
+    { "id": "one", "input": 1, "expected": "1" },
+    { "id": "negative-one", "input": -1, "expected": "-1" },
+    { "id": "pi", "input": 3.141592653589793, "expected": "3.141592653589793" },
+    { "id": "large-integer", "input": 9007199254740992, "expected": "9007199254740992" },
+    { "id": "small-fraction", "input": 0.000001, "expected": "0.000001" },
+    { "id": "scientific-large", "input": 1e+20, "expected": "100000000000000000000" },
+    { "id": "max-safe-integer", "input": 9007199254740991, "expected": "9007199254740991" },
+    { "id": "min-safe-integer", "input": -9007199254740991, "expected": "-9007199254740991" },
+    { "id": "one-third", "input": 0.3333333333333333, "expected": "0.3333333333333333" },
+    { "id": "subnormal", "input": 5e-324, "expected": "5e-324" },
+    { "id": "negative-fraction", "input": -0.5, "expected": "-0.5" },
+    { "id": "large-negative", "input": -1e+20, "expected": "-100000000000000000000" },
+    { "id": "small-negative-scientific", "input": -1e-7, "expected": "-1e-7" },
+    { "id": "one-point-zero", "input": 1.0, "expected": "1" },
+    { "id": "max-double", "input": 1.7976931348623157e+308, "expected": "1.7976931348623157e+308" },
+    { "id": "min-positive-normal", "input": 2.2250738585072014e-308, "expected": "2.2250738585072014e-308" }
+  ],
+  "negative_zero_note": "Negative zero (-0) must serialize as '0'. This is tested in code but cannot be represented in JSON (JSON parsers produce 0 for -0)."
+}
