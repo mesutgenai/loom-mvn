@@ -2168,6 +2168,11 @@ export class LoomStore {
     this.blobDailyBytesMax = Math.max(0, parseNonNegativeInteger(options.blobDailyBytesMax, 0));
     this.blobIdentityTotalBytesMax = Math.max(0, parseNonNegativeInteger(options.blobIdentityTotalBytesMax, 0));
     this.outboxBackpressureMax = Math.max(0, parseNonNegativeInteger(options.outboxBackpressureMax, 0));
+    this.replayMode = ["strict", "sliding_window"].includes(options.replayMode) ? options.replayMode : "strict";
+    this.threadLimits = {
+      max_envelopes_per_thread: Math.max(0, parseNonNegativeInteger(options.threadMaxEnvelopesPerThread, 10000)),
+      max_pending_parents: Math.max(0, parseNonNegativeInteger(options.threadMaxPendingParents, 500))
+    };
     this.identityEnvelopeUsageByDay = new Map();
     this.identityBlobUsageByDay = new Map();
     this.identityBlobTotalBytes = new Map();
@@ -12815,8 +12820,8 @@ export class LoomStore {
     return resolvePendingParentsForThreadCore.call(this, thread, parentEnvelopeId);
   }
 
-  enforceThreadEnvelopeEncryptionPolicy(thread, envelope, isNewThread) {
-    return enforceThreadEnvelopeEncryptionPolicyCore.call(this, thread, envelope, isNewThread);
+  enforceThreadEnvelopeEncryptionPolicy(thread, envelope, isNewThread, context = {}) {
+    return enforceThreadEnvelopeEncryptionPolicyCore.call(this, thread, envelope, isNewThread, context);
   }
 
   prepareThreadOperation(thread, envelope, actorIdentity, context = {}) {
@@ -12832,7 +12837,11 @@ export class LoomStore {
   }
 
   ingestEnvelope(envelope, context = {}) {
-    return ingestEnvelopeCore.call(this, envelope, context);
+    return ingestEnvelopeCore.call(this, envelope, {
+      ...context,
+      replayMode: context.replayMode || this.replayMode,
+      threadLimits: context.threadLimits || this.threadLimits
+    });
   }
 
   getEnvelope(envelopeId) {

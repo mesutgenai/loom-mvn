@@ -1,9 +1,12 @@
+import { verifyCapabilityPoP, POP_REQUIRED_INTENTS } from "../../protocol/capability_pop.js";
 import { verifyEnvelopeSignature } from "../../protocol/crypto.js";
+import { replayStateKey, createReplayTracker, checkReplayCounter, acceptReplayCounter } from "../../protocol/replay.js";
 import { verifyDelegationChainOrThrow } from "../../protocol/delegation.js";
 import { validateEnvelopeOrThrow } from "../../protocol/envelope.js";
 import { LoomError } from "../../protocol/errors.js";
 import { isIdentity } from "../../protocol/ids.js";
 import { canonicalThreadOrder, validateThreadDag } from "../../protocol/thread.js";
+import { assertThreadLimitsOrThrow } from "../../protocol/thread_limits.js";
 import { resolveE2eeProfile, validateEncryptedContentShape, validateEncryptionEpochParameters } from "../../protocol/e2ee.js";
 
 function nowIso() {
@@ -69,7 +72,8 @@ function normalizeSenderReplayStateEntry(entry) {
     epoch,
     replay_counter: replayCounter,
     profile_commitment: profileCommitment,
-    profile: profile || null
+    profile: profile || null,
+    replay_tracker: entry.replay_tracker || null
   };
 }
 
@@ -82,10 +86,12 @@ function recordSenderReplayStateOrThrow(thread, envelope, profileId, epoch, opti
     });
   }
 
+  const deviceId = envelope?.from?.device_id || null;
+  const stateKey = replayStateKey(senderIdentity, deviceId);
   const replayCounter = Number(envelope?.content?.replay_counter);
   const profileCommitment = String(envelope?.content?.profile_commitment || "").trim();
   const senderReplayStateMap = ensureSenderReplayStateMap(thread);
-  const previousState = normalizeSenderReplayStateEntry(senderReplayStateMap[senderIdentity]);
+  const previousState = normalizeSenderReplayStateEntry(senderReplayStateMap[stateKey]);
   const assertProfileMigrationPolicy =
     typeof options.assertProfileMigrationPolicy === "function" ? options.assertProfileMigrationPolicy : null;
 
@@ -171,7 +177,25 @@ function recordSenderReplayStateOrThrow(thread, envelope, profileId, epoch, opti
           }
         );
       }
-      if (replayCounter <= previousState.replay_counter) {
+      const replayMode = options.replayMode || "strict";
+      if (replayMode === "sliding_window" && previousState.replay_tracker) {
+        const windowResult = checkReplayCounter(previousState.replay_tracker, replayCounter);
+        if (!windowResult.accepted) {
+          throw new LoomError(
+            "STATE_TRANSITION_INVALID",
+            `Encrypted envelope replay_counter rejected by sliding window: ${windowResult.reason}`,
+            409,
+            {
+              thread_id: thread.id,
+              sender: senderIdentity,
+              device_id: deviceId,
+              epoch,
+              replay_counter: replayCounter,
+              reason: windowResult.reason
+            }
+          );
+        }
+      } else if (replayCounter <= previousState.replay_counter) {
         throw new LoomError(
           "STATE_TRANSITION_INVALID",
           "Encrypted envelope replay_counter must strictly increase for sender epoch state",
@@ -179,6 +203,7 @@ function recordSenderReplayStateOrThrow(thread, envelope, profileId, epoch, opti
           {
             thread_id: thread.id,
             sender: senderIdentity,
+            device_id: deviceId,
             epoch,
             previous_replay_counter: previousState.replay_counter,
             envelope_replay_counter: replayCounter
@@ -201,13 +226,24 @@ function recordSenderReplayStateOrThrow(thread, envelope, profileId, epoch, opti
     }
   }
 
-  senderReplayStateMap[senderIdentity] = {
+  const replayMode = options.replayMode || "strict";
+  let replayTracker = previousState?.replay_tracker || null;
+  if (replayMode === "sliding_window") {
+    if (!replayTracker || (previousState && epoch !== previousState.epoch)) {
+      replayTracker = createReplayTracker(64);
+    }
+    acceptReplayCounter(replayTracker, replayCounter);
+  }
+
+  senderReplayStateMap[stateKey] = {
     profile: profileId,
     epoch,
     replay_counter: replayCounter,
     profile_commitment: profileCommitment,
     envelope_id: envelope.id,
-    updated_at: nowIso()
+    device_id: deviceId,
+    updated_at: nowIso(),
+    ...(replayTracker ? { replay_tracker: replayTracker } : {})
   };
 }
 
@@ -256,7 +292,7 @@ export function resolvePendingParentsForThreadCore(thread, parentEnvelopeId) {
   return resolved;
 }
 
-export function enforceThreadEnvelopeEncryptionPolicyCore(thread, envelope, isNewThread) {
+export function enforceThreadEnvelopeEncryptionPolicyCore(thread, envelope, isNewThread, context = {}) {
   if (!thread || !envelope || envelope.type === "thread_op") {
     return;
   }
@@ -331,6 +367,7 @@ export function enforceThreadEnvelopeEncryptionPolicyCore(thread, envelope, isNe
         sender_replay: ensureSenderReplayStateMap(thread)
       };
       recordSenderReplayStateOrThrow(thread, envelope, profileId, epoch, {
+        replayMode: context.replayMode || this.replayMode || "strict",
         assertProfileMigrationPolicy: (fromProfile, toProfile, migrationContext) => {
           if (typeof this.assertE2eeProfileMigrationPolicy === "function") {
             this.assertE2eeProfileMigrationPolicy(fromProfile, toProfile, migrationContext);
@@ -414,6 +451,7 @@ export function enforceThreadEnvelopeEncryptionPolicyCore(thread, envelope, isNe
   }
 
   recordSenderReplayStateOrThrow(thread, envelope, threadProfileId, epoch, {
+    replayMode: context.replayMode || this.replayMode || "strict",
     assertProfileMigrationPolicy: (fromProfile, toProfile, migrationContext) => {
       if (typeof this.assertE2eeProfileMigrationPolicy === "function") {
         this.assertE2eeProfileMigrationPolicy(fromProfile, toProfile, migrationContext);
@@ -473,6 +511,45 @@ export function prepareThreadOperationCore(thread, envelope, actorIdentity, cont
         field: "content.structured.parameters.capability_token"
       }
     );
+  }
+
+  // Proof-of-Possession verification for sensitive intents with cnf-bound tokens
+  const tokenObj = validatedToken?.token || validatedToken?.localToken;
+  if (tokenObj?.cnf?.key_id && POP_REQUIRED_INTENTS.has(intent)) {
+    const popSignature = parameters.pop_signature;
+    const popTimestamp = parameters.pop_timestamp;
+    if (!popSignature || !popTimestamp) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Proof-of-possession required for this intent with cnf-bound capability token",
+        403,
+        { intent, capability_id: tokenObj.id, field: "content.structured.parameters.pop_signature" }
+      );
+    }
+    const popPublicKey = this.resolvePublicKey(tokenObj.cnf.key_id);
+    if (!popPublicKey) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Cannot resolve public key for PoP verification",
+        403,
+        { intent, key_id: tokenObj.cnf.key_id }
+      );
+    }
+    const popValid = verifyCapabilityPoP({
+      capabilityId: tokenObj.id,
+      envelopeId: envelope.id,
+      timestamp: popTimestamp,
+      signature: popSignature,
+      publicKeyPem: popPublicKey
+    });
+    if (!popValid) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Proof-of-possession signature verification failed",
+        403,
+        { intent, capability_id: tokenObj.id }
+      );
+    }
   }
 
   return () => {
@@ -1033,7 +1110,11 @@ export function ingestEnvelopeCore(envelope, context = {}) {
 
   const threadSnapshot = !isNewThread ? structuredClone(thread) : null;
 
-  this.enforceThreadEnvelopeEncryptionPolicy(thread, envelope, isNewThread);
+  if (!isNewThread) {
+    assertThreadLimitsOrThrow(thread.envelope_ids?.length || 0, context.threadLimits, thread.pending_parent_count || 0);
+  }
+
+  this.enforceThreadEnvelopeEncryptionPolicy(thread, envelope, isNewThread, context);
 
   const operationMutation =
     envelope.type === "thread_op" ? this.prepareThreadOperation(thread, envelope, actorIdentity, context) : null;
