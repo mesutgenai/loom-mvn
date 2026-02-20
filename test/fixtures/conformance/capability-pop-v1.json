@@ -1,0 +1,50 @@
+{
+  "description": "Capability Proof-of-Possession conformance vectors",
+  "version": 1,
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAomL6Ycyx2K4gvuTeMh2e2DezAJcUuv0ViHnfZq0hF08=\n-----END PUBLIC KEY-----\n",
+  "private_key_pem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIFHcNlcspwsaZ8MXVZXawNDpbDI4FK/aJovtI8Bjl9Qm\n-----END PRIVATE KEY-----\n",
+  "wrong_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEApDbvNMiAHUXNU8L73XZj471GDHtiH4MNeItnFCQGXx8=\n-----END PUBLIC KEY-----\n",
+  "vectors": [
+    {
+      "id": "valid-pop",
+      "capability_id": "cap_01ARZ3NDEKTSV4RRFFQ69G5FG1",
+      "envelope_id": "env_01ARZ3NDEKTSV4RRFFQ69G5FG2",
+      "timestamp": "2025-01-15T12:00:00.000Z",
+      "signature": "Y3Z_HarftGOnHgzQaibxyDsD7PjYhazTitke8L5cC0HAKqigmXfFlpljOmbdatsYl2yQh8peVrS-qUq3GUS2Ag",
+      "should_verify": true
+    },
+    {
+      "id": "wrong-key-pop",
+      "capability_id": "cap_01ARZ3NDEKTSV4RRFFQ69G5FG1",
+      "envelope_id": "env_01ARZ3NDEKTSV4RRFFQ69G5FG2",
+      "timestamp": "2025-01-15T12:00:00.000Z",
+      "signature": "Y3Z_HarftGOnHgzQaibxyDsD7PjYhazTitke8L5cC0HAKqigmXfFlpljOmbdatsYl2yQh8peVrS-qUq3GUS2Ag",
+      "use_wrong_key": true,
+      "should_verify": false
+    },
+    {
+      "id": "wrong-capability-id-pop",
+      "capability_id": "cap_01ARZ3NDEKTSV4RRFFQ69WRONG",
+      "envelope_id": "env_01ARZ3NDEKTSV4RRFFQ69G5FG2",
+      "timestamp": "2025-01-15T12:00:00.000Z",
+      "signature": "Y3Z_HarftGOnHgzQaibxyDsD7PjYhazTitke8L5cC0HAKqigmXfFlpljOmbdatsYl2yQh8peVrS-qUq3GUS2Ag",
+      "should_verify": false
+    },
+    {
+      "id": "wrong-envelope-id-pop",
+      "capability_id": "cap_01ARZ3NDEKTSV4RRFFQ69G5FG1",
+      "envelope_id": "env_WRONG",
+      "timestamp": "2025-01-15T12:00:00.000Z",
+      "signature": "Y3Z_HarftGOnHgzQaibxyDsD7PjYhazTitke8L5cC0HAKqigmXfFlpljOmbdatsYl2yQh8peVrS-qUq3GUS2Ag",
+      "should_verify": false
+    },
+    {
+      "id": "wrong-timestamp-pop",
+      "capability_id": "cap_01ARZ3NDEKTSV4RRFFQ69G5FG1",
+      "envelope_id": "env_01ARZ3NDEKTSV4RRFFQ69G5FG2",
+      "timestamp": "2025-01-15T13:00:00.000Z",
+      "signature": "Y3Z_HarftGOnHgzQaibxyDsD7PjYhazTitke8L5cC0HAKqigmXfFlpljOmbdatsYl2yQh8peVrS-qUq3GUS2Ag",
+      "should_verify": false
+    }
+  ]
+}
