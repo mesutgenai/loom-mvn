@@ -49,7 +49,13 @@ const E2EE_PROFILES = [
     wrapped_key_ciphertext_package_version: E2EE_WRAPPED_KEY_CIPHERTEXT_VERSION,
     replay_counter_required: true,
     profile_commitment_required: true,
-    requires_wrapped_keys: true
+    requires_wrapped_keys: true,
+    security_properties: {
+      forward_secrecy: false,
+      post_compromise_security: false,
+      confidentiality: "best_effort",
+      description: "Per-epoch key wrapping without FS/PCS. Suitable for stored-message confidentiality."
+    }
   },
   {
     id: "loom-e2ee-x25519-xchacha20-v2",
@@ -66,7 +72,37 @@ const E2EE_PROFILES = [
     wrapped_key_ciphertext_package_version: E2EE_WRAPPED_KEY_CIPHERTEXT_VERSION,
     replay_counter_required: true,
     profile_commitment_required: true,
-    requires_wrapped_keys: true
+    requires_wrapped_keys: true,
+    security_properties: {
+      forward_secrecy: false,
+      post_compromise_security: false,
+      confidentiality: "best_effort",
+      description: "Per-epoch key wrapping without FS/PCS. Suitable for stored-message confidentiality."
+    }
+  },
+  {
+    id: "loom-e2ee-mls-1",
+    aliases: [],
+    status: "reserved",
+    key_agreement: "MLS-TreeKEM",
+    cipher: "AES-128-GCM",
+    kdf: "HKDF-SHA-256",
+    wrapped_key_algorithms: [],
+    recipient_key_algorithm: null,
+    payload_aad_type: E2EE_PAYLOAD_AAD_TYPE,
+    attachment_aad_type: E2EE_ATTACHMENT_AAD_TYPE,
+    wrapped_key_aad_type: null,
+    payload_ciphertext_package_version: null,
+    wrapped_key_ciphertext_package_version: null,
+    replay_counter_required: false,
+    profile_commitment_required: false,
+    requires_wrapped_keys: false,
+    security_properties: {
+      forward_secrecy: true,
+      post_compromise_security: true,
+      confidentiality: "mls_grade",
+      description: "MLS (RFC 9420) based profile. Reserved for future implementation."
+    }
   }
 ];
 
@@ -890,15 +926,27 @@ export function resolveE2eeProfile(profileId) {
     return null;
   }
 
-  return E2EE_PROFILES.find((profile) => profile.id === canonicalId) || null;
+  const found = E2EE_PROFILES.find((profile) => profile.id === canonicalId) || null;
+  if (found?.status === "reserved") {
+    return null;
+  }
+  return found;
+}
+
+export function listAllE2eeProfiles() {
+  return E2EE_PROFILES.map((profile) => ({
+    id: profile.id,
+    status: profile.status || "active",
+    security_properties: { ...profile.security_properties }
+  }));
 }
 
 export function listSupportedE2eeProfiles() {
-  return E2EE_PROFILES.map((profile) => profile.id);
+  return E2EE_PROFILES.filter((profile) => profile.status !== "reserved").map((profile) => profile.id);
 }
 
 export function listSupportedE2eeProfileCapabilities() {
-  return E2EE_PROFILES.map((profile) => ({
+  return E2EE_PROFILES.filter((profile) => profile.status !== "reserved").map((profile) => ({
     id: profile.id,
     aliases: [...profile.aliases],
     key_agreement: profile.key_agreement,
