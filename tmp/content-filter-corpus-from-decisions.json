@@ -1,0 +1,64 @@
+{
+  "version": "agent-production-like-agent-v1",
+  "generated_at": "2026-02-20T13:54:39.317Z",
+  "source_filter": "federation",
+  "profile": "agent",
+  "total_vectors": 4,
+  "vectors": [
+    {
+      "id": "log_000001",
+      "source": "federation",
+      "expected_action": "allow",
+      "scores": {
+        "total_score": 0,
+        "spam_score": 0,
+        "phish_score": 0,
+        "malware_score": 0
+      },
+      "signal_codes": []
+    },
+    {
+      "id": "log_000002",
+      "source": "federation",
+      "expected_action": "allow",
+      "scores": {
+        "total_score": 1,
+        "spam_score": 1,
+        "phish_score": 0,
+        "malware_score": 0
+      },
+      "signal_codes": [
+        "keyword.spam"
+      ]
+    },
+    {
+      "id": "log_000003",
+      "source": "federation",
+      "expected_action": "quarantine",
+      "scores": {
+        "total_score": 7,
+        "spam_score": 1,
+        "phish_score": 6,
+        "malware_score": 0
+      },
+      "signal_codes": [
+        "keyword.phish_cluster",
+        "url.shortener"
+      ]
+    },
+    {
+      "id": "log_000004",
+      "source": "federation",
+      "expected_action": "reject",
+      "scores": {
+        "total_score": 10,
+        "spam_score": 1,
+        "phish_score": 4,
+        "malware_score": 5
+      },
+      "signal_codes": [
+        "attachment.risky_extension"
+      ]
+    }
+  ]
+}

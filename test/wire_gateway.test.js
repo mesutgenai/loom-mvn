@@ -126,6 +126,20 @@ function createIdentityAndToken(store, identity, keyId, keys) {
   return token.access_token;
 }
 
+function parseSearchResponseValues(line) {
+  const raw = String(line || "");
+  if (!raw.toUpperCase().startsWith("* SEARCH")) {
+    return [];
+  }
+  return raw
+    .replace(/^\* SEARCH\s*/i, "")
+    .trim()
+    .split(/\s+/)
+    .map((entry) => Number(entry))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((a, b) => a - b);
+}
+
 test("wire gateway refuses authenticated mode without TLS by default", () => {
   const store = new LoomStore({ nodeId: "node.test" });
   assert.throws(
@@ -429,6 +443,16 @@ test("wire IMAP gateway supports IDLE, APPEND, MOVE, UID MOVE, and sectioned FET
   await wait((line) => line.includes("BODY[TEXT]"), "UID FETCH text payload");
   await wait((line) => line.startsWith("b8 OK UID FETCH completed"), "UID FETCH completion");
 
+  socket.write("b8a UID SORT (DATE) UTF-8 ALL\r\n");
+  const sortLine = await wait((line) => line.startsWith("* SORT"), "UID SORT payload");
+  assert.match(sortLine, /\* SORT(?:\s+\d+)+/);
+  await wait((line) => line.startsWith("b8a OK UID SORT completed"), "UID SORT completion");
+
+  socket.write("b8b UID THREAD REFERENCES UTF-8 ALL\r\n");
+  const threadLine = await wait((line) => line.startsWith("* THREAD"), "UID THREAD payload");
+  assert.match(threadLine, /\* THREAD(?:\s+\(.+\))?/);
+  await wait((line) => line.startsWith("b8b OK UID THREAD completed"), "UID THREAD completion");
+
   socket.write('b9 UID MOVE 1:* "Trash"\r\n');
   await wait((line) => line.startsWith("b9 OK UID MOVE completed"), "UID MOVE completion");
 
@@ -437,7 +461,11 @@ test("wire IMAP gateway supports IDLE, APPEND, MOVE, UID MOVE, and sectioned FET
   assert.match(trashStatus, /MESSAGES\s+1\b/);
   await wait((line) => line.startsWith("b10 OK"), "Trash STATUS completion");
 
-  socket.write('b11 APPEND "Sent" "hello appended via imap"\r\n');
+  const appendLiteral = "Subject: IMAP Literal Append\r\nTo: bob@node.test\r\n\r\nhello appended via imap literal";
+  const appendBytes = Buffer.byteLength(appendLiteral, "utf-8");
+  socket.write(`b11 APPEND "Sent" {${appendBytes}}\r\n`);
+  await wait((line) => line.startsWith("+ Ready for literal data"), "APPEND literal continuation");
+  socket.write(`${appendLiteral}\r\n`);
   await wait((line) => line.startsWith("b11 OK APPEND completed"), "APPEND completion");
 
   socket.write('b12 STATUS "Sent" (MESSAGES)\r\n');
@@ -454,6 +482,141 @@ test("wire IMAP gateway supports IDLE, APPEND, MOVE, UID MOVE, and sectioned FET
   socket.write("b15 LOGOUT\r\n");
   await wait((line) => line.startsWith("* BYE"), "LOGOUT BYE");
   await wait((line) => line.startsWith("b15 OK"), "LOGOUT completion");
+});
+
+test("wire IMAP SEARCH supports OR/NOT boolean criteria with grouped expressions", async (t) => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  const keys = generateSigningKeyPair();
+  const token = createIdentityAndToken(store, "loom://alice@node.test", "k_sign_alice_1", keys);
+
+  store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      subject: "Agent Alert",
+      text: "agent_marker coordination update for weekly ops",
+      date: "2026-02-20T00:00:00.000Z"
+    },
+    "loom://alice@node.test"
+  );
+  store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      subject: "Daily Digest",
+      text: "digest_marker pipeline summary and digest report",
+      date: "2026-02-20T00:01:00.000Z"
+    },
+    "loom://alice@node.test"
+  );
+  store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      subject: "Support Notice",
+      text: "support_marker manual support follow-up needed",
+      date: "2026-02-20T00:02:00.000Z"
+    },
+    "loom://alice@node.test"
+  );
+
+  const gateway = new LoomWireGateway({
+    store,
+    enabled: true,
+    host: "127.0.0.1",
+    smtpEnabled: false,
+    imapEnabled: true,
+    imapPort: 0,
+    requireAuth: true,
+    allowInsecureAuth: true
+  });
+  await gateway.start();
+  t.after(async () => {
+    await gateway.stop();
+  });
+
+  const status = gateway.getStatus();
+  const socket = connectTcp(status.imap.bound_port, "127.0.0.1");
+  await once(socket, "connect");
+  t.after(() => {
+    socket.destroy();
+  });
+
+  const waitFor = createLineWaiter(socket);
+  const wait = async (predicate, label) => {
+    try {
+      return await waitFor(predicate);
+    } catch {
+      throw new Error(`Timed out waiting for ${label}`);
+    }
+  };
+  await wait((line) => line.startsWith("* OK"), "IMAP greeting");
+
+  socket.write(`c1 LOGIN "loom://alice@node.test" "${token}"\r\n`);
+  await wait((line) => line.startsWith("c1 OK"), "LOGIN completion");
+
+  socket.write('c2 SELECT "INBOX"\r\n');
+  await wait((line) => line.includes(" EXISTS"), "SELECT INBOX exists");
+  await wait((line) => line.startsWith("c2 OK"), "SELECT INBOX completion");
+
+  socket.write('c3 UID SEARCH BODY "agent_marker"\r\n');
+  const searchAgent = parseSearchResponseValues(await wait((line) => line.startsWith("* SEARCH"), "search agent marker"));
+  await wait((line) => line.startsWith("c3 OK UID SEARCH completed"), "search agent marker completion");
+  assert.equal(searchAgent.length, 1);
+
+  socket.write('c4 UID SEARCH BODY "digest_marker"\r\n');
+  const searchDigest = parseSearchResponseValues(
+    await wait((line) => line.startsWith("* SEARCH"), "search digest marker")
+  );
+  await wait((line) => line.startsWith("c4 OK UID SEARCH completed"), "search digest marker completion");
+  assert.equal(searchDigest.length, 1);
+
+  socket.write('c5 UID SEARCH BODY "support_marker"\r\n');
+  const searchSupport = parseSearchResponseValues(
+    await wait((line) => line.startsWith("* SEARCH"), "search support marker")
+  );
+  await wait((line) => line.startsWith("c5 OK UID SEARCH completed"), "search support marker completion");
+  assert.equal(searchSupport.length, 1);
+
+  const agentUid = searchAgent[0];
+  const digestUid = searchDigest[0];
+  const supportUid = searchSupport[0];
+  const sortedThree = [agentUid, digestUid, supportUid].sort((a, b) => a - b);
+
+  socket.write('c6 UID SEARCH OR BODY "agent_marker" BODY "digest_marker"\r\n');
+  const orResult = parseSearchResponseValues(await wait((line) => line.startsWith("* SEARCH"), "OR search"));
+  await wait((line) => line.startsWith("c6 OK UID SEARCH completed"), "OR search completion");
+  assert.deepEqual(orResult, [agentUid, digestUid].sort((a, b) => a - b));
+
+  socket.write('c7 UID SEARCH NOT BODY "digest_marker"\r\n');
+  const notResult = parseSearchResponseValues(await wait((line) => line.startsWith("* SEARCH"), "NOT search"));
+  await wait((line) => line.startsWith("c7 OK UID SEARCH completed"), "NOT search completion");
+  assert.deepEqual(notResult, [agentUid, supportUid].sort((a, b) => a - b));
+
+  socket.write('c8 UID SEARCH (OR BODY "agent_marker" BODY "digest_marker") NOT BODY "digest_marker"\r\n');
+  const groupedAndResult = parseSearchResponseValues(
+    await wait((line) => line.startsWith("* SEARCH"), "grouped AND search")
+  );
+  await wait((line) => line.startsWith("c8 OK UID SEARCH completed"), "grouped AND search completion");
+  assert.deepEqual(groupedAndResult, [agentUid]);
+
+  socket.write('c9 UID SEARCH NOT (OR BODY "agent_marker" BODY "digest_marker")\r\n');
+  const groupedNotResult = parseSearchResponseValues(
+    await wait((line) => line.startsWith("* SEARCH"), "grouped NOT search")
+  );
+  await wait((line) => line.startsWith("c9 OK UID SEARCH completed"), "grouped NOT search completion");
+  assert.deepEqual(groupedNotResult, [supportUid]);
+
+  socket.write('c10 UID SEARCH OR (NOT BODY "support_marker") BODY "support_marker"\r\n');
+  const nestedResult = parseSearchResponseValues(
+    await wait((line) => line.startsWith("* SEARCH"), "nested OR/NOT grouped search")
+  );
+  await wait((line) => line.startsWith("c10 OK UID SEARCH completed"), "nested OR/NOT grouped search completion");
+  assert.deepEqual(nestedResult, sortedThree);
+
+  socket.write("c11 LOGOUT\r\n");
+  await wait((line) => line.startsWith("* BYE"), "LOGOUT BYE");
+  await wait((line) => line.startsWith("c11 OK"), "LOGOUT completion");
 });
 
 test("wire SMTP gateway supports STARTTLS upgrade", async (t) => {

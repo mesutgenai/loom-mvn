@@ -1809,6 +1809,584 @@ test("maintenance sweep returns swept count reflecting total evictions", () => {
   assert.ok(result.swept >= 3);
 });
 
+test("bridge inbound ignores payload auth_results when disabled and sanitizes original headers", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    bridgeInboundAllowPayloadAuthResults: false,
+    bridgeInboundRequireAuthResults: true
+  });
+
+  const result = store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      text: "bridge auth boundary",
+      auth_results: {
+        spf: "pass",
+        dkim: "pass",
+        dmarc: "pass"
+      },
+      headers: {
+        Subject: "Bridge Boundary",
+        "X-Not-Allowed": "secret",
+        Date: new Date().toUTCString()
+      }
+    },
+    "loom://alice@node.test"
+  );
+
+  assert.equal(result.quarantined, true);
+  const envelope = store.getEnvelope(result.envelope_id);
+  assert.equal(envelope?.meta?.bridge?.auth_results?.source, "none");
+  assert.equal(envelope?.meta?.bridge?.original_headers?.Subject, "Bridge Boundary");
+  assert.equal(Object.prototype.hasOwnProperty.call(envelope?.meta?.bridge?.original_headers || {}, "X-Not-Allowed"), false);
+  assert.equal(envelope?.meta?.bridge?.auth_policy?.allow_payload_auth_results, false);
+});
+
+test("bridge inbound content filter rejects risky executable attachments", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    inboundContentFilterEnabled: true,
+    inboundContentFilterRejectMalware: true
+  });
+
+  assert.throws(
+    () =>
+      store.createBridgeInboundEnvelope(
+        {
+          smtp_from: "sender@example.net",
+          rcpt_to: ["alice@node.test"],
+          subject: "Invoice",
+          text: "See attached invoice",
+          attachments: [
+            {
+              filename: "invoice.pdf.exe",
+              mime_type: "application/octet-stream"
+            }
+          ]
+        },
+        "loom://alice@node.test"
+      ),
+    (error) => error?.code === "CAPABILITY_DENIED"
+  );
+
+  const status = store.getInboundContentFilterStatus();
+  assert.equal(status.rejected >= 1, true);
+});
+
+test("bridge inbound content filter can quarantine phishing-like content and expose metadata", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    inboundContentFilterEnabled: true
+  });
+
+  const result = store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      subject: "Notice",
+      text: "Verify your account now: https://bit.ly/recover-account"
+    },
+    "loom://alice@node.test"
+  );
+
+  assert.equal(result.quarantined, true);
+
+  const envelope = store.getEnvelope(result.envelope_id);
+  assert.equal(envelope?.meta?.security?.content_filter?.action, "quarantine");
+  assert.equal(Array.isArray(envelope?.meta?.security?.content_filter?.signal_codes), true);
+
+  const thread = store.getThread(result.thread_id);
+  assert.equal(thread?.labels?.includes("sys.quarantine"), true);
+});
+
+test("content filter tracks profile-labeled decision counters for calibration metrics", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    inboundContentFilterEnabled: true,
+    inboundContentFilterProfileDefault: "balanced",
+    inboundContentFilterProfileBridge: "strict",
+    inboundContentFilterProfileFederation: "agent"
+  });
+
+  const allowed = store.evaluateInboundContentPolicy(
+    {
+      subject: "Pipeline digest",
+      text: "Automated workflow summary for job-42. No operator action required."
+    },
+    {
+      source: "federation"
+    }
+  );
+  assert.equal(allowed.profile, "agent");
+  assert.equal(allowed.action, "allow");
+
+  const quarantined = store.evaluateInboundContentPolicy(
+    {
+      subject: "Login required",
+      text: "Login required to review account state: https://bit.ly/session-check https://xn--billing-check-9ob.example/login"
+    },
+    {
+      source: "federation"
+    }
+  );
+  assert.equal(quarantined.profile, "agent");
+  assert.equal(quarantined.action, "quarantine");
+
+  const rejected = store.evaluateInboundContentPolicy(
+    {
+      subject: "Invoice attachment",
+      text: "Please inspect attachment.",
+      attachments: [
+        {
+          filename: "invoice.pdf.exe",
+          mime_type: "application/octet-stream"
+        }
+      ]
+    },
+    {
+      source: "bridge_email"
+    }
+  );
+  assert.equal(rejected.profile, "strict");
+  assert.equal(rejected.action, "reject");
+
+  const status = store.getInboundContentFilterStatus();
+  assert.equal(status.evaluated, 3);
+  assert.equal(status.rejected, 1);
+  assert.equal(status.quarantined, 1);
+  assert.equal(status.decision_counts_by_profile.agent.evaluated, 2);
+  assert.equal(status.decision_counts_by_profile.agent.allow, 1);
+  assert.equal(status.decision_counts_by_profile.agent.quarantine, 1);
+  assert.equal(status.decision_counts_by_profile.agent.reject, 0);
+  assert.equal(status.decision_counts_by_profile.strict.evaluated, 1);
+  assert.equal(status.decision_counts_by_profile.strict.reject, 1);
+});
+
+test("content filter decision counters persist across restart", () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "loom-content-filter-persist-"));
+  try {
+    const storeA = new LoomStore({
+      nodeId: "node.test",
+      dataDir,
+      inboundContentFilterEnabled: true
+    });
+
+    storeA.evaluateInboundContentPolicy(
+      {
+        subject: "Workflow digest",
+        text: "Pipeline summary for run-123. no action needed."
+      },
+      {
+        source: "federation",
+        profile: "agent"
+      }
+    );
+    storeA.evaluateInboundContentPolicy(
+      {
+        subject: "Security alert",
+        text: "verify your account now: https://bit.ly/security-check"
+      },
+      {
+        source: "bridge_email",
+        profile: "strict"
+      }
+    );
+    storeA.persistState();
+
+    const storeB = new LoomStore({
+      nodeId: "node.test",
+      dataDir
+    });
+    const status = storeB.getInboundContentFilterStatus();
+    assert.equal(status.evaluated, 2);
+    assert.equal(status.decision_counts_by_profile.agent.evaluated, 1);
+    assert.equal(status.decision_counts_by_profile.strict.evaluated, 1);
+    assert.equal(status.quarantined >= 1 || status.rejected >= 1, true);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("content filter config supports canary apply rollback workflow", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    inboundContentFilterEnabled: true
+  });
+  const before = store.getInboundContentFilterConfigStatus();
+
+  const canary = store.updateInboundContentFilterConfig(
+    {
+      mode: "canary",
+      config: {
+        quarantine_threshold: 6,
+        reject_threshold: 9,
+        profile_federation: "strict"
+      },
+      note: "canary threshold hardening"
+    },
+    "admin"
+  );
+  assert.equal(canary.active.quarantine_threshold, before.active.quarantine_threshold);
+  assert.equal(canary.canary?.config?.quarantine_threshold, 6);
+  assert.equal(canary.canary?.config?.reject_threshold, 9);
+
+  const applied = store.updateInboundContentFilterConfig(
+    {
+      mode: "apply"
+    },
+    "admin"
+  );
+  assert.equal(applied.active.quarantine_threshold, 6);
+  assert.equal(applied.active.reject_threshold, 9);
+  assert.equal(applied.active.profile_federation, "strict");
+  assert.equal(applied.canary, null);
+  assert.equal(applied.rollback?.config?.quarantine_threshold, before.active.quarantine_threshold);
+
+  const rolledBack = store.updateInboundContentFilterConfig(
+    {
+      mode: "rollback"
+    },
+    "admin"
+  );
+  assert.equal(rolledBack.active.quarantine_threshold, before.active.quarantine_threshold);
+  assert.equal(rolledBack.active.reject_threshold, before.active.reject_threshold);
+});
+
+test("content filter decision telemetry log writes anonymized profile decisions", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "loom-content-filter-log-"));
+  const decisionLogFile = join(workDir, "content-filter-decisions.jsonl");
+
+  try {
+    const store = new LoomStore({
+      nodeId: "node.test",
+      inboundContentFilterEnabled: true,
+      inboundContentFilterDecisionLogEnabled: true,
+      inboundContentFilterDecisionLogFile: decisionLogFile,
+      inboundContentFilterDecisionLogSalt: "test-salt",
+      inboundContentFilterProfileDefault: "balanced",
+      inboundContentFilterProfileFederation: "agent"
+    });
+
+    const result = store.evaluateInboundContentPolicy(
+      {
+        subject: "Agent digest",
+        text: "Workflow summary for loom://ops@node.test see https://ops.example.net/runbooks/17"
+      },
+      {
+        source: "federation",
+        actor: "loom://ops@node.test",
+        node_id: "remote.example"
+      }
+    );
+
+    assert.equal(result.profile, "agent");
+    const raw = readFileSync(decisionLogFile, "utf-8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    assert.equal(raw.length, 1);
+    const entry = JSON.parse(raw[0]);
+    assert.equal(entry.source, "federation");
+    assert.equal(entry.profile, "agent");
+    assert.equal(entry.action, "allow");
+    assert.equal(typeof entry.subject_hash, "string");
+    assert.equal(typeof entry.text_hash, "string");
+    assert.equal(Object.prototype.hasOwnProperty.call(entry, "subject"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(entry, "text"), false);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test("federation protocol capabilities negotiation is fetched and recorded for known node", async () => {
+  const keyPair = generateSigningKeyPair();
+  const store = new LoomStore({
+    nodeId: "node.test"
+  });
+
+  const node = store.registerFederationNode(
+    {
+      node_id: "remote.test",
+      key_id: "k_node_remote_1",
+      public_key_pem: keyPair.publicKeyPem,
+      deliver_url: "https://remote.test/v1/federation/deliver",
+      protocol_capabilities_url: "https://remote.test/v1/protocol/capabilities"
+    },
+    "admin"
+  );
+
+  store.fetchFederationJsonDocument = async () => ({
+    url: "https://remote.test/v1/protocol/capabilities",
+    payload: {
+      loom_version: "1.1",
+      node_id: "remote.test",
+      federation_negotiation: {
+        trust_anchor_mode: store.getFederationTrustAnchorMode(),
+        trust_anchor_modes_supported: [store.getFederationTrustAnchorMode()],
+        e2ee_profiles: ["loom-e2ee-x25519-xchacha20-v1"]
+      }
+    }
+  });
+
+  const refreshed = await store.ensureFederationNodeProtocolCapabilities(node, "admin", {
+    forceRefresh: true,
+    failOnMissing: true,
+    failOnFetchError: true,
+    persist: false
+  });
+
+  assert.equal(refreshed.protocol_capabilities_url, "https://remote.test/v1/protocol/capabilities");
+  assert.deepEqual(refreshed.negotiated_e2ee_profiles, ["loom-e2ee-x25519-xchacha20-v1"]);
+  assert.equal(refreshed.protocol_negotiated_trust_anchor_mode, store.getFederationTrustAnchorMode());
+  assert.equal(refreshed.protocol_capabilities_fetch_error, null);
+});
+
+test("federation trust DNS proof enforces DNSSEC validation when required", async () => {
+  const trustRecord =
+    "v=loomfed1;keyset=https://remote.test/.well-known/loom-keyset.json;digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;revocations=https://remote.test/.well-known/loom-revocations.json;trust_epoch=1;version=1";
+
+  const storeWithoutDnssec = new LoomStore({
+    nodeId: "node.test",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustRequireDnssec: true,
+    federationTrustDnsTxtResolver: async () => [[trustRecord]]
+  });
+
+  await assert.rejects(
+    async () => {
+      await storeWithoutDnssec.resolveFederationTrustDnsProof("remote.test");
+    },
+    (error) => error?.code === "SIGNATURE_INVALID"
+  );
+
+  const storeWithDnssec = new LoomStore({
+    nodeId: "node.test",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustRequireDnssec: true,
+    federationTrustDnsTxtResolver: async () => ({
+      answers: [[trustRecord]],
+      dnssec_validated: true,
+      dnssec_source: "test-dnssec"
+    })
+  });
+
+  const proof = await storeWithDnssec.resolveFederationTrustDnsProof("remote.test");
+  assert.equal(proof.dnssec_validated, true);
+  assert.equal(proof.dnssec_source, "test-dnssec");
+});
+
+test("federation trust transparency checkpoint chain advances deterministically", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  const hashV1 = "a".repeat(64);
+  const hashV2 = "b".repeat(64);
+
+  const first = store.deriveFederationTrustTransparencyState("remote.test", 1, 1, hashV1);
+  assert.equal(first.event_index, 0);
+  assert.equal(typeof first.checkpoint, "string");
+  assert.equal(first.mode, "local_append_only");
+
+  const unchanged = store.deriveFederationTrustTransparencyState(
+    "remote.test",
+    1,
+    1,
+    hashV1,
+    {
+      node_id: "remote.test",
+      trust_anchor_epoch: 1,
+      trust_anchor_keyset_version: 1,
+      trust_anchor_keyset_hash: hashV1,
+      trust_anchor_transparency_log_id: first.log_id,
+      trust_anchor_transparency_mode: first.mode,
+      trust_anchor_transparency_checkpoint: first.checkpoint,
+      trust_anchor_transparency_previous_checkpoint: first.previous_checkpoint,
+      trust_anchor_transparency_event_index: first.event_index,
+      trust_anchor_transparency_verified_at: first.verified_at
+    }
+  );
+  assert.equal(unchanged.appended, false);
+  assert.equal(unchanged.event_index, first.event_index);
+  assert.equal(unchanged.checkpoint, first.checkpoint);
+
+  const second = store.deriveFederationTrustTransparencyState(
+    "remote.test",
+    2,
+    2,
+    hashV2,
+    {
+      node_id: "remote.test",
+      trust_anchor_epoch: 1,
+      trust_anchor_keyset_version: 1,
+      trust_anchor_keyset_hash: hashV1,
+      trust_anchor_transparency_log_id: first.log_id,
+      trust_anchor_transparency_mode: first.mode,
+      trust_anchor_transparency_checkpoint: first.checkpoint,
+      trust_anchor_transparency_previous_checkpoint: first.previous_checkpoint,
+      trust_anchor_transparency_event_index: first.event_index,
+      trust_anchor_transparency_verified_at: first.verified_at
+    }
+  );
+  assert.equal(second.appended, true);
+  assert.equal(second.event_index, 1);
+  assert.equal(second.previous_checkpoint, first.checkpoint);
+  assert.notEqual(second.checkpoint, first.checkpoint);
+});
+
+test("federation outbox compatibility rejects unsupported encrypted profile negotiation", () => {
+  const store = new LoomStore({ nodeId: "node.test" });
+  const node = {
+    node_id: "remote.test",
+    protocol_capabilities: {
+      loom_version: "1.1",
+      node_id: "remote.test",
+      federation_negotiation: {
+        trust_anchor_mode: store.getFederationTrustAnchorMode(),
+        trust_anchor_modes_supported: [store.getFederationTrustAnchorMode()],
+        e2ee_profiles: []
+      }
+    },
+    negotiated_e2ee_profiles: [],
+    protocol_negotiated_trust_anchor_mode: store.getFederationTrustAnchorMode()
+  };
+  const encryptedEnvelope = {
+    id: "env_enc_1",
+    content: {
+      encrypted: true,
+      profile: "loom-e2ee-x25519-xchacha20-v1"
+    }
+  };
+
+  assert.throws(
+    () => store.assertFederationOutboxNodeCompatibility(node, [encryptedEnvelope]),
+    (error) => error?.code === "CAPABILITY_DENIED"
+  );
+
+  node.protocol_capabilities.federation_negotiation.e2ee_profiles = ["loom-e2ee-x25519-xchacha20-v1"];
+  node.negotiated_e2ee_profiles = ["loom-e2ee-x25519-xchacha20-v1"];
+  assert.doesNotThrow(() => store.assertFederationOutboxNodeCompatibility(node, [encryptedEnvelope]));
+});
+
+test("maintenance sweep message retention removes expired thread envelopes and scoped artifacts", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    messageRetentionDays: 1
+  });
+
+  const oldDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  const threadId = "thr_retention_old";
+  const envelopeId = "env_retention_old";
+
+  store.envelopesById.set(envelopeId, {
+    id: envelopeId,
+    thread_id: threadId,
+    created_at: oldDate,
+    parent_id: null,
+    meta: {}
+  });
+  store.threadsById.set(threadId, {
+    id: threadId,
+    root_envelope_id: envelopeId,
+    subject: "Retention Subject",
+    state: "active",
+    created_at: oldDate,
+    updated_at: oldDate,
+    participants: [
+      {
+        identity: "loom://alice@node.test",
+        role: "owner",
+        joined_at: oldDate,
+        left_at: null
+      }
+    ],
+    labels: [],
+    cap_epoch: 0,
+    encryption: {
+      enabled: false,
+      profile: null,
+      key_epoch: 0
+    },
+    envelope_ids: [envelopeId],
+    pending_parent_count: 0
+  });
+
+  store.capabilitiesById.set("cap_retention_old", {
+    id: "cap_retention_old",
+    thread_id: threadId,
+    secret_hash: "cap_retention_hash"
+  });
+  store.capabilityIdBySecretHash.set("cap_retention_hash", "cap_retention_old");
+  store.delegationsById.set("del_retention_old", {
+    id: "del_retention_old",
+    thread_id: threadId
+  });
+  store.revokedDelegationIds.add("del_retention_old");
+
+  const result = store.runMaintenanceSweep();
+  assert.equal(store.envelopesById.has(envelopeId), false);
+  assert.equal(store.threadsById.has(threadId), false);
+  assert.equal(store.capabilitiesById.has("cap_retention_old"), false);
+  assert.equal(store.capabilityIdBySecretHash.has("cap_retention_hash"), false);
+  assert.equal(store.delegationsById.has("del_retention_old"), false);
+  assert.equal(store.revokedDelegationIds.has("del_retention_old"), false);
+  assert.ok(result.swept >= 1);
+});
+
+test("maintenance sweep blob retention scrubs referenced blobs and removes unreferenced blobs", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    blobRetentionDays: 1
+  });
+  const oldDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+
+  store.envelopesById.set("env_blob_ref", {
+    id: "env_blob_ref",
+    thread_id: "thr_blob_ref",
+    created_at: oldDate,
+    attachments: [
+      {
+        blob_id: "blob_ref"
+      }
+    ],
+    meta: {}
+  });
+
+  store.blobsById.set("blob_ref", {
+    id: "blob_ref",
+    created_by: "loom://alice@node.test",
+    created_at: oldDate,
+    completed_at: oldDate,
+    status: "complete",
+    data_base64: Buffer.from("hello", "utf-8").toString("base64"),
+    size_bytes: 5,
+    hash: "sha256:abc",
+    quota_accounted_bytes: 5,
+    parts: {
+      "1": Buffer.from("hello", "utf-8").toString("base64")
+    }
+  });
+  store.blobsById.set("blob_unreferenced", {
+    id: "blob_unreferenced",
+    created_by: "loom://alice@node.test",
+    created_at: oldDate,
+    completed_at: oldDate,
+    status: "complete",
+    data_base64: Buffer.from("bye", "utf-8").toString("base64"),
+    size_bytes: 3,
+    hash: "sha256:def",
+    quota_accounted_bytes: 3,
+    parts: {}
+  });
+
+  store.runMaintenanceSweep();
+
+  const referenced = store.blobsById.get("blob_ref");
+  assert.ok(referenced);
+  assert.equal(referenced.status, "expired");
+  assert.equal(referenced.data_base64, undefined);
+  assert.equal(referenced.size_bytes, 0);
+  assert.equal(store.blobsById.has("blob_unreferenced"), false);
+});
+
 test("outbox worker backoff formula doubles on consecutive failures and caps at 5 minutes", () => {
   let backoffMs = 0;
 

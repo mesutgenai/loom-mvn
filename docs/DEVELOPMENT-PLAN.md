@@ -27,13 +27,22 @@ v1.1 is implementation-ready for a Core Level 1 node, with concrete requirements
   - Backup/restore flows covered in API tests.
 - SMTP/IMAP interoperability hardening baseline:
   - Edge-case address parsing, case-insensitive header handling, and folder alias support.
+  - IMAP SEARCH boolean grammar (`OR`, `NOT`, grouped criteria), APPEND literals, and `UID THREAD`/`UID SORT` command coverage.
 - Federation hardening baseline:
   - Rate policy controls, allowlist/trust model, abuse automation, and discovery bootstrap.
+  - Protocol-capability negotiation controls (optional strict profile-overlap/trust-mode-parity gates).
+- Agent-first protocol modularization baseline:
+  - Store internals split into protocol core, policy engine, and adapters for clearer trust/policy boundary ownership.
+- Inbound content policy baseline:
+  - Profile-aware bridge/federation content filtering, profile-labeled decision telemetry, admin canary/apply/rollback controls, and corpus builder for threshold tuning.
 - Distributed abuse controls baseline:
   - Global inbound limits, reputation updates, auto-policy gates, and challenge escalation/token flow.
 - Delivery/outbox hardening baseline:
   - DSN-style per-recipient email outbox status updates (`/v1/email/outbox/{id}/dsn`).
   - Distributed outbox claim leasing for `email`, `federation`, and `webhook` workers.
+  - Periodic trust-anchor revalidation worker and trust freshness drill automation.
+- Retention and maintenance baseline:
+  - Message/blob retention policies with periodic maintenance sweep execution.
 - Repo operations baseline:
   - License and CI workflow are present (`LICENSE`, `.github/workflows/ci.yml`).
   - Conformance profile and vectors documented in `docs/CONFORMANCE.md`.
@@ -74,7 +83,7 @@ v1.1 is implementation-ready for a Core Level 1 node, with concrete requirements
 - BCC copy behavior and audience restrictions.
 - Legacy gateway and bridge integration.
 - Outbound email relay queue + processing automation.
-- Wire-level legacy gateway daemon baseline (SMTP submit + IMAP mailbox access) with optional STARTTLS and extended IMAP mailbox commands (`STATUS`, `SEARCH`, `FETCH`, `STORE`, `APPEND`, `IDLE`, `MOVE`, `UID SEARCH`, `UID FETCH`, `UID STORE`, `UID MOVE`).
+- Wire-level legacy gateway daemon baseline (SMTP submit + IMAP mailbox access) with optional STARTTLS and extended IMAP mailbox commands (`STATUS`, `SEARCH`, `FETCH`, `STORE`, `APPEND` with literal mode, `IDLE`, `MOVE`, `UID SEARCH`, `UID FETCH`, `UID STORE`, `UID MOVE`, `UID THREAD`, `UID SORT`).
 - Known wire IMAP limitation: `COPY`/`UID COPY` are rejected in the current mailbox-state model.
 
 ## Definition of Done for MVN (Current Build Target)

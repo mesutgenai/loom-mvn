@@ -1,0 +1,80 @@
+{
+  "spec": "loom.e2ee.attachment.crypto.x25519.xchacha20.v1",
+  "vector": {
+    "id": "deterministic-attachment-two-recipient-roundtrip",
+    "input": {
+      "profile": "loom-e2ee-x25519-xchacha20-v1",
+      "epoch": 9,
+      "replay_counter": 11,
+      "profile_commitment": "o3nhTYP40pIJiozBWxmWxFqeRetqnOC3_nU7GDCFiFU",
+      "plaintext_utf8": "Attachment payload bytes v1",
+      "content_encryption_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+      "payload_nonce": "ZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8",
+      "recipients": [
+        {
+          "to": "loom://alice@agents.example",
+          "key_id": "k_enc_alice_agents_1",
+          "algorithm": "X25519-HKDF-SHA256",
+          "recipient_public_key": "G64rdnJEuSk2FeJuijdhdj0QG3IMKtbeJnqmpYq1ZQs",
+          "recipient_private_key": "GKa1WKsnFkyFIUb19E5cJhNRGAtCaK9AJoQ78Q2eD1s",
+          "ephemeral_private_key": "KF8XKxqZx--5MW-e4oJAxsAnrtCnmmYHYtW8UkMDzU0",
+          "ephemeral_public_key": "MOxvXtYA-wZs2C_FnfplNy0NIbR7cOfkx40kc8G-wQU",
+          "wrap_nonce": "CwwNDg8QERITFBUWFxgZGhscHR4fICEi"
+        },
+        {
+          "to": "loom://bob@agents.example",
+          "key_id": "k_enc_bob_agents_1",
+          "algorithm": "X25519-HKDF-SHA256",
+          "recipient_public_key": "Lbn447faHnr007qJPvZA3M-ze6ZIXHsJoYo5hDEd524",
+          "recipient_private_key": "cER8NSAiW6NdAZDyFU_gONLfOrU9pCs5DbzuW45X92A",
+          "ephemeral_private_key": "8GLHY5Cuf21AOxbtnOBTiRqKfinqcNd5ii3Y7jrHxVY",
+          "ephemeral_public_key": "NxNouVAIAv8uBnNW8Aq4Rs6Y0rKu3P1iw9HhZ5nLgDs",
+          "wrap_nonce": "09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq"
+        }
+      ]
+    },
+    "expected_encrypted_attachment": {
+      "encrypted": true,
+      "profile": "loom-e2ee-x25519-xchacha20-v1",
+      "epoch": 9,
+      "replay_counter": 11,
+      "profile_commitment": "o3nhTYP40pIJiozBWxmWxFqeRetqnOC3_nU7GDCFiFU",
+      "ciphertext": "AWVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fGJE7Zv4yZgW2VCIbLLLdKS2qg3B7kbuNREm32z6lftjo-ih37oJdpCI59Q",
+      "wrapped_keys": [
+        {
+          "to": "loom://alice@agents.example",
+          "algorithm": "X25519-HKDF-SHA256",
+          "key_id": "k_enc_alice_agents_1",
+          "ciphertext": "ATDsb17WAPsGbNgvxZ36ZTctDSG0e3Dn5MeNJHPBvsEFCwwNDg8QERITFBUWFxgZGhscHR4fICEiNSEIUwvgXDdHlnGpaBVstWCRtyXz88g52Y5PlDOWOUWO8KC0vAOC2fR-Qz7kZWMh"
+        },
+        {
+          "to": "loom://bob@agents.example",
+          "algorithm": "X25519-HKDF-SHA256",
+          "key_id": "k_enc_bob_agents_1",
+          "ciphertext": "ATcTaLlQCAL_LgZzVvAKuEbOmNKyrtz9YsPR4WeZy4A709TV1tfY2drb3N3e3-Dh4uPk5ebn6OnqCbjMyHHioVDi9rjZyEOdflIHBW5NLG8jYP6wmi0PcQsdSkG-uK9-kU-anS5aibYe"
+        }
+      ]
+    },
+    "expected_plaintext_utf8": "Attachment payload bytes v1",
+    "decrypt_cases": [
+      {
+        "recipient_identity": "loom://alice@agents.example",
+        "recipient_key_id": "k_enc_alice_agents_1",
+        "recipient_private_key": {
+          "private_key": "GKa1WKsnFkyFIUb19E5cJhNRGAtCaK9AJoQ78Q2eD1s",
+          "public_key": "G64rdnJEuSk2FeJuijdhdj0QG3IMKtbeJnqmpYq1ZQs"
+        },
+        "expected_wrapped_key_algorithm": "X25519-HKDF-SHA256"
+      },
+      {
+        "recipient_identity": "loom://bob@agents.example",
+        "recipient_key_id": "k_enc_bob_agents_1",
+        "recipient_private_key": {
+          "private_key": "cER8NSAiW6NdAZDyFU_gONLfOrU9pCs5DbzuW45X92A",
+          "public_key": "Lbn447faHnr007qJPvZA3M-ze6ZIXHsJoYo5hDEd524"
+        },
+        "expected_wrapped_key_algorithm": "X25519-HKDF-SHA256"
+      }
+    ]
+  }
+}

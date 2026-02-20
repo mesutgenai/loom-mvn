@@ -13,6 +13,7 @@ const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const DEFAULT_RATE_LIMIT_DEFAULT_MAX = 2000;
 const DEFAULT_RATE_LIMIT_SENSITIVE_MAX = 120;
+const INBOUND_CONTENT_FILTER_PROFILE_VALUES = new Set(["strict", "balanced", "agent"]);
 
 function normalizeLogFormat(value, fallback = "json") {
   const normalized = String(value || fallback)
@@ -48,6 +49,127 @@ function normalizeIdentityDomain(value) {
   }
 
   return hostPort;
+}
+
+function parseStringList(value) {
+  if (value == null) {
+    return [];
+  }
+  const list = Array.isArray(value) ? value : String(value).split(/[,\n;]+/);
+  return Array.from(
+    new Set(
+      list
+        .map((entry) => String(entry || "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function normalizePemOption(value) {
+  if (value == null) {
+    return null;
+  }
+  const text = String(value);
+  if (!text.trim()) {
+    return null;
+  }
+  return text.replace(/\\n/g, "\n");
+}
+
+function normalizeHeaderAllowlist(value) {
+  const list = parseStringList(value).map((entry) => entry.toLowerCase().replace(/:+$/, ""));
+  return list.length > 0 ? Array.from(new Set(list)) : null;
+}
+
+function normalizeInboundContentFilterProfile(value, fallback = "balanced") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (INBOUND_CONTENT_FILTER_PROFILE_VALUES.has(normalized)) {
+    return normalized;
+  }
+  const fallbackNormalized = String(fallback || "balanced")
+    .trim()
+    .toLowerCase();
+  return INBOUND_CONTENT_FILTER_PROFILE_VALUES.has(fallbackNormalized) ? fallbackNormalized : "balanced";
+}
+
+function parseDnsTxtRdataValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  if (!raw.includes("\"")) {
+    return raw;
+  }
+
+  let combined = "";
+  const pattern = /"((?:\\.|[^"\\])*)"/g;
+  let match = null;
+  while ((match = pattern.exec(raw)) != null) {
+    combined += match[1].replace(/\\(.)/g, "$1");
+  }
+  return combined || raw.replace(/^"+|"+$/g, "");
+}
+
+function createDnssecDohTxtResolver(options = {}) {
+  const endpoint = String(options.endpoint || "https://cloudflare-dns.com/dns-query").trim();
+  const timeoutMs = Math.max(500, Math.floor(parsePositiveNumber(options.timeoutMs, 5000)));
+  const maxResponseBytes = Math.max(1024, Math.floor(parsePositiveNumber(options.maxResponseBytes, 256 * 1024)));
+
+  return async (dnsName) => {
+    const url = new URL(endpoint);
+    url.searchParams.set("name", String(dnsName || "").trim());
+    url.searchParams.set("type", "TXT");
+    url.searchParams.set("do", "true");
+    url.searchParams.set("cd", "false");
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    timer.unref?.();
+
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          accept: "application/dns-json"
+        },
+        signal: controller.signal
+      });
+
+      const rawText = await response.text();
+      if (Buffer.byteLength(rawText, "utf-8") > maxResponseBytes) {
+        throw new Error(`DNS-over-HTTPS response exceeds ${maxResponseBytes} bytes`);
+      }
+      if (!response.ok) {
+        throw new Error(`DNS-over-HTTPS resolver returned HTTP ${response.status}`);
+      }
+
+      let payload = null;
+      try {
+        payload = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        throw new Error("DNS-over-HTTPS resolver returned non-JSON response");
+      }
+
+      const answerRecords = Array.isArray(payload?.Answer) ? payload.Answer : [];
+      const txtRecords = answerRecords
+        .filter((entry) => Number(entry?.type) === 16)
+        .map((entry) => parseDnsTxtRdataValue(entry?.data))
+        .filter(Boolean);
+
+      const dnssecValidated = payload?.AD === true || payload?.ad === true;
+      return {
+        answers: txtRecords,
+        dnssec_validated: dnssecValidated,
+        dnssec_source: `doh:${url.origin}`,
+        resolver_mode: "dnssec_doh",
+        response_status: Number(payload?.Status || 0)
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 }
 
 function getIdempotencyKey(req) {
@@ -548,11 +670,13 @@ function isSensitiveRoute(method, path) {
     path === "/v1/email/outbox/process" ||
     path === "/v1/outbox/dlq/requeue" ||
     path === "/v1/admin/persistence/restore" ||
+    path === "/v1/admin/content-filter/config" ||
     path === "/v1/webhooks" ||
     path === "/v1/webhooks/outbox/process" ||
     path === "/v1/federation/deliver" ||
     path === "/v1/federation/challenge" ||
     path === "/v1/federation/outbox/process" ||
+    path === "/v1/federation/nodes/revalidate" ||
     path === "/v1/federation/nodes/bootstrap" ||
     path.startsWith("/v1/mailbox/threads/") ||
     path === "/v1/envelopes"
@@ -565,6 +689,10 @@ function isSensitiveRoute(method, path) {
   }
 
   if (path.startsWith("/v1/federation/outbox/") && path.endsWith("/process")) {
+    return true;
+  }
+
+  if (path.startsWith("/v1/federation/nodes/") && path.endsWith("/revalidate")) {
     return true;
   }
 
@@ -973,6 +1101,70 @@ function formatMetricsPrometheus(
     lines.push(
       `loom_federation_require_signed_receipts ${federationInboundPolicy.require_signed_receipts ? 1 : 0}`
     );
+    lines.push(
+      `loom_inbound_content_filter_enabled ${federationInboundPolicy.content_filter_enabled ? 1 : 0}`
+    );
+    lines.push(
+      `loom_inbound_content_filter_reject_malware ${federationInboundPolicy.content_filter_reject_malware ? 1 : 0}`
+    );
+    lines.push(
+      `loom_inbound_content_filter_evaluated_total ${Number(federationInboundPolicy.content_filter_evaluated || 0)}`
+    );
+    lines.push(
+      `loom_inbound_content_filter_rejected_total ${Number(federationInboundPolicy.content_filter_rejected || 0)}`
+    );
+    lines.push(
+      `loom_inbound_content_filter_quarantined_total ${Number(federationInboundPolicy.content_filter_quarantined || 0)}`
+    );
+    lines.push(
+      `loom_inbound_content_filter_spam_labeled_total ${Number(federationInboundPolicy.content_filter_spam_labeled || 0)}`
+    );
+    lines.push(
+      `loom_inbound_content_filter_decision_log_enabled ${federationInboundPolicy.content_filter?.decision_log_enabled ? 1 : 0}`
+    );
+    lines.push(
+      `loom_inbound_content_filter_decision_log_sink_configured ${federationInboundPolicy.content_filter?.decision_log_sink_configured ? 1 : 0}`
+    );
+    const profileDecisionCounts =
+      federationInboundPolicy.content_filter_decision_counts_by_profile &&
+      typeof federationInboundPolicy.content_filter_decision_counts_by_profile === "object"
+        ? federationInboundPolicy.content_filter_decision_counts_by_profile
+        : {};
+    lines.push(
+      "# HELP loom_inbound_content_filter_profile_evaluated_total Content filter evaluations grouped by active profile."
+    );
+    lines.push("# TYPE loom_inbound_content_filter_profile_evaluated_total counter");
+    lines.push(
+      "# HELP loom_inbound_content_filter_profile_spam_labeled_total Content filter spam labels grouped by active profile."
+    );
+    lines.push("# TYPE loom_inbound_content_filter_profile_spam_labeled_total counter");
+    lines.push(
+      "# HELP loom_inbound_content_filter_decisions_total Content filter allow/quarantine/reject decisions grouped by active profile."
+    );
+    lines.push("# TYPE loom_inbound_content_filter_decisions_total counter");
+    for (const profile of ["strict", "balanced", "agent"]) {
+      const counts =
+        profileDecisionCounts[profile] && typeof profileDecisionCounts[profile] === "object"
+          ? profileDecisionCounts[profile]
+          : {};
+      lines.push(
+        `loom_inbound_content_filter_profile_evaluated_total{profile="${profile}"} ${Number(
+          counts.evaluated || 0
+        )}`
+      );
+      lines.push(
+        `loom_inbound_content_filter_profile_spam_labeled_total{profile="${profile}"} ${Number(
+          counts.spam_labeled || 0
+        )}`
+      );
+      for (const action of ["allow", "quarantine", "reject"]) {
+        lines.push(
+          `loom_inbound_content_filter_decisions_total{profile="${profile}",action="${action}"} ${Number(
+            counts[action] || 0
+          )}`
+        );
+      }
+    }
   }
 
   if (emailRelayStatus) {
@@ -1012,6 +1204,31 @@ function formatMetricsPrometheus(
     lines.push(`loom_webhook_outbox_worker_runs_total ${Number(worker.runs_total || 0)}`);
     lines.push(`loom_webhook_outbox_worker_last_processed_count ${Number(worker.last_processed_count || 0)}`);
     lines.push(`loom_webhook_outbox_worker_last_error ${worker.last_error ? 1 : 0}`);
+  }
+
+  if (runtimeStatus?.federation_trust_revalidation_worker) {
+    const worker = runtimeStatus.federation_trust_revalidation_worker;
+    lines.push(
+      "# HELP loom_federation_trust_revalidation_worker_enabled Whether federation trust revalidation worker is enabled (1 or 0)."
+    );
+    lines.push("# TYPE loom_federation_trust_revalidation_worker_enabled gauge");
+    lines.push(`loom_federation_trust_revalidation_worker_enabled ${worker.enabled ? 1 : 0}`);
+    lines.push(`loom_federation_trust_revalidation_worker_in_progress ${worker.in_progress ? 1 : 0}`);
+    lines.push(`loom_federation_trust_revalidation_worker_runs_total ${Number(worker.runs_total || 0)}`);
+    lines.push(
+      `loom_federation_trust_revalidation_worker_last_revalidated_count ${Number(worker.last_revalidated_count || 0)}`
+    );
+    lines.push(
+      `loom_federation_trust_revalidation_worker_last_skipped_count ${Number(worker.last_skipped_count || 0)}`
+    );
+    lines.push(`loom_federation_trust_revalidation_worker_last_failed_count ${Number(worker.last_failed_count || 0)}`);
+    lines.push(`loom_federation_trust_revalidation_worker_last_error ${worker.last_error ? 1 : 0}`);
+    lines.push(`loom_federation_trust_revalidation_worker_batch_backoff_ms ${Number(worker.batch_backoff_ms || 0)}`);
+    lines.push(`loom_federation_trust_revalidation_worker_interval_ms ${Number(worker.interval_ms || 0)}`);
+    lines.push(`loom_federation_trust_revalidation_worker_batch_limit ${Number(worker.batch_limit || 0)}`);
+    lines.push(
+      `loom_federation_trust_revalidation_worker_include_non_public_modes ${worker.include_non_public_modes ? 1 : 0}`
+    );
   }
 
   if (runtimeStatus?.persistence) {
@@ -1239,11 +1456,89 @@ export function createLoomServer(options = {}) {
   const remoteIdentityHostAllowlist = parseHostAllowlist(
     options.remoteIdentityHostAllowlist ?? process.env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST
   );
+  const federationTrustAnchorBindings =
+    options.federationTrustAnchorBindings ?? process.env.LOOM_FEDERATION_TRUST_ANCHORS ?? null;
+  const federationTrustMode = options.federationTrustMode ?? process.env.LOOM_FEDERATION_TRUST_MODE ?? null;
+  const federationTrustFailClosed = parseBoolean(
+    options.federationTrustFailClosed ?? process.env.LOOM_FEDERATION_TRUST_FAIL_CLOSED,
+    true
+  );
+  const federationTrustMaxClockSkewMs = parsePositiveNumber(
+    options.federationTrustMaxClockSkewMs ?? process.env.LOOM_FEDERATION_TRUST_MAX_CLOCK_SKEW_MS,
+    5 * 60 * 1000
+  );
+  const federationTrustKeysetMaxAgeMs = parsePositiveNumber(
+    options.federationTrustKeysetMaxAgeMs ?? process.env.LOOM_FEDERATION_TRUST_KEYSET_MAX_AGE_MS,
+    24 * 60 * 60 * 1000
+  );
+  const federationTrustKeysetPublishTtlMs = parsePositiveNumber(
+    options.federationTrustKeysetPublishTtlMs ?? process.env.LOOM_FEDERATION_TRUST_KEYSET_PUBLISH_TTL_MS,
+    24 * 60 * 60 * 1000
+  );
+  const federationTrustDnsTxtLabel =
+    options.federationTrustDnsTxtLabel ?? process.env.LOOM_FEDERATION_TRUST_DNS_TXT_LABEL ?? "_loomfed";
+  const federationTrustDnsResolverMode = String(
+    options.federationTrustDnsResolverMode ?? process.env.LOOM_FEDERATION_TRUST_DNS_RESOLVER_MODE ?? "system"
+  )
+    .trim()
+    .toLowerCase();
+  const federationTrustDnssecDohUrl =
+    options.federationTrustDnssecDohUrl ?? process.env.LOOM_FEDERATION_TRUST_DNSSEC_DOH_URL ?? "https://cloudflare-dns.com/dns-query";
+  const federationTrustDnssecDohTimeoutMs = Math.max(
+    500,
+    Math.floor(
+      parsePositiveNumber(
+        options.federationTrustDnssecDohTimeoutMs ?? process.env.LOOM_FEDERATION_TRUST_DNSSEC_DOH_TIMEOUT_MS,
+        5000
+      )
+    )
+  );
+  const federationTrustDnssecDohMaxResponseBytes = Math.max(
+    1024,
+    Math.floor(
+      parsePositiveNumber(
+        options.federationTrustDnssecDohMaxResponseBytes ??
+          process.env.LOOM_FEDERATION_TRUST_DNSSEC_DOH_MAX_RESPONSE_BYTES,
+        256 * 1024
+      )
+    )
+  );
+  const federationTrustLocalEpoch = Math.max(
+    0,
+    Math.floor(
+      parsePositiveNumber(options.federationTrustLocalEpoch ?? process.env.LOOM_FEDERATION_TRUST_LOCAL_EPOCH, 1)
+    )
+  );
+  const federationTrustKeysetVersion = Math.max(
+    0,
+    Math.floor(
+      parsePositiveNumber(options.federationTrustKeysetVersion ?? process.env.LOOM_FEDERATION_TRUST_KEYSET_VERSION, 1)
+    )
+  );
+  const federationTrustRevokedKeyIds = parseStringList(
+    options.federationTrustRevokedKeyIds ?? process.env.LOOM_FEDERATION_REVOKED_KEY_IDS
+  );
   const nativeTlsConfig = resolveNativeTlsConfig(options);
   const publicService = parseBoolean(
     options.publicService ?? process.env.LOOM_PUBLIC_SERVICE,
     false
   );
+  const federationTrustModeNormalized = String(federationTrustMode || "")
+    .trim()
+    .toLowerCase();
+  const federationTrustRequireDnssec = parseBoolean(
+    options.federationTrustRequireDnssec ?? process.env.LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC,
+    publicService && federationTrustModeNormalized === "public_dns_webpki"
+  );
+  const federationTrustRequireTransparency = parseBoolean(
+    options.federationTrustRequireTransparency ?? process.env.LOOM_FEDERATION_TRUST_REQUIRE_TRANSPARENCY,
+    publicService && federationTrustModeNormalized === "public_dns_webpki"
+  );
+  const federationTrustTransparencyMode = String(
+    options.federationTrustTransparencyMode ?? process.env.LOOM_FEDERATION_TRUST_TRANSPARENCY_MODE ?? "local_append_only"
+  )
+    .trim()
+    .toLowerCase();
   const requirePortableThreadOpCapability = parseBoolean(
     options.requirePortableThreadOpCapability ?? process.env.LOOM_REQUIRE_PORTABLE_THREAD_OP_CAPABILITY,
     publicService
@@ -1257,13 +1552,82 @@ export function createLoomServer(options = {}) {
   const outboxWorkerIdRaw = options.outboxWorkerId ?? process.env.LOOM_OUTBOX_WORKER_ID ?? null;
   const outboxWorkerId =
     typeof outboxWorkerIdRaw === "string" && outboxWorkerIdRaw.trim().length > 0 ? outboxWorkerIdRaw.trim() : null;
+  let federationTrustDnsTxtResolver = null;
+  if (typeof options.federationTrustDnsTxtResolver === "function") {
+    federationTrustDnsTxtResolver = options.federationTrustDnsTxtResolver;
+  } else if (federationTrustDnsResolverMode === "dnssec_doh") {
+    federationTrustDnsTxtResolver = createDnssecDohTxtResolver({
+      endpoint: federationTrustDnssecDohUrl,
+      timeoutMs: federationTrustDnssecDohTimeoutMs,
+      maxResponseBytes: federationTrustDnssecDohMaxResponseBytes
+    });
+  }
+  const requireExternalSigningKeys = parseBoolean(
+    options.requireExternalSigningKeys ?? process.env.LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS,
+    publicService
+  );
+  if (publicService && !requireExternalSigningKeys) {
+    throw new Error(
+      "Public service requires externally provisioned signing keys (set LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS=true)."
+    );
+  }
+  const requireDistinctFederationSigningKey = parseBoolean(
+    options.requireDistinctFederationSigningKey ?? process.env.LOOM_REQUIRE_DISTINCT_FEDERATION_SIGNING_KEY,
+    false
+  );
+  const federationRequireProtocolCapabilities = parseBoolean(
+    options.federationRequireProtocolCapabilities ?? process.env.LOOM_FEDERATION_REQUIRE_PROTOCOL_CAPABILITIES,
+    false
+  );
+  const federationRequireE2eeProfileOverlap = parseBoolean(
+    options.federationRequireE2eeProfileOverlap ?? process.env.LOOM_FEDERATION_REQUIRE_E2EE_PROFILE_OVERLAP,
+    false
+  );
+  const federationRequireTrustModeParity = parseBoolean(
+    options.federationRequireTrustModeParity ?? process.env.LOOM_FEDERATION_REQUIRE_TRUST_MODE_PARITY,
+    false
+  );
+  const e2eeProfileMigrationAllowlist =
+    options.e2eeProfileMigrationAllowlist ?? process.env.LOOM_E2EE_PROFILE_MIGRATION_ALLOWLIST ?? null;
+  const messageRetentionDays = Math.max(
+    0,
+    Math.floor(parsePositiveNumber(options.messageRetentionDays ?? process.env.LOOM_MESSAGE_RETENTION_DAYS, 0))
+  );
+  const blobRetentionDays = Math.max(
+    0,
+    Math.floor(parsePositiveNumber(options.blobRetentionDays ?? process.env.LOOM_BLOB_RETENTION_DAYS, 0))
+  );
+  const requireStateEncryptionAtRest = parseBoolean(
+    options.requireStateEncryptionAtRest ?? process.env.LOOM_REQUIRE_STATE_ENCRYPTION_AT_REST,
+    false
+  );
+  const stateEncryptionKey = options.stateEncryptionKey ?? process.env.LOOM_STATE_ENCRYPTION_KEY ?? null;
+  const systemSigningKeyId = options.systemSigningKeyId ?? process.env.LOOM_SYSTEM_SIGNING_KEY_ID ?? null;
+  const systemSigningPrivateKeyPem = normalizePemOption(
+    options.systemSigningPrivateKeyPem ?? process.env.LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM ?? null
+  );
+  const systemSigningPublicKeyPem = normalizePemOption(
+    options.systemSigningPublicKeyPem ?? process.env.LOOM_SYSTEM_SIGNING_PUBLIC_KEY_PEM ?? null
+  );
+  const federationSigningPrivateKeyPem = normalizePemOption(
+    options.federationSigningPrivateKeyPem ?? process.env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM ?? null
+  );
   const store =
     options.store ||
     new LoomStore({
       nodeId: options.nodeId,
       dataDir: options.dataDir,
+      systemSigningKeyId,
+      systemSigningPrivateKeyPem,
+      systemSigningPublicKeyPem,
+      requireExternalSigningKeys,
+      requireDistinctFederationSigningKey,
       federationSigningKeyId: options.federationSigningKeyId,
-      federationSigningPrivateKeyPem: options.federationSigningPrivateKeyPem,
+      federationSigningPrivateKeyPem,
+      federationRequireProtocolCapabilities,
+      federationRequireE2eeProfileOverlap,
+      federationRequireTrustModeParity,
+      e2eeProfileMigrationAllowlist,
       persistenceAdapter: options.persistenceAdapter,
       idempotencyTtlMs,
       idempotencyMaxEntries,
@@ -1310,6 +1674,20 @@ export function createLoomServer(options = {}) {
       federationBootstrapHostAllowlist,
       webhookOutboundHostAllowlist,
       remoteIdentityHostAllowlist,
+      federationTrustAnchorBindings,
+      federationTrustMode,
+      federationTrustFailClosed,
+      federationTrustMaxClockSkewMs,
+      federationTrustKeysetMaxAgeMs,
+      federationTrustKeysetPublishTtlMs,
+      federationTrustDnsTxtLabel,
+      federationTrustDnsTxtResolver,
+      federationTrustRequireDnssec,
+      federationTrustRequireTransparency,
+      federationTrustTransparencyMode,
+      federationTrustLocalEpoch,
+      federationTrustKeysetVersion,
+      federationTrustRevokedKeyIds,
       localIdentityDomain,
       outboxClaimLeaseMs,
       outboxWorkerId,
@@ -1317,6 +1695,10 @@ export function createLoomServer(options = {}) {
       maxRemoteIdentities,
       maxDelegationsPerIdentity,
       maxDelegationsTotal,
+      messageRetentionDays,
+      blobRetentionDays,
+      requireStateEncryptionAtRest,
+      stateEncryptionKey,
       outboxBackpressureMax: Math.max(
         0,
         Math.floor(
@@ -1371,6 +1753,25 @@ export function createLoomServer(options = {}) {
   store.federationBootstrapHostAllowlist = federationBootstrapHostAllowlist;
   store.webhookOutboundHostAllowlist = webhookOutboundHostAllowlist;
   store.remoteIdentityHostAllowlist = remoteIdentityHostAllowlist;
+  if (federationTrustMode != null && typeof store.resolveFederationBootstrapTrustMode === "function") {
+    store.federationTrustMode = store.resolveFederationBootstrapTrustMode({
+      trust_anchor_mode: federationTrustMode
+    });
+  }
+  store.federationTrustFailClosed = federationTrustFailClosed;
+  store.federationTrustMaxClockSkewMs = Math.max(1000, Math.floor(federationTrustMaxClockSkewMs));
+  store.federationTrustKeysetMaxAgeMs = Math.max(60 * 1000, Math.floor(federationTrustKeysetMaxAgeMs));
+  store.federationTrustKeysetPublishTtlMs = Math.max(60 * 1000, Math.floor(federationTrustKeysetPublishTtlMs));
+  store.federationTrustDnsTxtLabel = String(federationTrustDnsTxtLabel || "_loomfed").trim() || "_loomfed";
+  store.federationTrustRequireDnssec = federationTrustRequireDnssec;
+  store.federationTrustRequireTransparency = federationTrustRequireTransparency;
+  store.federationTrustTransparencyMode = federationTrustTransparencyMode || "local_append_only";
+  store.federationTrustLocalEpoch = Math.max(0, Math.floor(federationTrustLocalEpoch));
+  store.federationTrustKeysetVersion = Math.max(0, Math.floor(federationTrustKeysetVersion));
+  store.federationTrustRevokedKeyIds = federationTrustRevokedKeyIds;
+  if (typeof federationTrustDnsTxtResolver === "function") {
+    store.federationTrustDnsTxtResolver = federationTrustDnsTxtResolver;
+  }
   const rateLimiter = createRateLimiter({
     windowMs: options.rateLimitWindowMs ?? process.env.LOOM_RATE_LIMIT_WINDOW_MS,
     defaultMax: options.rateLimitDefaultMax ?? process.env.LOOM_RATE_LIMIT_DEFAULT_MAX,
@@ -1419,6 +1820,92 @@ export function createLoomServer(options = {}) {
       process.env.LOOM_BRIDGE_EMAIL_INBOUND_QUARANTINE_ON_AUTH_FAILURE,
     true
   );
+  const bridgeInboundAllowPayloadAuthResults = parseBoolean(
+    options.bridgeInboundAllowPayloadAuthResults ??
+      process.env.LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_PAYLOAD_AUTH_RESULTS,
+    true
+  );
+  const inboundContentFilterEnabled = parseBoolean(
+    options.inboundContentFilterEnabled ?? process.env.LOOM_INBOUND_CONTENT_FILTER_ENABLED,
+    store.inboundContentFilterEnabled
+  );
+  const inboundContentFilterRejectMalware = parseBoolean(
+    options.inboundContentFilterRejectMalware ?? process.env.LOOM_INBOUND_CONTENT_FILTER_REJECT_MALWARE,
+    store.inboundContentFilterRejectMalware
+  );
+  const inboundContentFilterSpamThreshold = Math.max(
+    1,
+    Math.floor(
+      parsePositiveNumber(
+        options.inboundContentFilterSpamThreshold ?? process.env.LOOM_INBOUND_CONTENT_FILTER_SPAM_THRESHOLD,
+        store.inboundContentFilterSpamThreshold
+      )
+    )
+  );
+  const inboundContentFilterPhishThreshold = Math.max(
+    1,
+    Math.floor(
+      parsePositiveNumber(
+        options.inboundContentFilterPhishThreshold ?? process.env.LOOM_INBOUND_CONTENT_FILTER_PHISH_THRESHOLD,
+        store.inboundContentFilterPhishThreshold
+      )
+    )
+  );
+  const inboundContentFilterQuarantineThreshold = Math.max(
+    1,
+    Math.floor(
+      parsePositiveNumber(
+        options.inboundContentFilterQuarantineThreshold ??
+          process.env.LOOM_INBOUND_CONTENT_FILTER_QUARANTINE_THRESHOLD,
+        store.inboundContentFilterQuarantineThreshold
+      )
+    )
+  );
+  const inboundContentFilterRejectThreshold = Math.max(
+    inboundContentFilterQuarantineThreshold + 1,
+    Math.floor(
+      parsePositiveNumber(
+        options.inboundContentFilterRejectThreshold ?? process.env.LOOM_INBOUND_CONTENT_FILTER_REJECT_THRESHOLD,
+        store.inboundContentFilterRejectThreshold
+      )
+    )
+  );
+  const inboundContentFilterProfileDefault = normalizeInboundContentFilterProfile(
+    options.inboundContentFilterProfileDefault ?? process.env.LOOM_INBOUND_CONTENT_FILTER_PROFILE_DEFAULT,
+    store.inboundContentFilterProfileDefault
+  );
+  const inboundContentFilterProfileBridge = normalizeInboundContentFilterProfile(
+    options.inboundContentFilterProfileBridge ?? process.env.LOOM_INBOUND_CONTENT_FILTER_PROFILE_BRIDGE,
+    store.inboundContentFilterProfileBridge || inboundContentFilterProfileDefault
+  );
+  const inboundContentFilterProfileFederation = normalizeInboundContentFilterProfile(
+    options.inboundContentFilterProfileFederation ?? process.env.LOOM_INBOUND_CONTENT_FILTER_PROFILE_FEDERATION,
+    store.inboundContentFilterProfileFederation
+  );
+  const inboundContentFilterDecisionLogEnabled = parseBoolean(
+    options.inboundContentFilterDecisionLogEnabled ??
+      process.env.LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_ENABLED,
+    store.inboundContentFilterDecisionLogEnabled
+  );
+  const inboundContentFilterDecisionLogFile =
+    typeof (options.inboundContentFilterDecisionLogFile ??
+      process.env.LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_FILE) === "string"
+      ? String(
+          options.inboundContentFilterDecisionLogFile ??
+            process.env.LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_FILE
+        ).trim() || null
+      : null;
+  const inboundContentFilterDecisionLogSalt =
+    typeof (options.inboundContentFilterDecisionLogSalt ??
+      process.env.LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_SALT) === "string"
+      ? String(
+          options.inboundContentFilterDecisionLogSalt ??
+            process.env.LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_SALT
+        ).trim() || null
+      : null;
+  const bridgeInboundHeaderAllowlist = normalizeHeaderAllowlist(
+    options.bridgeInboundHeaderAllowlist ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_HEADER_ALLOWLIST
+  );
   if (publicService && bridgeInboundEnabled && !bridgeInboundPublicConfirmed) {
     throw new Error(
       "Refusing public service with LOOM_BRIDGE_EMAIL_INBOUND_ENABLED=true without LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true"
@@ -1458,6 +1945,49 @@ export function createLoomServer(options = {}) {
   store.bridgeInboundRequireDmarcPass = bridgeInboundRequireDmarcPass;
   store.bridgeInboundRejectOnAuthFailure = bridgeInboundRejectOnAuthFailure;
   store.bridgeInboundQuarantineOnAuthFailure = bridgeInboundQuarantineOnAuthFailure;
+  store.bridgeInboundAllowPayloadAuthResults = bridgeInboundAllowPayloadAuthResults;
+  store.inboundContentFilterEnabled = inboundContentFilterEnabled;
+  store.inboundContentFilterRejectMalware = inboundContentFilterRejectMalware;
+  store.inboundContentFilterSpamThreshold = inboundContentFilterSpamThreshold;
+  store.inboundContentFilterPhishThreshold = inboundContentFilterPhishThreshold;
+  store.inboundContentFilterQuarantineThreshold = inboundContentFilterQuarantineThreshold;
+  store.inboundContentFilterRejectThreshold = inboundContentFilterRejectThreshold;
+  store.inboundContentFilterProfileDefault = inboundContentFilterProfileDefault;
+  store.inboundContentFilterProfileBridge = inboundContentFilterProfileBridge;
+  store.inboundContentFilterProfileFederation = inboundContentFilterProfileFederation;
+  store.inboundContentFilterDecisionLogEnabled = inboundContentFilterDecisionLogEnabled;
+  if (inboundContentFilterDecisionLogFile) {
+    store.inboundContentFilterDecisionLogFile = inboundContentFilterDecisionLogFile;
+  }
+  if (inboundContentFilterDecisionLogSalt) {
+    store.inboundContentFilterDecisionLogSalt = inboundContentFilterDecisionLogSalt;
+  }
+  if (bridgeInboundHeaderAllowlist && bridgeInboundHeaderAllowlist.length > 0) {
+    store.bridgeInboundHeaderAllowlist = bridgeInboundHeaderAllowlist;
+  }
+  store.requireExternalSigningKeys = requireExternalSigningKeys;
+  store.requireDistinctFederationSigningKey = requireDistinctFederationSigningKey;
+  if (publicService && requireExternalSigningKeys) {
+    const hasSystemSigningPrivateKey = String(store.systemSigningPrivateKeyPem || "").trim().length > 0;
+    const hasFederationSigningPrivateKey = String(store.federationSigningPrivateKeyPem || "").trim().length > 0;
+    if (!hasSystemSigningPrivateKey || !hasFederationSigningPrivateKey) {
+      throw new Error(
+        "Public service requires externally provisioned system and federation signing private keys."
+      );
+    }
+  }
+  store.federationRequireProtocolCapabilities = federationRequireProtocolCapabilities;
+  store.federationRequireE2eeProfileOverlap = federationRequireE2eeProfileOverlap;
+  store.federationRequireTrustModeParity = federationRequireTrustModeParity;
+  if (e2eeProfileMigrationAllowlist != null && options.store) {
+    const entries = String(e2eeProfileMigrationAllowlist)
+      .split(/[,\n;]+/)
+      .map((entry) => String(entry || "").trim().toLowerCase())
+      .filter(Boolean);
+    store.e2eeProfileMigrationAllowlist = new Set(entries);
+  }
+  store.messageRetentionDays = messageRetentionDays;
+  store.blobRetentionDays = blobRetentionDays;
   const runtimeStatusProvider = typeof options.runtimeStatusProvider === "function" ? options.runtimeStatusProvider : null;
   const emailRelay = options.emailRelay || null;
 
@@ -1642,6 +2172,20 @@ export function createLoomServer(options = {}) {
         return;
       }
 
+      if (methodIs(req, "GET") && path === "/v1/admin/content-filter/config") {
+        requireAdminToken(req, adminToken);
+        sendJson(res, 200, store.getInboundContentFilterConfigStatus());
+        return;
+      }
+
+      if (methodIs(req, "POST") && path === "/v1/admin/content-filter/config") {
+        requireAdminToken(req, adminToken);
+        const body = await readJson(req, maxBodyBytes);
+        const result = store.updateInboundContentFilterConfig(body, "admin");
+        sendJson(res, 200, result);
+        return;
+      }
+
       if (methodIs(req, "GET") && path === "/v1/admin/persistence/schema") {
         requireAdminToken(req, adminToken);
         const schema = await store.getPersistenceSchemaStatus();
@@ -1778,6 +2322,32 @@ export function createLoomServer(options = {}) {
 
       if (methodIs(req, "GET") && path === "/.well-known/loom.json") {
         sendJson(res, 200, store.getNodeDocument(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/.well-known/loom-capabilities.json") {
+        sendJson(res, 200, store.getProtocolCapabilities(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/.well-known/loom-keyset.json") {
+        sendJson(res, 200, store.getFederationKeysetDocument(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/.well-known/loom-revocations.json") {
+        sendJson(res, 200, store.getFederationRevocationsDocument(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/.well-known/loom-trust.json") {
+        sendJson(res, 200, store.getFederationTrustDnsDescriptor(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/.well-known/loom-trust.txt") {
+        const descriptor = store.getFederationTrustDnsDescriptor(domain);
+        sendText(res, 200, `${descriptor.txt_record}\n`, "text/plain; charset=utf-8");
         return;
       }
 
@@ -2045,6 +2615,43 @@ export function createLoomServer(options = {}) {
         return;
       }
 
+      if (methodIs(req, "GET") && path === "/v1/protocol/capabilities") {
+        sendJson(res, 200, store.getProtocolCapabilities(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/federation/trust") {
+        requireAdminToken(req, adminToken);
+        sendJson(res, 200, store.getFederationTrustStatus(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/federation/trust/verify-dns") {
+        requireAdminToken(req, adminToken);
+        const url = requestUrl(req);
+        const verification = await store.verifyLocalFederationTrustDnsPublication(
+          url.searchParams.get("domain") || domain
+        );
+        const requireMatch = parseBoolean(url.searchParams.get("require_match"), false);
+        if (
+          requireMatch &&
+          (!verification.match_semantic || (verification.dnssec_required === true && verification.dnssec_validated !== true))
+        ) {
+          sendJson(res, 409, verification);
+          return;
+        }
+        sendJson(res, 200, verification);
+        return;
+      }
+
+      if (methodIs(req, "POST") && path === "/v1/federation/trust") {
+        requireAdminToken(req, adminToken);
+        const body = await readJson(req, maxBodyBytes);
+        const result = store.updateFederationTrustConfig(body, "admin");
+        sendJson(res, 200, result);
+        return;
+      }
+
       if (methodIs(req, "POST") && path === "/v1/federation/nodes") {
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
@@ -2073,6 +2680,80 @@ export function createLoomServer(options = {}) {
       if (methodIs(req, "GET") && path === "/v1/federation/nodes") {
         requireActorIdentity(req, store);
         sendJson(res, 200, { nodes: store.listFederationNodes() });
+        return;
+      }
+
+      if (methodIs(req, "POST") && path === "/v1/federation/nodes/revalidate") {
+        const actorIdentity = requireActorIdentity(req, store);
+        const body = await readJson(req, maxBodyBytes);
+        const adminRequest = hasValidAdminToken(req, adminToken);
+        const requestedNodeIds = Array.isArray(body?.node_ids)
+          ? Array.from(
+              new Set(
+                body.node_ids
+                  .map((entry) => String(entry || "").trim())
+                  .filter(Boolean)
+              )
+            )
+          : [];
+        const targetNodeIds =
+          requestedNodeIds.length > 0
+            ? requestedNodeIds
+            : store.listFederationNodes().map((node) => node.node_id);
+        const selectedNodes = targetNodeIds
+          .map((nodeId) => store.knownNodesById.get(nodeId))
+          .filter(Boolean);
+        const requestedInsecureTransport = selectedNodes.some(
+          (node) => node.allow_insecure_http === true || node.allow_private_network === true
+        );
+        if (requestedInsecureTransport && adminToken && !adminRequest) {
+          throw new LoomError(
+            "CAPABILITY_DENIED",
+            "Admin token required to revalidate insecure federation node transport settings",
+            403,
+            {
+              field: "x-loom-admin-token"
+            }
+          );
+        }
+        const result = await store.revalidateFederationNodesTrust(body, actorIdentity);
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (
+        methodIs(req, "POST") &&
+        path.startsWith("/v1/federation/nodes/") &&
+        path.endsWith("/revalidate") &&
+        path !== "/v1/federation/nodes/revalidate"
+      ) {
+        const actorIdentity = requireActorIdentity(req, store);
+        const nodeId = path.slice("/v1/federation/nodes/".length, -"/revalidate".length);
+        if (!nodeId || nodeId === "bootstrap") {
+          throw new LoomError("ENVELOPE_INVALID", "node_id is required for federation revalidation", 400, {
+            field: "node_id"
+          });
+        }
+
+        const body = await readJson(req, maxBodyBytes);
+        const node = store.knownNodesById.get(nodeId);
+        const requestedInsecureTransport = node
+          ? node.allow_insecure_http === true || node.allow_private_network === true
+          : false;
+        const adminRequest = hasValidAdminToken(req, adminToken);
+        if (requestedInsecureTransport && adminToken && !adminRequest) {
+          throw new LoomError(
+            "CAPABILITY_DENIED",
+            "Admin token required to revalidate insecure federation node transport settings",
+            403,
+            {
+              field: "x-loom-admin-token"
+            }
+          );
+        }
+
+        const result = await store.revalidateFederationNodeTrust(nodeId, actorIdentity, body);
+        sendJson(res, 200, result);
         return;
       }
 
@@ -2363,7 +3044,9 @@ export function createLoomServer(options = {}) {
           requireAuthResults: bridgeInboundRequireAuthResults,
           requireDmarcPass: bridgeInboundRequireDmarcPass,
           rejectOnAuthFailure: bridgeInboundRejectOnAuthFailure,
-          quarantineOnAuthFailure: bridgeInboundQuarantineOnAuthFailure
+          quarantineOnAuthFailure: bridgeInboundQuarantineOnAuthFailure,
+          allowPayloadAuthResults: bridgeInboundAllowPayloadAuthResults,
+          headerAllowlist: bridgeInboundHeaderAllowlist
         });
         storeIdempotentResult(store, idempotency, 201, accepted);
         sendJson(res, 201, accepted);

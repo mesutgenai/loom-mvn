@@ -327,6 +327,66 @@ test("federation delivery throws original error when all envelopes fail", async 
   );
 });
 
+test("federation delivery rejects content-filtered phishing envelopes", async () => {
+  const remoteSenderKeys = generateSigningKeyPair();
+  const nodeKeys = generateSigningKeyPair();
+  const store = makeStore({ federationResolveRemoteIdentities: false });
+
+  const nodeId = "remote-phish.test";
+  const keyId = "k_node_sign_remote_phish_1";
+  store.registerFederationNode({
+    node_id: nodeId,
+    key_id: keyId,
+    public_key_pem: nodeKeys.publicKeyPem,
+    policy: "trusted"
+  });
+
+  store.registerIdentity({
+    id: "loom://alice@remote-phish.test",
+    display_name: "Remote Alice",
+    signing_keys: [{ key_id: "k_sign_remote_phish_alice_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
+  });
+
+  const phishEnvelope = makeSignedEnvelope(remoteSenderKeys, {
+    fromIdentity: "loom://alice@remote-phish.test",
+    keyId: "k_sign_remote_phish_alice_1",
+    text: "Security alert: verify your account, reset your password, and review unusual activity immediately."
+  });
+  const timestamp = new Date().toISOString();
+  const nonce = `nonce_phish_${Date.now()}`;
+  const wrapper = {
+    sender_node: nodeId,
+    timestamp,
+    nonce,
+    envelopes: [phishEnvelope]
+  };
+  const message = [
+    "loom.federation.deliver.v1",
+    nodeId,
+    timestamp,
+    nonce,
+    canonicalizeJson({ envelopes: wrapper.envelopes })
+  ].join("\n");
+
+  const { signUtf8Message } = await import("../src/protocol/crypto.js");
+  const signature = signUtf8Message(nodeKeys.privateKeyPem, message);
+
+  await assert.rejects(
+    () =>
+      store.ingestFederationDelivery(wrapper, {
+        node_id: nodeId,
+        key_id: keyId,
+        signature,
+        policy: "trusted"
+      }),
+    (err) => {
+      assert.equal(err?.code, "CAPABILITY_DENIED");
+      assert.equal(err?.details?.content_filter?.action, "reject");
+      return true;
+    }
+  );
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // Fix #6+7: Idempotency sentinel — reserveIdempotencySlot
 // ────────────────────────────────────────────────────────────────────────────

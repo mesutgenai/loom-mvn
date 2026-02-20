@@ -112,6 +112,27 @@ function buildNodeSignedIdentityDocument({
   };
 }
 
+function hashSignedDocumentPayload(document) {
+  const payload = {
+    ...(document && typeof document === "object" ? document : {})
+  };
+  delete payload.signature;
+  return createHash("sha256")
+    .update(canonicalizeJson(payload), "utf-8")
+    .digest("hex");
+}
+
+function buildPublicServiceSigningKeyOptions() {
+  const systemKeys = generateSigningKeyPair();
+  const federationKeys = generateSigningKeyPair();
+  return {
+    requireExternalSigningKeys: true,
+    systemSigningPrivateKeyPem: systemKeys.privateKeyPem,
+    systemSigningPublicKeyPem: systemKeys.publicKeyPem,
+    federationSigningPrivateKeyPem: federationKeys.privateKeyPem
+  };
+}
+
 test("API serves LOOM live dashboard at root path", async (t) => {
   const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -209,8 +230,85 @@ test("API node document advertises identity resolve URL", async (t) => {
   assert.equal(nodeDocument.response.status, 200);
   assert.equal(nodeDocument.body.identity_resolve_url, "https://127.0.0.1/v1/identity/{identity}");
   assert.equal(
+    nodeDocument.body.protocol_capabilities_url,
+    "https://127.0.0.1/v1/protocol/capabilities"
+  );
+  assert.equal(
     nodeDocument.body?.federation?.identity_resolve_url,
     "https://127.0.0.1/v1/identity/{identity}"
+  );
+  assert.equal(
+    nodeDocument.body?.federation?.protocol_capabilities_url,
+    "https://127.0.0.1/v1/protocol/capabilities"
+  );
+
+  const protocolCapabilities = await jsonRequest(`${baseUrl}/v1/protocol/capabilities`);
+  assert.equal(protocolCapabilities.response.status, 200);
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.trust_anchor_mode,
+    "strict_identity_authority"
+  );
+  assert.equal(protocolCapabilities.body?.federation_negotiation?.trust_anchor_fail_closed, true);
+  assert.equal(
+    Array.isArray(protocolCapabilities.body?.federation_negotiation?.trust_anchor_modes_supported),
+    true
+  );
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.trust_anchor_modes_supported?.includes("public_dns_webpki"),
+    true
+  );
+  assert.equal(
+    Array.isArray(protocolCapabilities.body?.federation_negotiation?.e2ee_profiles),
+    true
+  );
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.e2ee_profiles?.[0]?.id,
+    "loom-e2ee-x25519-xchacha20-v1"
+  );
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.e2ee_profiles?.some(
+      (profile) => profile?.id === "loom-e2ee-x25519-xchacha20-v2"
+    ),
+    true
+  );
+
+  const keyset = await jsonRequest(`${baseUrl}/.well-known/loom-keyset.json`);
+  assert.equal(keyset.response.status, 200);
+  assert.equal(keyset.body?.type, "loom.federation.keyset@v1");
+  assert.equal(keyset.body?.node_id, "node.test");
+  assert.equal(
+    keyset.body?.keyset_url,
+    "https://127.0.0.1/.well-known/loom-keyset.json"
+  );
+  const keysetSignatureKey = keyset.body?.signing_keys?.find((key) => key.key_id === keyset.body?.signature?.key_id) || null;
+  const keysetPayload = { ...(keyset.body || {}) };
+  delete keysetPayload.signature;
+  assert.equal(Boolean(keysetSignatureKey), true);
+  assert.equal(typeof keyset.body?.signature?.value, "string");
+  assert.equal(
+    verifyUtf8MessageSignature(
+      keysetSignatureKey?.public_key_pem || "",
+      canonicalizeJson(keysetPayload),
+      keyset.body?.signature?.value || ""
+    ),
+    true
+  );
+
+  const revocations = await jsonRequest(`${baseUrl}/.well-known/loom-revocations.json`);
+  assert.equal(revocations.response.status, 200);
+  assert.equal(revocations.body?.type, "loom.federation.revocations@v1");
+  assert.equal(Array.isArray(revocations.body?.revoked_key_ids), true);
+  const revocationSignatureKey =
+    keyset.body?.signing_keys?.find((key) => key.key_id === revocations.body?.signature?.key_id) || null;
+  const revocationPayload = { ...(revocations.body || {}) };
+  delete revocationPayload.signature;
+  assert.equal(
+    verifyUtf8MessageSignature(
+      revocationSignatureKey?.public_key_pem || "",
+      canonicalizeJson(revocationPayload),
+      revocations.body?.signature?.value || ""
+    ),
+    true
   );
 
   const registerAlice = await jsonRequest(`${baseUrl}/v1/identity`, {
@@ -229,6 +327,237 @@ test("API node document advertises identity resolve URL", async (t) => {
   assert.equal(identity.body.node_signature?.algorithm, "Ed25519");
   assert.equal(identity.body.node_signature?.key_id, "k_node_sign_local_1");
   assert.equal(typeof identity.body.node_signature?.value, "string");
+});
+
+test("API protocol capability endpoint reports curated trust-anchor mode when bindings are configured", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationTrustAnchorBindings: "agents.example=fed-hub.partner.example|fed-hub-dr.partner.example"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const protocolCapabilities = await jsonRequest(`${baseUrl}/v1/protocol/capabilities`);
+  assert.equal(protocolCapabilities.response.status, 200);
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.trust_anchor_mode,
+    "curated_trust_anchors"
+  );
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.trust_anchor_bindings_count,
+    1
+  );
+});
+
+test("API protocol capability endpoint reports public DNS trust mode when configured", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustDnsTxtLabel: "_loomfed",
+    federationTrustLocalEpoch: 7
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const protocolCapabilities = await jsonRequest(`${baseUrl}/v1/protocol/capabilities`);
+  assert.equal(protocolCapabilities.response.status, 200);
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.trust_anchor_mode,
+    "public_dns_webpki"
+  );
+  assert.equal(protocolCapabilities.body?.federation_negotiation?.trust_anchor_epoch, 7);
+  assert.equal(
+    protocolCapabilities.body?.federation_negotiation?.trust_anchor_modes_supported?.includes("public_dns_webpki"),
+    true
+  );
+
+  const nodeDocument = await jsonRequest(`${baseUrl}/.well-known/loom.json`);
+  assert.equal(nodeDocument.response.status, 200);
+  assert.equal(
+    nodeDocument.body?.federation?.keyset_url,
+    "https://127.0.0.1/.well-known/loom-keyset.json"
+  );
+  assert.equal(
+    nodeDocument.body?.federation?.revocations_url,
+    "https://127.0.0.1/.well-known/loom-revocations.json"
+  );
+});
+
+test("API exposes federation trust DNS publication descriptors", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustDnsTxtLabel: "_loomfed",
+    federationTrustLocalEpoch: 3,
+    federationTrustKeysetVersion: 9
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const descriptor = await jsonRequest(`${baseUrl}/.well-known/loom-trust.json`);
+  assert.equal(descriptor.response.status, 200);
+  assert.equal(descriptor.body?.version, "loomfed1");
+  assert.equal(descriptor.body?.trust_epoch, 3);
+  assert.equal(descriptor.body?.keyset_version, 9);
+  assert.equal(
+    String(descriptor.body?.txt_record || "").includes("v=loomfed1;"),
+    true
+  );
+  assert.equal(
+    String(descriptor.body?.txt_record || "").includes("keyset=https://127.0.0.1/.well-known/loom-keyset.json"),
+    true
+  );
+
+  const text = await textRequest(`${baseUrl}/.well-known/loom-trust.txt`);
+  assert.equal(text.response.status, 200);
+  assert.equal(text.body, `${descriptor.body?.txt_record}\n`);
+});
+
+test("API rotates federation trust config via admin endpoint", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustLocalEpoch: 1,
+    federationTrustKeysetVersion: 1
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const before = await jsonRequest(`${baseUrl}/v1/federation/trust`, {
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    }
+  });
+  assert.equal(before.response.status, 200);
+  assert.equal(before.body?.trust_epoch, 1);
+  assert.equal(before.body?.keyset_version, 1);
+
+  const rotate = await jsonRequest(`${baseUrl}/v1/federation/trust`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    },
+    body: JSON.stringify({
+      bump_trust_epoch: true,
+      bump_keyset_version: true,
+      append_revoked_key_ids: ["k_node_sign_retired_2026_01"]
+    })
+  });
+  assert.equal(rotate.response.status, 200, JSON.stringify(rotate.body));
+  assert.equal(rotate.body?.trust_epoch, 2);
+  assert.equal(rotate.body?.keyset_version, 2);
+  assert.equal(rotate.body?.revoked_key_ids?.includes("k_node_sign_retired_2026_01"), true);
+
+  const keyset = await jsonRequest(`${baseUrl}/.well-known/loom-keyset.json`);
+  assert.equal(keyset.response.status, 200);
+  assert.equal(keyset.body?.trust_epoch, 2);
+  assert.equal(keyset.body?.version, 2);
+
+  const revocations = await jsonRequest(`${baseUrl}/.well-known/loom-revocations.json`);
+  assert.equal(revocations.response.status, 200);
+  assert.equal(revocations.body?.trust_epoch, 2);
+  assert.equal(revocations.body?.version, 2);
+  assert.equal(revocations.body?.revoked_key_ids?.includes("k_node_sign_retired_2026_01"), true);
+});
+
+test("API verifies federation trust DNS publication and supports require_match gating", async (t) => {
+  let dnsTxtRecord = "";
+  const federationTrustDnsTxtResolver = async () => {
+    return dnsTxtRecord ? [[dnsTxtRecord]] : [];
+  };
+
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustDnsTxtResolver
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const trustText = await textRequest(`${baseUrl}/.well-known/loom-trust.txt`);
+  assert.equal(trustText.response.status, 200);
+  const expectedRecord = trustText.body.trim();
+  const parts = expectedRecord.split(";").filter(Boolean);
+  assert.equal(parts.length >= 6, true);
+
+  // Reordered fields should still be accepted as semantic match.
+  dnsTxtRecord = [parts[0], parts[5], parts[4], parts[3], parts[2], parts[1]].join(";");
+  const semanticMatch = await jsonRequest(`${baseUrl}/v1/federation/trust/verify-dns`, {
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    }
+  });
+  assert.equal(semanticMatch.response.status, 200);
+  assert.equal(semanticMatch.body?.match_semantic, true);
+
+  // Force mismatch and require strict match response.
+  const digestPart = parts.find((part) => part.startsWith("digest=")) || "";
+  assert.notEqual(digestPart.length, 0);
+  dnsTxtRecord = expectedRecord.replace(digestPart, "digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  const mismatch = await jsonRequest(`${baseUrl}/v1/federation/trust/verify-dns?require_match=true`, {
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    }
+  });
+  assert.equal(mismatch.response.status, 409);
+  assert.equal(mismatch.body?.match_semantic, false);
+  assert.equal(mismatch.body?.status, "mismatch");
+});
+
+test("API federation trust DNS verification fails require_match when DNSSEC is required but unvalidated", async (t) => {
+  let dnsTxtRecord = "";
+  const federationTrustDnsTxtResolver = async () => {
+    return dnsTxtRecord ? [[dnsTxtRecord]] : [];
+  };
+
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustRequireDnssec: true,
+    federationTrustDnsTxtResolver
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const trustText = await textRequest(`${baseUrl}/.well-known/loom-trust.txt`);
+  assert.equal(trustText.response.status, 200);
+  dnsTxtRecord = trustText.body.trim();
+
+  const verification = await jsonRequest(`${baseUrl}/v1/federation/trust/verify-dns?require_match=true`, {
+    headers: {
+      "x-loom-admin-token": "admin-secret"
+    }
+  });
+  assert.equal(verification.response.status, 409);
+  assert.equal(verification.body?.match_semantic, true);
+  assert.equal(verification.body?.dnssec_required, true);
+  assert.equal(verification.body?.dnssec_validated, false);
+  assert.equal(verification.body?.status, "dnssec_unverified");
 });
 
 test("API rejects request bodies larger than configured max", async (t) => {
@@ -1180,6 +1509,7 @@ test("API rejects invalid trusted proxy allowlist configuration", () => {
 
 test("API enforces HTTPS via trusted proxy headers when configured", async (t) => {
   const { server } = createLoomServer({
+    ...buildPublicServiceSigningKeyOptions(),
     nodeId: "node.test",
     domain: "127.0.0.1",
     publicService: true,
@@ -1219,6 +1549,7 @@ test("API requires trusted proxy configuration for strict proxy HTTPS mode", () 
   assert.throws(
     () =>
       createLoomServer({
+        ...buildPublicServiceSigningKeyOptions(),
         nodeId: "node.test",
         domain: "127.0.0.1",
         publicService: true,
@@ -1226,6 +1557,23 @@ test("API requires trusted proxy configuration for strict proxy HTTPS mode", () 
         trustProxy: false
       }),
     /LOOM_REQUIRE_HTTPS_FROM_PROXY requires trusted proxy headers/
+  );
+});
+
+test("API enforces external signing key provisioning on public service", () => {
+  assert.throws(
+    () =>
+      createLoomServer({
+        nodeId: "node.test",
+        domain: "127.0.0.1",
+        publicService: true,
+        requireExternalSigningKeys: false,
+        requireHttpsFromProxy: true,
+        trustProxy: true,
+        trustProxyAllowlist: "127.0.0.1/32",
+        bridgeInboundEnabled: false
+      }),
+    /Public service requires externally provisioned signing keys/
   );
 });
 
@@ -1260,6 +1608,7 @@ test("API refuses public inbound bridge exposure without explicit confirmation",
   assert.throws(
     () =>
       createLoomServer({
+        ...buildPublicServiceSigningKeyOptions(),
         nodeId: "node.test",
         domain: "127.0.0.1",
         publicService: true,
@@ -1285,6 +1634,7 @@ test("API rejects inbound bridge admin requirement without configured admin toke
 test("API applies strict inbound bridge auth defaults on public service", () => {
   assert.doesNotThrow(() =>
     createLoomServer({
+      ...buildPublicServiceSigningKeyOptions(),
       nodeId: "node.test",
       domain: "127.0.0.1",
       publicService: true,
@@ -1300,6 +1650,7 @@ test("API refuses weak inbound bridge auth policy on public service without expl
   assert.throws(
     () =>
       createLoomServer({
+        ...buildPublicServiceSigningKeyOptions(),
         nodeId: "node.test",
         domain: "127.0.0.1",
         publicService: true,
@@ -1399,6 +1750,21 @@ test("API exposes readiness and protects admin operational endpoints", async (t)
         runs_total: 3,
         last_processed_count: 1,
         last_error: null
+      },
+      federation_trust_revalidation_worker: {
+        enabled: true,
+        interval_ms: 60000,
+        batch_limit: 50,
+        include_non_public_modes: false,
+        runs_total: 4,
+        in_progress: false,
+        last_run_at: "2026-02-20T00:00:00.000Z",
+        last_revalidated_count: 2,
+        last_skipped_count: 1,
+        last_failed_count: 0,
+        last_error: null,
+        last_error_at: null,
+        batch_backoff_ms: 0
       }
     })
   });
@@ -1450,6 +1816,87 @@ test("API exposes readiness and protects admin operational endpoints", async (t)
   assert.match(metrics.response.headers.get("content-type") || "", /text\/plain/i);
   assert.match(metrics.body, /loom_requests_total/);
   assert.match(metrics.body, /loom_federation_outbox_total/);
+  assert.match(metrics.body, /loom_inbound_content_filter_profile_evaluated_total\{profile="strict"\}/);
+  assert.match(metrics.body, /loom_inbound_content_filter_decisions_total\{profile="agent",action="allow"\}/);
+  assert.match(metrics.body, /loom_inbound_content_filter_decision_log_enabled/);
+  assert.match(metrics.body, /loom_federation_trust_revalidation_worker_enabled/);
+  assert.match(metrics.body, /loom_federation_trust_revalidation_worker_last_revalidated_count/);
+});
+
+test("API supports admin canary/apply/rollback workflow for inbound content filter config", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret-token"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const denied = await jsonRequest(`${baseUrl}/v1/admin/content-filter/config`);
+  assert.equal(denied.response.status, 403);
+  assert.equal(denied.body.error.code, "CAPABILITY_DENIED");
+
+  const current = await jsonRequest(`${baseUrl}/v1/admin/content-filter/config`, {
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    }
+  });
+  assert.equal(current.response.status, 200);
+  assert.equal(typeof current.body.active.quarantine_threshold, "number");
+
+  const canary = await jsonRequest(`${baseUrl}/v1/admin/content-filter/config`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      mode: "canary",
+      config: {
+        quarantine_threshold: current.body.active.quarantine_threshold + 2,
+        reject_threshold: current.body.active.reject_threshold + 2,
+        profile_federation: "strict"
+      },
+      note: "canary hardening"
+    })
+  });
+  assert.equal(canary.response.status, 200);
+  assert.equal(canary.body.active.quarantine_threshold, current.body.active.quarantine_threshold);
+  assert.equal(
+    canary.body.canary?.config?.quarantine_threshold,
+    current.body.active.quarantine_threshold + 2
+  );
+  assert.equal(canary.body.canary?.config?.profile_federation, "strict");
+
+  const applied = await jsonRequest(`${baseUrl}/v1/admin/content-filter/config`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      mode: "apply"
+    })
+  });
+  assert.equal(applied.response.status, 200);
+  assert.equal(applied.body.active.quarantine_threshold, current.body.active.quarantine_threshold + 2);
+  assert.equal(applied.body.active.profile_federation, "strict");
+  assert.equal(applied.body.canary, null);
+  assert.equal(applied.body.rollback?.config?.quarantine_threshold, current.body.active.quarantine_threshold);
+
+  const rolledBack = await jsonRequest(`${baseUrl}/v1/admin/content-filter/config`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({
+      mode: "rollback"
+    })
+  });
+  assert.equal(rolledBack.response.status, 200);
+  assert.equal(rolledBack.body.active.quarantine_threshold, current.body.active.quarantine_threshold);
+  assert.equal(rolledBack.body.active.reject_threshold, current.body.active.reject_threshold);
 });
 
 test("API enforces auth for envelope submission and supports proof-of-key login", async (t) => {
@@ -4532,6 +4979,538 @@ test("API bootstraps federation node trust from node discovery document", async 
   });
   assert.equal(deliver.response.status, 202, JSON.stringify(deliver.body));
   assert.equal(deliver.body.accepted_count, 1);
+});
+
+test("API bootstraps public DNS trust anchor and enforces trust epoch header", async (t) => {
+  const remoteNodeSigningKeys = generateSigningKeyPair();
+  const remoteSenderKeys = generateSigningKeyPair();
+
+  const { server: remoteServer } = createLoomServer({
+    nodeId: "remote.test",
+    domain: "127.0.0.1",
+    federationSigningKeyId: "k_node_sign_remote_public_dns_1",
+    federationSigningPrivateKeyPem: remoteNodeSigningKeys.privateKeyPem,
+    federationTrustMode: "public_dns_webpki",
+    federationTrustLocalEpoch: 1,
+    federationTrustKeysetVersion: 1
+  });
+  await new Promise((resolve) => remoteServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => remoteServer.close(resolve)));
+  const remoteAddress = remoteServer.address();
+  const remoteBaseUrl = `http://127.0.0.1:${remoteAddress.port}`;
+
+  const federationTrustDnsTxtResolver = async () => {
+    const keyset = await jsonRequest(`${remoteBaseUrl}/.well-known/loom-keyset.json`);
+    const keysetHash = hashSignedDocumentPayload(keyset.body);
+    return [
+      [
+        `v=loomfed1;keyset=${remoteBaseUrl}/.well-known/loom-keyset.json;digest=sha256:${keysetHash};revocations=${remoteBaseUrl}/.well-known/loom-revocations.json;trust_epoch=1;version=1`
+      ]
+    ];
+  };
+
+  const { server: localServer } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustDnsTxtResolver,
+    federationTrustFailClosed: true
+  });
+  await new Promise((resolve) => localServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => localServer.close(resolve)));
+  const localAddress = localServer.address();
+  const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+
+  const adminKeys = generateSigningKeyPair();
+
+  const registerAdmin = await jsonRequest(`${localBaseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_public_dns_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAdmin.response.status, 201);
+
+  const registerRemoteSender = await jsonRequest(`${localBaseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@remote.test",
+      imported_remote: true,
+      display_name: "Remote Alice",
+      signing_keys: [{ key_id: "k_sign_remote_alice_public_dns_1", public_key_pem: remoteSenderKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerRemoteSender.response.status, 201);
+
+  const challenge = await jsonRequest(`${localBaseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_public_dns_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${localBaseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_public_dns_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const bootstrap = await jsonRequest(`${localBaseUrl}/v1/federation/nodes/bootstrap`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_document_url: `${remoteBaseUrl}/.well-known/loom.json`,
+      trust_anchor_mode: "public_dns_webpki",
+      allow_insecure_http: true,
+      allow_private_network: true,
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      identity_resolve_url: `${remoteBaseUrl}/v1/identity/{identity}`
+    })
+  });
+  assert.equal(bootstrap.response.status, 201, JSON.stringify(bootstrap.body));
+  assert.equal(bootstrap.body?.node?.trust_anchor_mode, "public_dns_webpki");
+  assert.equal(bootstrap.body?.node?.trust_anchor_epoch, 1);
+  assert.equal(typeof bootstrap.body?.node?.trust_anchor_keyset_hash, "string");
+
+  const remoteEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G7PX1",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G7PX2",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@remote.test",
+        display: "Remote Alice",
+        key_id: "k_sign_remote_alice_public_dns_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://team@node.test", role: "primary" }],
+      created_at: "2026-02-17T08:10:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "public dns trust delivery", format: "markdown" },
+        structured: { intent: "message.general@v1", parameters: {} },
+        encrypted: false
+      },
+      attachments: []
+    },
+    remoteSenderKeys.privateKeyPem,
+    "k_sign_remote_alice_public_dns_1"
+  );
+
+  const wrapper = {
+    loom: "1.1",
+    sender_node: "remote.test",
+    timestamp: new Date().toISOString(),
+    envelopes: [remoteEnvelope]
+  };
+  const rawBody = JSON.stringify(wrapper);
+
+  const signDeliveryRequest = (nonce, trustEpochHeader = null) => {
+    const timestamp = new Date().toISOString();
+    const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
+    const canonical = `POST\n/v1/federation/deliver\n${bodyHash}\n${timestamp}\n${nonce}\n${trustEpochHeader == null ? "" : String(trustEpochHeader)}`;
+    const requestSignature = signUtf8Message(remoteNodeSigningKeys.privateKeyPem, canonical);
+    return {
+      timestamp,
+      requestSignature,
+      headers: {
+        "x-loom-node": "remote.test",
+        "x-loom-timestamp": timestamp,
+        "x-loom-nonce": nonce,
+        "x-loom-key-id": "k_node_sign_remote_public_dns_1",
+        "x-loom-signature": requestSignature,
+        ...(trustEpochHeader != null ? { "x-loom-trust-epoch": String(trustEpochHeader) } : {})
+      }
+    };
+  };
+
+  const missingEpoch = signDeliveryRequest("nonce_public_dns_missing_epoch");
+  const deliverMissingEpoch = await jsonRequest(`${localBaseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: missingEpoch.headers,
+    body: rawBody
+  });
+  assert.equal(deliverMissingEpoch.response.status, 401);
+  assert.equal(deliverMissingEpoch.body?.error?.code, "SIGNATURE_INVALID");
+
+  const staleEpoch = signDeliveryRequest("nonce_public_dns_stale_epoch", 0);
+  const deliverStaleEpoch = await jsonRequest(`${localBaseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: staleEpoch.headers,
+    body: rawBody
+  });
+  assert.equal(deliverStaleEpoch.response.status, 401);
+  assert.equal(deliverStaleEpoch.body?.error?.code, "SIGNATURE_INVALID");
+
+  const validEpoch = signDeliveryRequest("nonce_public_dns_valid_epoch", 1);
+  const deliver = await jsonRequest(`${localBaseUrl}/v1/federation/deliver`, {
+    method: "POST",
+    headers: validEpoch.headers,
+    body: rawBody
+  });
+  assert.equal(deliver.response.status, 202, JSON.stringify(deliver.body));
+  assert.equal(deliver.body.accepted_count, 1);
+});
+
+test("API revalidates public DNS federation node trust and refreshes trust metadata", async (t) => {
+  const remoteNodeSigningKeys = generateSigningKeyPair();
+
+  const { server: remoteServer } = createLoomServer({
+    nodeId: "remote.test",
+    domain: "127.0.0.1",
+    adminToken: "remote-admin-secret",
+    federationSigningKeyId: "k_node_sign_remote_revalidate_1",
+    federationSigningPrivateKeyPem: remoteNodeSigningKeys.privateKeyPem,
+    federationTrustMode: "public_dns_webpki",
+    federationTrustLocalEpoch: 1,
+    federationTrustKeysetVersion: 1
+  });
+  await new Promise((resolve) => remoteServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => remoteServer.close(resolve)));
+  const remoteAddress = remoteServer.address();
+  const remoteBaseUrl = `http://127.0.0.1:${remoteAddress.port}`;
+
+  const federationTrustDnsTxtResolver = async () => {
+    const keyset = await jsonRequest(`${remoteBaseUrl}/.well-known/loom-keyset.json`);
+    const keysetHash = hashSignedDocumentPayload(keyset.body);
+    const trustEpoch = Number(keyset.body?.trust_epoch || 0);
+    const keysetVersion = Number(keyset.body?.version || 0);
+    return [
+      [
+        `v=loomfed1;keyset=${remoteBaseUrl}/.well-known/loom-keyset.json;digest=sha256:${keysetHash};revocations=${remoteBaseUrl}/.well-known/loom-revocations.json;trust_epoch=${trustEpoch};version=${keysetVersion}`
+      ]
+    ];
+  };
+
+  const { server: localServer } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustDnsTxtResolver,
+    federationTrustFailClosed: true
+  });
+  await new Promise((resolve) => localServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => localServer.close(resolve)));
+  const localAddress = localServer.address();
+  const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+
+  const adminKeys = generateSigningKeyPair();
+  const registerAdmin = await jsonRequest(`${localBaseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_public_dns_revalidate_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAdmin.response.status, 201);
+
+  const challenge = await jsonRequest(`${localBaseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_public_dns_revalidate_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${localBaseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_public_dns_revalidate_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const bootstrap = await jsonRequest(`${localBaseUrl}/v1/federation/nodes/bootstrap`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_document_url: `${remoteBaseUrl}/.well-known/loom.json`,
+      trust_anchor_mode: "public_dns_webpki",
+      allow_insecure_http: true,
+      allow_private_network: true,
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      identity_resolve_url: `${remoteBaseUrl}/v1/identity/{identity}`
+    })
+  });
+  assert.equal(bootstrap.response.status, 201, JSON.stringify(bootstrap.body));
+  assert.equal(bootstrap.body?.node?.trust_anchor_epoch, 1);
+  assert.equal(bootstrap.body?.node?.trust_anchor_keyset_version, 1);
+
+  const rotateRemoteTrust = await jsonRequest(`${remoteBaseUrl}/v1/federation/trust`, {
+    method: "POST",
+    headers: {
+      "x-loom-admin-token": "remote-admin-secret"
+    },
+    body: JSON.stringify({
+      bump_trust_epoch: true,
+      bump_keyset_version: true
+    })
+  });
+  assert.equal(rotateRemoteTrust.response.status, 200, JSON.stringify(rotateRemoteTrust.body));
+  assert.equal(rotateRemoteTrust.body?.trust_epoch, 2);
+  assert.equal(rotateRemoteTrust.body?.keyset_version, 2);
+
+  const revalidate = await jsonRequest(`${localBaseUrl}/v1/federation/nodes/remote.test/revalidate`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(revalidate.response.status, 200, JSON.stringify(revalidate.body));
+  assert.equal(revalidate.body?.status, "revalidated");
+  assert.equal(revalidate.body?.node?.trust_anchor_epoch, 2);
+  assert.equal(revalidate.body?.node?.trust_anchor_keyset_version, 2);
+  assert.equal(revalidate.body?.previous?.trust_epoch, 1);
+  assert.equal(revalidate.body?.next?.trust_epoch, 2);
+  assert.equal(revalidate.body?.previous?.keyset_version, 1);
+  assert.equal(revalidate.body?.next?.keyset_version, 2);
+});
+
+test("API batch revalidation reports revalidated and skipped federation nodes", async (t) => {
+  const remoteNodeSigningKeys = generateSigningKeyPair();
+
+  const { server: remoteServer } = createLoomServer({
+    nodeId: "remote.test",
+    domain: "127.0.0.1",
+    federationSigningKeyId: "k_node_sign_remote_batch_revalidate_1",
+    federationSigningPrivateKeyPem: remoteNodeSigningKeys.privateKeyPem,
+    federationTrustMode: "public_dns_webpki",
+    federationTrustLocalEpoch: 1,
+    federationTrustKeysetVersion: 1
+  });
+  await new Promise((resolve) => remoteServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => remoteServer.close(resolve)));
+  const remoteAddress = remoteServer.address();
+  const remoteBaseUrl = `http://127.0.0.1:${remoteAddress.port}`;
+
+  const federationTrustDnsTxtResolver = async () => {
+    const keyset = await jsonRequest(`${remoteBaseUrl}/.well-known/loom-keyset.json`);
+    const keysetHash = hashSignedDocumentPayload(keyset.body);
+    const trustEpoch = Number(keyset.body?.trust_epoch || 0);
+    const keysetVersion = Number(keyset.body?.version || 0);
+    return [
+      [
+        `v=loomfed1;keyset=${remoteBaseUrl}/.well-known/loom-keyset.json;digest=sha256:${keysetHash};revocations=${remoteBaseUrl}/.well-known/loom-revocations.json;trust_epoch=${trustEpoch};version=${keysetVersion}`
+      ]
+    ];
+  };
+
+  const { server: localServer } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    federationTrustMode: "public_dns_webpki",
+    federationTrustDnsTxtResolver,
+    federationTrustFailClosed: true
+  });
+  await new Promise((resolve) => localServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => localServer.close(resolve)));
+  const localAddress = localServer.address();
+  const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+
+  const adminKeys = generateSigningKeyPair();
+  const registerAdmin = await jsonRequest(`${localBaseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://admin@node.test",
+      display_name: "Admin",
+      signing_keys: [{ key_id: "k_sign_admin_batch_revalidate_1", public_key_pem: adminKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerAdmin.response.status, 201);
+
+  const challenge = await jsonRequest(`${localBaseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_batch_revalidate_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${localBaseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://admin@node.test",
+      key_id: "k_sign_admin_batch_revalidate_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(adminKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const bootstrap = await jsonRequest(`${localBaseUrl}/v1/federation/nodes/bootstrap`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_document_url: `${remoteBaseUrl}/.well-known/loom.json`,
+      trust_anchor_mode: "public_dns_webpki",
+      allow_insecure_http: true,
+      allow_private_network: true,
+      deliver_url: `${remoteBaseUrl}/v1/federation/deliver`,
+      identity_resolve_url: `${remoteBaseUrl}/v1/identity/{identity}`
+    })
+  });
+  assert.equal(bootstrap.response.status, 201, JSON.stringify(bootstrap.body));
+
+  const legacyNodeKeys = generateSigningKeyPair();
+  const registerLegacyNode = await jsonRequest(`${localBaseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_id: "legacy.test",
+      key_id: "k_node_sign_legacy_batch_revalidate_1",
+      public_key_pem: legacyNodeKeys.publicKeyPem,
+      deliver_url: "https://legacy.test/v1/federation/deliver",
+      identity_resolve_url: "https://legacy.test/v1/identity/{identity}",
+      trust_anchor_mode: "strict_identity_authority"
+    })
+  });
+  assert.equal(registerLegacyNode.response.status, 201, JSON.stringify(registerLegacyNode.body));
+
+  const revalidate = await jsonRequest(`${localBaseUrl}/v1/federation/nodes/revalidate`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_ids: ["legacy.test", "remote.test"]
+    })
+  });
+  assert.equal(revalidate.response.status, 200, JSON.stringify(revalidate.body));
+  assert.equal(revalidate.body?.requested_count, 2);
+  assert.equal(revalidate.body?.attempted_count, 2);
+  assert.equal(revalidate.body?.revalidated_count, 1);
+  assert.equal(revalidate.body?.skipped_count, 1);
+  assert.equal(revalidate.body?.failed_count, 0);
+  assert.equal(revalidate.body?.processed?.[0]?.node_id, "remote.test");
+  assert.equal(revalidate.body?.processed?.[0]?.status, "revalidated");
+  assert.equal(revalidate.body?.skipped?.[0]?.node_id, "legacy.test");
+  assert.equal(revalidate.body?.skipped?.[0]?.reason, "trust_mode_not_public_dns_webpki");
+});
+
+test("API requires admin token for insecure federation node revalidation when configured", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    adminToken: "admin-secret-token"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const userKeys = generateSigningKeyPair();
+  const remoteNodeKeys = generateSigningKeyPair();
+
+  const registerUser = await jsonRequest(`${baseUrl}/v1/identity`, {
+    method: "POST",
+    body: JSON.stringify({
+      id: "loom://alice@node.test",
+      display_name: "Alice",
+      signing_keys: [{ key_id: "k_sign_alice_fed_revalidate_admin_1", public_key_pem: userKeys.publicKeyPem }]
+    })
+  });
+  assert.equal(registerUser.response.status, 201);
+
+  const challenge = await jsonRequest(`${baseUrl}/v1/auth/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_fed_revalidate_admin_1"
+    })
+  });
+  assert.equal(challenge.response.status, 200);
+
+  const token = await jsonRequest(`${baseUrl}/v1/auth/token`, {
+    method: "POST",
+    body: JSON.stringify({
+      identity: "loom://alice@node.test",
+      key_id: "k_sign_alice_fed_revalidate_admin_1",
+      challenge_id: challenge.body.challenge_id,
+      signature: signUtf8Message(userKeys.privateKeyPem, challenge.body.nonce)
+    })
+  });
+  assert.equal(token.response.status, 200);
+
+  const insecureNodePayload = {
+    node_id: "remote.test",
+    key_id: "k_node_sign_remote_revalidate_admin_1",
+    public_key_pem: remoteNodeKeys.publicKeyPem,
+    node_document_url: "http://127.0.0.1:33445/.well-known/loom.json",
+    deliver_url: "http://127.0.0.1:33445/v1/federation/deliver",
+    identity_resolve_url: "http://127.0.0.1:33445/v1/identity/{identity}",
+    allow_insecure_http: true,
+    allow_private_network: true
+  };
+
+  const registerNode = await jsonRequest(`${baseUrl}/v1/federation/nodes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`,
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify(insecureNodePayload)
+  });
+  assert.equal(registerNode.response.status, 201, JSON.stringify(registerNode.body));
+
+  const deniedSingle = await jsonRequest(`${baseUrl}/v1/federation/nodes/remote.test/revalidate`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(deniedSingle.response.status, 403);
+  assert.equal(deniedSingle.body?.error?.code, "CAPABILITY_DENIED");
+
+  const deniedBatch = await jsonRequest(`${baseUrl}/v1/federation/nodes/revalidate`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`
+    },
+    body: JSON.stringify({
+      node_ids: ["remote.test"]
+    })
+  });
+  assert.equal(deniedBatch.response.status, 403);
+  assert.equal(deniedBatch.body?.error?.code, "CAPABILITY_DENIED");
+
+  const allowed = await jsonRequest(`${baseUrl}/v1/federation/nodes/remote.test/revalidate`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.body.access_token}`,
+      "x-loom-admin-token": "admin-secret-token"
+    },
+    body: JSON.stringify({})
+  });
+  assert.equal(allowed.response.status, 200, JSON.stringify(allowed.body));
+  assert.equal(allowed.body?.status, "skipped");
+  assert.equal(allowed.body?.reason, "trust_mode_not_public_dns_webpki");
 });
 
 test("API rejects federation bootstrap to private network by default", async (t) => {

@@ -24,6 +24,20 @@ function isPublicBindHost(value) {
   return true;
 }
 
+function normalizePositiveInteger(value, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  const floored = Math.floor(parsed);
+  if (floored < min) {
+    return fallback;
+  }
+
+  return Math.min(max, floored);
+}
+
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
 const domain = process.env.LOOM_DOMAIN || `${host}:${port}`;
@@ -123,6 +137,46 @@ const emailOutboxAutoProcessBatchSize = Number(process.env.LOOM_EMAIL_OUTBOX_AUT
 const webhookOutboxAutoProcessIntervalMs = Number(process.env.LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_INTERVAL_MS || 5000);
 const webhookOutboxAutoProcessBatchSize = Number(process.env.LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_BATCH_SIZE || 20);
 const maintenanceSweepIntervalMs = Number(process.env.LOOM_MAINTENANCE_SWEEP_INTERVAL_MS || 60000);
+const federationTrustRevalidateIntervalMs = Number(
+  process.env.LOOM_FEDERATION_TRUST_REVALIDATE_INTERVAL_MS || 15 * 60 * 1000
+);
+const federationTrustRevalidateBatchLimit = Number(
+  process.env.LOOM_FEDERATION_TRUST_REVALIDATE_BATCH_LIMIT || 100
+);
+const federationTrustRevalidateIncludeNonPublicModes = parseBoolean(
+  process.env.LOOM_FEDERATION_TRUST_REVALIDATE_INCLUDE_NON_PUBLIC_MODES,
+  false
+);
+const federationTrustRevalidateTimeoutMs = Number(
+  process.env.LOOM_FEDERATION_TRUST_REVALIDATE_TIMEOUT_MS || 5000
+);
+const federationTrustRevalidateMaxResponseBytes = Number(
+  process.env.LOOM_FEDERATION_TRUST_REVALIDATE_MAX_RESPONSE_BYTES || 256 * 1024
+);
+const normalizedFederationTrustRevalidateBatchLimit = normalizePositiveInteger(
+  federationTrustRevalidateBatchLimit,
+  100,
+  {
+    min: 1,
+    max: 1000
+  }
+);
+const normalizedFederationTrustRevalidateTimeoutMs = normalizePositiveInteger(
+  federationTrustRevalidateTimeoutMs,
+  5000,
+  {
+    min: 500,
+    max: 20000
+  }
+);
+const normalizedFederationTrustRevalidateMaxResponseBytes = normalizePositiveInteger(
+  federationTrustRevalidateMaxResponseBytes,
+  256 * 1024,
+  {
+    min: 1024,
+    max: 1024 * 1024
+  }
+);
 const federationSigningPrivateKeyPem = process.env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM
   ? process.env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM.replace(/\\n/g, "\n")
   : null;
@@ -163,6 +217,21 @@ const runtimeStatus = {
     in_progress: false,
     last_run_at: null,
     last_processed_count: 0,
+    last_error: null,
+    last_error_at: null,
+    batch_backoff_ms: 0
+  },
+  federation_trust_revalidation_worker: {
+    enabled: false,
+    interval_ms: federationTrustRevalidateIntervalMs,
+    batch_limit: normalizedFederationTrustRevalidateBatchLimit,
+    include_non_public_modes: federationTrustRevalidateIncludeNonPublicModes,
+    runs_total: 0,
+    in_progress: false,
+    last_run_at: null,
+    last_revalidated_count: 0,
+    last_skipped_count: 0,
+    last_failed_count: 0,
     last_error: null,
     last_error_at: null,
     batch_backoff_ms: 0
@@ -214,6 +283,10 @@ let webhookOutboxTimer = null;
 let isWebhookOutboxProcessing = false;
 let webhookOutboxBackoffUntil = 0;
 let webhookOutboxBackoffMs = 0;
+let federationTrustRevalidationTimer = null;
+let isFederationTrustRevalidationProcessing = false;
+let federationTrustRevalidationBackoffUntil = 0;
+let federationTrustRevalidationBackoffMs = 0;
 
 function buildWorkerTraceId(worker) {
   const normalizedWorker = String(worker || "worker")
@@ -276,6 +349,54 @@ function logWorkerBatchProcessed(worker, traceId, result) {
       outbox_ids: outboxIds,
       source_request_ids: sourceRequestIds,
       source_trace_ids: sourceTraceIds
+    })
+  );
+}
+
+function logFederationTrustRevalidationProcessed(traceId, result) {
+  if (!result || typeof result !== "object") {
+    return;
+  }
+
+  const revalidatedCount = Number(result.revalidated_count || 0);
+  const skippedCount = Number(result.skipped_count || 0);
+  const failedCount = Number(result.failed_count || 0);
+  if (revalidatedCount <= 0 && failedCount <= 0) {
+    return;
+  }
+
+  const revalidatedNodeIds = Array.isArray(result.processed)
+    ? result.processed
+        .map((entry) => (entry && typeof entry === "object" ? String(entry.node_id || "").trim() : ""))
+        .filter(Boolean)
+        .slice(0, 20)
+    : [];
+  const skippedNodeIds = Array.isArray(result.skipped)
+    ? result.skipped
+        .map((entry) => (entry && typeof entry === "object" ? String(entry.node_id || "").trim() : ""))
+        .filter(Boolean)
+        .slice(0, 20)
+    : [];
+  const failedNodeIds = Array.isArray(result.failed)
+    ? result.failed
+        .map((entry) => (entry && typeof entry === "object" ? String(entry.node_id || "").trim() : ""))
+        .filter(Boolean)
+        .slice(0, 20)
+    : [];
+
+  // eslint-disable-next-line no-console
+  console.log(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: "worker.federation.trust.revalidation",
+      worker: "federation_trust_revalidation",
+      trace_id: traceId,
+      revalidated_count: revalidatedCount,
+      skipped_count: skippedCount,
+      failed_count: failedCount,
+      revalidated_node_ids: revalidatedNodeIds,
+      skipped_node_ids: skippedNodeIds,
+      failed_node_ids: failedNodeIds
     })
   );
 }
@@ -458,6 +579,85 @@ function stopWebhookOutboxWorker() {
   }
 }
 
+function startFederationTrustRevalidationWorker() {
+  if (!Number.isFinite(federationTrustRevalidateIntervalMs) || federationTrustRevalidateIntervalMs <= 0) {
+    runtimeStatus.federation_trust_revalidation_worker.enabled = false;
+    return;
+  }
+
+  runtimeStatus.federation_trust_revalidation_worker.enabled = true;
+
+  federationTrustRevalidationTimer = setInterval(() => {
+    if (isFederationTrustRevalidationProcessing) {
+      return;
+    }
+    if (federationTrustRevalidationBackoffUntil > Date.now()) {
+      return;
+    }
+
+    isFederationTrustRevalidationProcessing = true;
+    void (async () => {
+      runtimeStatus.federation_trust_revalidation_worker.in_progress = true;
+      runtimeStatus.federation_trust_revalidation_worker.last_run_at = new Date().toISOString();
+      runtimeStatus.federation_trust_revalidation_worker.runs_total += 1;
+      try {
+        const { traceId, result } = await runWithWorkerTrace("federation_trust_revalidation", () =>
+          store.revalidateFederationNodesTrust(
+            {
+              limit: normalizedFederationTrustRevalidateBatchLimit,
+              include_non_public_modes: federationTrustRevalidateIncludeNonPublicModes,
+              continue_on_error: true,
+              timeout_ms: normalizedFederationTrustRevalidateTimeoutMs,
+              max_response_bytes: normalizedFederationTrustRevalidateMaxResponseBytes
+            },
+            "system"
+          )
+        );
+        runtimeStatus.federation_trust_revalidation_worker.last_revalidated_count = Number(
+          result?.revalidated_count || 0
+        );
+        runtimeStatus.federation_trust_revalidation_worker.last_skipped_count = Number(
+          result?.skipped_count || 0
+        );
+        runtimeStatus.federation_trust_revalidation_worker.last_failed_count = Number(
+          result?.failed_count || 0
+        );
+        runtimeStatus.federation_trust_revalidation_worker.last_error = null;
+        runtimeStatus.federation_trust_revalidation_worker.last_error_at = null;
+        federationTrustRevalidationBackoffMs = 0;
+        federationTrustRevalidationBackoffUntil = 0;
+        runtimeStatus.federation_trust_revalidation_worker.batch_backoff_ms = 0;
+        logFederationTrustRevalidationProcessed(traceId, result);
+      } catch (error) {
+        runtimeStatus.federation_trust_revalidation_worker.last_error =
+          error?.message || "Unknown federation trust revalidation worker error";
+        runtimeStatus.federation_trust_revalidation_worker.last_error_at = new Date().toISOString();
+        federationTrustRevalidationBackoffMs = Math.min(
+          300000,
+          federationTrustRevalidationBackoffMs === 0 ? 10000 : federationTrustRevalidationBackoffMs * 2
+        );
+        federationTrustRevalidationBackoffUntil = Date.now() + federationTrustRevalidationBackoffMs;
+        runtimeStatus.federation_trust_revalidation_worker.batch_backoff_ms =
+          federationTrustRevalidationBackoffMs;
+        // eslint-disable-next-line no-console
+        console.error("LOOM federation trust revalidation worker failed", error);
+      } finally {
+        isFederationTrustRevalidationProcessing = false;
+        runtimeStatus.federation_trust_revalidation_worker.in_progress = false;
+      }
+    })();
+  }, federationTrustRevalidateIntervalMs);
+
+  federationTrustRevalidationTimer.unref?.();
+}
+
+function stopFederationTrustRevalidationWorker() {
+  if (federationTrustRevalidationTimer) {
+    clearInterval(federationTrustRevalidationTimer);
+    federationTrustRevalidationTimer = null;
+  }
+}
+
 let maintenanceSweepTimer = null;
 
 function startMaintenanceSweep() {
@@ -561,6 +761,7 @@ async function shutdown(signal, exitCode = 0) {
   stopFederationOutboxWorker();
   stopEmailOutboxWorker();
   stopWebhookOutboxWorker();
+  stopFederationTrustRevalidationWorker();
   stopMaintenanceSweep();
   try {
     await wireGateway.stop();
@@ -626,6 +827,7 @@ async function start() {
   startFederationOutboxWorker();
   startEmailOutboxWorker();
   startWebhookOutboxWorker();
+  startFederationTrustRevalidationWorker();
   startMaintenanceSweep();
 }
 

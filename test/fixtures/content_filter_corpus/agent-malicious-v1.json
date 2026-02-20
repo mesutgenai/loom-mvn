@@ -1,0 +1,29 @@
+{
+  "version": "agent-malicious-v1",
+  "vectors": [
+    {
+      "id": "agent_keyword_cluster_with_shortener_and_ip_literal",
+      "subject": "Security alert: verify your account immediately",
+      "text": "We detected unusual activity. Verify your account, reset your password, and click the link now: https://bit.ly/reset-token and https://198.51.100.44/session-check",
+      "expected_action": "reject"
+    },
+    {
+      "id": "agent_risky_attachment_double_extension",
+      "subject": "Invoice package",
+      "text": "Please review attached invoice.",
+      "attachments": [
+        {
+          "filename": "invoice.pdf.exe",
+          "mime_type": "application/octet-stream"
+        }
+      ],
+      "expected_action": "reject"
+    },
+    {
+      "id": "agent_punycode_login_lure",
+      "subject": "Login required for billing verification",
+      "text": "Payment failed in last cycle. Login required for account review at https://xn--billing-check-9ob.example/login",
+      "expected_action": "quarantine"
+    }
+  ]
+}

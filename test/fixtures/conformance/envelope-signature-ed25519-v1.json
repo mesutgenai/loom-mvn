@@ -1,0 +1,46 @@
+{
+  "spec": "loom.envelope-signature.ed25519.v1",
+  "vector": {
+    "key_id": "k_vector_sign_01",
+    "private_key_pem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINo6fkGiO/KPrLhFXn/psOUUbMoZf3YnI7Qjqyhns4ZT\n-----END PRIVATE KEY-----\n",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAsH455ZPpzLjpBeHEI07o8WYfD265LcHpOIV21JvW3ag=\n-----END PUBLIC KEY-----\n",
+    "unsigned_envelope": {
+      "loom": "1.1",
+      "id": "env_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "thread_id": "thr_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "parent_id": null,
+      "type": "message",
+      "from": {
+        "identity": "loom://alice@agents.example",
+        "display": "Alice",
+        "key_id": "k_vector_sign_01",
+        "type": "human"
+      },
+      "to": [
+        {
+          "identity": "loom://bob@agents.example",
+          "role": "primary"
+        }
+      ],
+      "created_at": "2026-02-19T12:00:00Z",
+      "priority": "normal",
+      "content": {
+        "human": {
+          "text": "Protocol vector",
+          "format": "markdown"
+        },
+        "structured": {
+          "intent": "message.general@v1",
+          "parameters": {
+            "work_item": "WF-42",
+            "retry": false
+          }
+        },
+        "encrypted": false
+      },
+      "attachments": []
+    },
+    "expected_canonical": "{\"attachments\":[],\"content\":{\"encrypted\":false,\"human\":{\"format\":\"markdown\",\"text\":\"Protocol vector\"},\"structured\":{\"intent\":\"message.general@v1\",\"parameters\":{\"retry\":false,\"work_item\":\"WF-42\"}}},\"created_at\":\"2026-02-19T12:00:00Z\",\"from\":{\"display\":\"Alice\",\"identity\":\"loom://alice@agents.example\",\"key_id\":\"k_vector_sign_01\",\"type\":\"human\"},\"id\":\"env_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"loom\":\"1.1\",\"parent_id\":null,\"priority\":\"normal\",\"thread_id\":\"thr_01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"to\":[{\"identity\":\"loom://bob@agents.example\",\"role\":\"primary\"}],\"type\":\"message\"}",
+    "expected_signature_base64url": "CI4J60HHrEomAC9_2eahWNgu3VuI84q9hW-4nWLM49PXRWCWlLBWUBspusscWyVvvkru5vnnxDK8k_2N0zPZCw"
+  }
+}

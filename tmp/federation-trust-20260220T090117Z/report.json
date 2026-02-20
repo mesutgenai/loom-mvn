@@ -1,0 +1,354 @@
+{
+  "drill_id": "federation-trust-20260220T090117Z",
+  "started_at": "2026-02-20T09:01:17.123Z",
+  "success": true,
+  "steps": [
+    {
+      "name": "register_local_admin_identity",
+      "status": 201,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/identity",
+      "response_body": {
+        "id": "loom://admin-jdk0y0t5@local.test",
+        "type": "human",
+        "display_name": "Drill Admin",
+        "signing_keys": [
+          {
+            "key_id": "k_sign_local_admin_jdk0y0t5",
+            "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAzZFQ4b27DUb4IkZAJ14O78Fkw0rmD32dFquznlAi1bY=\n-----END PUBLIC KEY-----"
+          }
+        ],
+        "encryption_keys": [],
+        "created_at": "2026-02-20T09:01:17.146Z",
+        "updated_at": "2026-02-20T09:01:17.146Z",
+        "identity_source": "local",
+        "imported_remote": false,
+        "remote_fetched_at": null,
+        "remote_expires_at": null
+      }
+    },
+    {
+      "name": "issue_local_auth_challenge",
+      "status": 200,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/auth/challenge",
+      "response_body": {
+        "challenge_id": "chl_01KHX4GBZ0BYDVHWSZGQWY9QZW",
+        "identity": "loom://admin-jdk0y0t5@local.test",
+        "key_id": "k_sign_local_admin_jdk0y0t5",
+        "nonce": "nonce_01KHX4GBZ0BYDVHWSZGQWY9QZX",
+        "expires_at": "2026-02-20T09:03:17.152Z",
+        "algorithm": "Ed25519"
+      }
+    },
+    {
+      "name": "exchange_local_auth_token",
+      "status": 200,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/auth/token",
+      "response_body": {
+        "token_type": "Bearer",
+        "access_token": "at_5e5ba44d02df44eca9e1e8db78392782",
+        "refresh_token": "rt_5ca25636c82544bf8d4ee23c7970cd7f",
+        "expires_in": 3600,
+        "identity": "loom://admin-jdk0y0t5@local.test",
+        "key_id": "k_sign_local_admin_jdk0y0t5"
+      }
+    },
+    {
+      "name": "register_remote_sender_identity",
+      "status": 201,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/identity",
+      "response_body": {
+        "id": "loom://sender-jdk0y0t5@remote.test",
+        "type": "human",
+        "display_name": "Remote Sender",
+        "signing_keys": [
+          {
+            "key_id": "k_sign_remote_sender_jdk0y0t5",
+            "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAjdFtjHbpV+0WZD0jzIrNn5Wk94U2iqrmo1tgalTPPD0=\n-----END PUBLIC KEY-----"
+          }
+        ],
+        "encryption_keys": [],
+        "created_at": "2026-02-20T09:01:17.155Z",
+        "updated_at": "2026-02-20T09:01:17.155Z",
+        "identity_source": "remote",
+        "imported_remote": true,
+        "remote_fetched_at": "2026-02-20T09:01:17.155Z",
+        "remote_expires_at": "2026-02-21T09:01:17.155Z"
+      }
+    },
+    {
+      "name": "bootstrap_remote_federation_trust",
+      "status": 201,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/federation/nodes/bootstrap",
+      "response_body": {
+        "node": {
+          "node_id": "remote.test",
+          "key_id": "k_node_sign_remote_jdk0y0t5",
+          "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAaIqa3zJBETFgFAFnUCFOt0c/2d7mhDAjwD6KFYQxJOw=\n-----END PUBLIC KEY-----",
+          "signing_keys": [
+            {
+              "key_id": "k_node_sign_remote_jdk0y0t5",
+              "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAaIqa3zJBETFgFAFnUCFOt0c/2d7mhDAjwD6KFYQxJOw=\n-----END PUBLIC KEY-----",
+              "status": "active",
+              "not_before": null,
+              "not_after": null,
+              "revoked_at": null
+            }
+          ],
+          "deliver_url": "http://127.0.0.1:64583/v1/federation/deliver",
+          "identity_resolve_url": "http://127.0.0.1:64583/v1/identity/{identity}",
+          "node_document_url": "http://127.0.0.1:64583/.well-known/loom.json",
+          "allow_insecure_http": true,
+          "allow_private_network": true,
+          "configured_policy": "trusted",
+          "policy": "trusted",
+          "trust_anchor_mode": "public_dns_webpki",
+          "trust_anchor_dns_name": "_loomfed.remote.test",
+          "trust_anchor_dns_record": "v=loomfed1;keyset=http://127.0.0.1:64583/.well-known/loom-keyset.json;digest=sha256:ae551426509a2e7c19ec16bec8fc3d1731a51c38a80f69642ebcccb9f1370c40;revocations=http://127.0.0.1:64583/.well-known/loom-revocations.json;trust_epoch=1;version=1",
+          "trust_anchor_keyset_url": "http://127.0.0.1:64583/.well-known/loom-keyset.json",
+          "trust_anchor_keyset_hash": "ae551426509a2e7c19ec16bec8fc3d1731a51c38a80f69642ebcccb9f1370c40",
+          "trust_anchor_keyset_version": 1,
+          "trust_anchor_epoch": 1,
+          "trust_anchor_verified_at": "2026-02-20T09:01:17.165Z",
+          "trust_anchor_revocations_url": "http://127.0.0.1:64583/.well-known/loom-revocations.json",
+          "revoked_key_ids": [],
+          "auto_policy": null,
+          "auto_policy_until": null,
+          "auto_policy_reason": null,
+          "challenge_required_until": null,
+          "challenge_reason": null,
+          "reputation_score": 0,
+          "created_at": "2026-02-20T09:01:17.165Z",
+          "updated_at": "2026-02-20T09:01:17.165Z"
+        },
+        "discovery": {
+          "node_document_url": "http://127.0.0.1:64583/.well-known/loom.json",
+          "fetched_at": "2026-02-20T09:01:17.165Z"
+        }
+      }
+    },
+    {
+      "name": "rotate_remote_trust_epoch_and_version",
+      "status": 200,
+      "ok": true,
+      "url": "http://127.0.0.1:64583/v1/federation/trust",
+      "response_body": {
+        "trust_anchor_mode": "public_dns_webpki",
+        "trust_anchor_fail_closed": true,
+        "trust_anchor_dns_txt_label": "_loomfed",
+        "trust_anchor_max_clock_skew_ms": 300000,
+        "trust_anchor_keyset_max_age_ms": 86400000,
+        "trust_anchor_keyset_publish_ttl_ms": 86400000,
+        "trust_anchor_bindings_count": 0,
+        "trust_epoch": 2,
+        "keyset_version": 2,
+        "revoked_key_ids": [],
+        "dns": {
+          "version": "loomfed1",
+          "dns_name": "_loomfed.remote.test",
+          "txt_record": "v=loomfed1;keyset=https://localhost/.well-known/loom-keyset.json;digest=sha256:b02eaf07bf31ded08fdeee8b10f90a10d7c14235313dd35bc06c9cd5ca1b07b3;revocations=https://localhost/.well-known/loom-revocations.json;trust_epoch=2;version=2",
+          "trust_epoch": 2,
+          "keyset_version": 2,
+          "keyset_url": "https://localhost/.well-known/loom-keyset.json",
+          "revocations_url": "https://localhost/.well-known/loom-revocations.json",
+          "generated_at": "2026-02-20T09:01:17.167Z"
+        }
+      }
+    },
+    {
+      "name": "trigger_one_revalidation_cycle",
+      "status": 200,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/federation/nodes/revalidate",
+      "response_body": {
+        "requested_count": 1,
+        "attempted_count": 1,
+        "revalidated_count": 1,
+        "skipped_count": 0,
+        "failed_count": 0,
+        "processed": [
+          {
+            "node_id": "remote.test",
+            "status": "revalidated",
+            "node": {
+              "node_id": "remote.test",
+              "key_id": "k_node_sign_remote_jdk0y0t5",
+              "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAaIqa3zJBETFgFAFnUCFOt0c/2d7mhDAjwD6KFYQxJOw=\n-----END PUBLIC KEY-----",
+              "signing_keys": [
+                {
+                  "key_id": "k_node_sign_remote_jdk0y0t5",
+                  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAaIqa3zJBETFgFAFnUCFOt0c/2d7mhDAjwD6KFYQxJOw=\n-----END PUBLIC KEY-----",
+                  "status": "active",
+                  "not_before": null,
+                  "not_after": null,
+                  "revoked_at": null
+                }
+              ],
+              "deliver_url": "http://127.0.0.1:64583/v1/federation/deliver",
+              "identity_resolve_url": "http://127.0.0.1:64583/v1/identity/{identity}",
+              "node_document_url": "http://127.0.0.1:64583/.well-known/loom.json",
+              "allow_insecure_http": true,
+              "allow_private_network": true,
+              "configured_policy": "trusted",
+              "policy": "trusted",
+              "trust_anchor_mode": "public_dns_webpki",
+              "trust_anchor_dns_name": "_loomfed.remote.test",
+              "trust_anchor_dns_record": "v=loomfed1;keyset=http://127.0.0.1:64583/.well-known/loom-keyset.json;digest=sha256:2e4a51ad1fe61491bca0e0f7e6454846140d2b2e9c90564ae6c6b8a1b6f0ec6b;revocations=http://127.0.0.1:64583/.well-known/loom-revocations.json;trust_epoch=2;version=2",
+              "trust_anchor_keyset_url": "http://127.0.0.1:64583/.well-known/loom-keyset.json",
+              "trust_anchor_keyset_hash": "2e4a51ad1fe61491bca0e0f7e6454846140d2b2e9c90564ae6c6b8a1b6f0ec6b",
+              "trust_anchor_keyset_version": 2,
+              "trust_anchor_epoch": 2,
+              "trust_anchor_verified_at": "2026-02-20T09:01:17.172Z",
+              "trust_anchor_revocations_url": "http://127.0.0.1:64583/.well-known/loom-revocations.json",
+              "revoked_key_ids": [],
+              "auto_policy": null,
+              "auto_policy_until": null,
+              "auto_policy_reason": null,
+              "challenge_required_until": null,
+              "challenge_reason": null,
+              "reputation_score": 0,
+              "created_at": "2026-02-20T09:01:17.165Z",
+              "updated_at": "2026-02-20T09:01:17.173Z"
+            },
+            "previous": {
+              "trust_epoch": 1,
+              "keyset_version": 1,
+              "keyset_hash": "ae551426509a2e7c19ec16bec8fc3d1731a51c38a80f69642ebcccb9f1370c40"
+            },
+            "next": {
+              "trust_epoch": 2,
+              "keyset_version": 2,
+              "keyset_hash": "2e4a51ad1fe61491bca0e0f7e6454846140d2b2e9c90564ae6c6b8a1b6f0ec6b"
+            },
+            "discovery": {
+              "node_document_url": "http://127.0.0.1:64583/.well-known/loom.json",
+              "fetched_at": "2026-02-20T09:01:17.173Z"
+            }
+          }
+        ],
+        "skipped": [],
+        "failed": []
+      }
+    },
+    {
+      "name": "list_local_federation_nodes_after_revalidation",
+      "status": 200,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/federation/nodes",
+      "response_body": {
+        "nodes": [
+          {
+            "node_id": "remote.test",
+            "key_id": "k_node_sign_remote_jdk0y0t5",
+            "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAaIqa3zJBETFgFAFnUCFOt0c/2d7mhDAjwD6KFYQxJOw=\n-----END PUBLIC KEY-----",
+            "signing_keys": [
+              {
+                "key_id": "k_node_sign_remote_jdk0y0t5",
+                "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAaIqa3zJBETFgFAFnUCFOt0c/2d7mhDAjwD6KFYQxJOw=\n-----END PUBLIC KEY-----",
+                "status": "active",
+                "not_before": null,
+                "not_after": null,
+                "revoked_at": null
+              }
+            ],
+            "deliver_url": "http://127.0.0.1:64583/v1/federation/deliver",
+            "identity_resolve_url": "http://127.0.0.1:64583/v1/identity/{identity}",
+            "node_document_url": "http://127.0.0.1:64583/.well-known/loom.json",
+            "allow_insecure_http": true,
+            "allow_private_network": true,
+            "configured_policy": "trusted",
+            "policy": "trusted",
+            "trust_anchor_mode": "public_dns_webpki",
+            "trust_anchor_dns_name": "_loomfed.remote.test",
+            "trust_anchor_dns_record": "v=loomfed1;keyset=http://127.0.0.1:64583/.well-known/loom-keyset.json;digest=sha256:2e4a51ad1fe61491bca0e0f7e6454846140d2b2e9c90564ae6c6b8a1b6f0ec6b;revocations=http://127.0.0.1:64583/.well-known/loom-revocations.json;trust_epoch=2;version=2",
+            "trust_anchor_keyset_url": "http://127.0.0.1:64583/.well-known/loom-keyset.json",
+            "trust_anchor_keyset_hash": "2e4a51ad1fe61491bca0e0f7e6454846140d2b2e9c90564ae6c6b8a1b6f0ec6b",
+            "trust_anchor_keyset_version": 2,
+            "trust_anchor_epoch": 2,
+            "trust_anchor_verified_at": "2026-02-20T09:01:17.172Z",
+            "trust_anchor_revocations_url": "http://127.0.0.1:64583/.well-known/loom-revocations.json",
+            "revoked_key_ids": [],
+            "auto_policy": null,
+            "auto_policy_until": null,
+            "auto_policy_reason": null,
+            "challenge_required_until": null,
+            "challenge_reason": null,
+            "reputation_score": 0,
+            "created_at": "2026-02-20T09:01:17.165Z",
+            "updated_at": "2026-02-20T09:01:17.173Z"
+          }
+        ]
+      }
+    },
+    {
+      "name": "deliver_with_stale_trust_epoch_header",
+      "status": 401,
+      "ok": false,
+      "url": "http://127.0.0.1:64584/v1/federation/deliver",
+      "response_body": {
+        "error": {
+          "code": "SIGNATURE_INVALID",
+          "message": "Federation request trust epoch is stale",
+          "details": {
+            "node_id": "remote.test",
+            "expected_epoch": 2,
+            "request_epoch": 1
+          },
+          "request_id": "req_e715e9eb-c8cb-48ad-9812-6dd2c0156e98",
+          "timestamp": "2026-02-20T09:01:17.176Z"
+        }
+      }
+    },
+    {
+      "name": "deliver_with_fresh_trust_epoch_header",
+      "status": 202,
+      "ok": true,
+      "url": "http://127.0.0.1:64584/v1/federation/deliver",
+      "response_body": {
+        "sender_node": "remote.test",
+        "accepted_count": 1,
+        "rejected_count": 0,
+        "accepted_envelope_ids": [
+          "env_01KHX4GBZPYZCP0BWQK93PR049"
+        ],
+        "receipt": {
+          "loom": "1.1",
+          "type": "federation.delivery.receipt@v1",
+          "delivery_id": "fdel_01KHX4GBZWMNA5YQY7A3ZGZC58",
+          "sender_node": "local.test",
+          "recipient_node": "remote.test",
+          "status": "accepted",
+          "accepted_count": 1,
+          "accepted_envelope_ids": [
+            "env_01KHX4GBZPYZCP0BWQK93PR049"
+          ],
+          "timestamp": "2026-02-20T09:01:17.180Z",
+          "signature": {
+            "algorithm": "Ed25519",
+            "key_id": "k_node_sign_local_1",
+            "value": "RyEYWkcBszCC61Nwrdfx1rVW1aSExW7N_-lm_agfe3gbVHn-zAwTPsXwxYGxeeGvDzXWbs6tu_PWBbFHXrp6Dw"
+          }
+        }
+      }
+    }
+  ],
+  "remote_base_url": "http://127.0.0.1:64583",
+  "local_base_url": "http://127.0.0.1:64584",
+  "assertions": {
+    "bootstrap_epoch": 1,
+    "bootstrap_keyset_version": 1,
+    "rotated_epoch": 2,
+    "rotated_keyset_version": 2,
+    "revalidation_previous_epoch": 1,
+    "revalidation_next_epoch": 2,
+    "revalidation_previous_keyset_version": 1,
+    "revalidation_next_keyset_version": 2,
+    "stale_epoch_delivery_rejected": true,
+    "fresh_epoch_delivery_accepted": true
+  },
+  "finished_at": "2026-02-20T09:01:17.180Z"
+}

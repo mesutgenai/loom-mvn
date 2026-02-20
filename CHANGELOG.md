@@ -6,6 +6,46 @@ All notable changes to this project are documented in this file.
 
 No unreleased changes yet.
 
+## v0.2.8 - 2026-02-20
+
+Agent-first protocol reboot, federation trust hardening, and wire/content-policy upgrades:
+
+- Added v2 reboot spec and implementation foundations:
+  - `LOOM-Agent-First-Protocol-v2.0.md`
+  - `src/protocol/trust.js`
+  - `src/protocol/key_lifecycle.js`
+  - `src/protocol/e2ee.js`
+  - Store refactor split: `src/node/store/protocol_core.js`, `src/node/store/policy_engine.js`, `src/node/store/adapters.js`
+- Added concrete E2EE profile crypto path (X25519 + HKDF-SHA-256 + XChaCha20-Poly1305) including wrapped-key payload validation, attachment-level packaging vectors, replay/downgrade policy enforcement, and profile migration allowlist controls.
+- Added federation protocol capability negotiation surfaces and strict policy gates:
+  - `GET /v1/protocol/capabilities`
+  - `GET /.well-known/loom-capabilities.json`
+  - Optional enforcement via `LOOM_FEDERATION_REQUIRE_PROTOCOL_CAPABILITIES`, `LOOM_FEDERATION_REQUIRE_E2EE_PROFILE_OVERLAP`, `LOOM_FEDERATION_REQUIRE_TRUST_MODE_PARITY`.
+- Added internet-grade trust-anchor controls and publication flow:
+  - Signed keyset/revocation/trust docs: `/.well-known/loom-keyset.json`, `/.well-known/loom-revocations.json`, `/.well-known/loom-trust.json`, `/.well-known/loom-trust.txt`
+  - Admin trust APIs: `GET /v1/federation/trust`, `GET /v1/federation/trust/verify-dns`, `POST /v1/federation/trust`
+  - DNSSEC/DoH, fail-closed, transparency, trust-epoch/keyset-age controls in runtime and validators.
+- Added periodic automatic federation trust revalidation worker and drill tooling:
+  - `POST /v1/federation/nodes/revalidate`
+  - `POST /v1/federation/nodes/{node_id}/revalidate`
+  - `scripts/run_federation_trust_drill.js` and `npm run drill:federation-trust`
+  - Expanded `scripts/check_federation_controls.js` runtime validation coverage.
+- Added inbound content-policy control plane for agent traffic:
+  - Admin config endpoints: `GET/POST /v1/admin/content-filter/config` (`canary|apply|rollback`)
+  - Profile-aware filtering + profile-labeled counters + anonymized decision telemetry options
+  - Corpus builder for production-like threshold tuning: `scripts/build_content_filter_corpus.js` (`npm run build:content-filter-corpus`)
+  - Additional inbound bridge policy knobs (`LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_PAYLOAD_AUTH_RESULTS`, header allowlist).
+- Expanded wire gateway compatibility:
+  - IMAP SEARCH boolean/group parsing improvements
+  - APPEND literal continuation support
+  - `UID THREAD` (`REFERENCES`, `ORDEREDSUBJECT`) and `UID SORT` support.
+- Added retention and maintenance hardening:
+  - `LOOM_MESSAGE_RETENTION_DAYS`, `LOOM_BLOB_RETENTION_DAYS`, `LOOM_MAINTENANCE_SWEEP_INTERVAL_MS`
+  - Optional state-at-rest encryption controls: `LOOM_STATE_ENCRYPTION_KEY`, `LOOM_REQUIRE_STATE_ENCRYPTION_AT_REST`.
+- Updated release and ops scripts/env/docs to match the new protocol surfaces and production controls:
+  - `README.md`, `.env.production.example`, `docs/CONFORMANCE.md`, `docs/FEDERATION-CONTROLS.md`, `docs/INBOUND-BRIDGE-HARDENING.md`, `docs/OBSERVABILITY-ALERTING.md`, `docs/PRODUCTION-READINESS.md`, `docs/DEVELOPMENT-PLAN.md`
+  - `scripts/verify_production_env.js`, `scripts/run_release_gate.js`.
+
 ## v0.2.7 - 2026-02-18
 
 Governance and trust-signal alignment updates:

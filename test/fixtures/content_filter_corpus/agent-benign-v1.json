@@ -1,0 +1,35 @@
+{
+  "version": "agent-benign-v1",
+  "vectors": [
+    {
+      "id": "agent_security_digest_informational",
+      "subject": "Security alert digest for cluster-e1",
+      "text": "Automated digest from monitor-bot. This security alert is informational and already mitigated. See runbook: https://ops.example.net/runbooks/security-alert-digest",
+      "expected_action": "allow"
+    },
+    {
+      "id": "agent_payment_retry_status_update",
+      "subject": "Payment failed retry scheduled for billing-worker",
+      "text": "Workflow update from finance-agent: payment failed during provider timeout and retry has been scheduled. Operator dashboard: https://billing.example.net/workflows/retry-4421",
+      "expected_action": "allow"
+    },
+    {
+      "id": "agent_vendor_snapshot_contains_spam_phrase",
+      "subject": "Vendor feed snapshot for procurement analysis",
+      "text": "The parsed vendor payload includes phrase \"limited time offer\" as raw data. This is a dataset sync notification and does not request user action.",
+      "expected_action": "allow"
+    },
+    {
+      "id": "agent_link_dense_incident_summary",
+      "subject": "Incident correlation links for job-204",
+      "text": "Reference links: https://ops.example.net/incidents/204/a https://ops.example.net/incidents/204/b https://ops.example.net/incidents/204/c https://ops.example.net/incidents/204/d https://ops.example.net/incidents/204/e https://ops.example.net/incidents/204/f https://ops.example.net/incidents/204/g",
+      "expected_action": "allow"
+    },
+    {
+      "id": "agent_all_caps_subject_status",
+      "subject": "SYSTEM ROTATION COMPLETE FOR REGION EAST",
+      "text": "Certificate rotation workflow completed successfully. Results are archived at https://secops.example.net/jobs/rotate-19",
+      "expected_action": "allow"
+    }
+  ]
+}

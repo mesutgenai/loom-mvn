@@ -1,0 +1,40 @@
+{
+  "spec": "loom.canonical-json.v1",
+  "vectors": [
+    {
+      "id": "sorts-object-keys-recursively",
+      "input": {
+        "z": 1,
+        "a": {
+          "y": true,
+          "b": [
+            3,
+            2,
+            1
+          ]
+        }
+      },
+      "expected": "{\"a\":{\"b\":[3,2,1],\"y\":true},\"z\":1}"
+    },
+    {
+      "id": "preserves-array-order-and-number-normalization",
+      "input": {
+        "n": -0,
+        "list": [
+          "x",
+          1.5,
+          false,
+          null
+        ]
+      },
+      "expected": "{\"list\":[\"x\",1.5,false,null],\"n\":0}"
+    },
+    {
+      "id": "rejects-lone-surrogates",
+      "input": {
+        "bad": "\ud800"
+      },
+      "expected_error": "unpaired surrogate"
+    }
+  ]
+}

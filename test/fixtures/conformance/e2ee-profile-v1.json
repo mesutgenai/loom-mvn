@@ -1,0 +1,122 @@
+{
+  "spec": "loom.e2ee.profile.v1",
+  "vectors": [
+    {
+      "id": "accepts-legacy-alias-profile",
+      "content": {
+        "encrypted": true,
+        "profile": "loom-e2ee-1",
+        "epoch": 0,
+        "ciphertext": "YWJj",
+        "wrapped_keys": [
+          {
+            "to": "loom://bob@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_bob_agents_1",
+            "ciphertext": "ZGVm"
+          }
+        ]
+      },
+      "expected_valid": true
+    },
+    {
+      "id": "rejects-plaintext-human-layer",
+      "content": {
+        "encrypted": true,
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 0,
+        "ciphertext": "YWJj",
+        "wrapped_keys": [
+          {
+            "to": "loom://bob@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_bob_agents_1",
+            "ciphertext": "ZGVm"
+          }
+        ],
+        "human": {
+          "text": "should not be present"
+        }
+      },
+      "expected_error_field": "content.human"
+    },
+    {
+      "id": "rejects-missing-wrapped-keys",
+      "content": {
+        "encrypted": true,
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 0,
+        "ciphertext": "YWJj"
+      },
+      "expected_error_field": "content.wrapped_keys"
+    },
+    {
+      "id": "accepts-replay-metadata-when-enforced",
+      "options": {
+        "enforceReplayMetadata": true
+      },
+      "content": {
+        "encrypted": true,
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 0,
+        "replay_counter": 0,
+        "profile_commitment": "S71PQ_ArVJgYnAHQZQN4-_lxsMEC6vKezDQ_DIcynH0",
+        "ciphertext": "YWJj",
+        "wrapped_keys": [
+          {
+            "to": "loom://bob@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_bob_agents_1",
+            "ciphertext": "ZGVm"
+          }
+        ]
+      },
+      "expected_valid": true
+    },
+    {
+      "id": "rejects-missing-replay-counter-when-enforced",
+      "options": {
+        "enforceReplayMetadata": true
+      },
+      "content": {
+        "encrypted": true,
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 0,
+        "profile_commitment": "S71PQ_ArVJgYnAHQZQN4-_lxsMEC6vKezDQ_DIcynH0",
+        "ciphertext": "YWJj",
+        "wrapped_keys": [
+          {
+            "to": "loom://bob@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_bob_agents_1",
+            "ciphertext": "ZGVm"
+          }
+        ]
+      },
+      "expected_error_field": "content.replay_counter"
+    },
+    {
+      "id": "rejects-profile-commitment-mismatch-when-enforced",
+      "options": {
+        "enforceReplayMetadata": true
+      },
+      "content": {
+        "encrypted": true,
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 0,
+        "replay_counter": 0,
+        "profile_commitment": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "ciphertext": "YWJj",
+        "wrapped_keys": [
+          {
+            "to": "loom://bob@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_bob_agents_1",
+            "ciphertext": "ZGVm"
+          }
+        ]
+      },
+      "expected_error_field": "content.profile_commitment"
+    }
+  ]
+}

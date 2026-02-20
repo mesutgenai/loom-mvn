@@ -1,0 +1,1082 @@
+Evaluation of mesutgenai/loom-mvn as an AgentOriented “Email Protocol” Replacement
+Executive summary
+Enabled connectors used: GitHub
+
+1
+
+(repository contents, including specs and source code)
+
+Verdict: Needs work — promising as an “agent-email” foundation inside controlled environments (single org,
+consortium, or curated federation), but not yet suitable as a general-purpose, Internet-replacement “new email
+protocol for agents” without substantial protocol hardening, interoperability work, and security/privacy controls.
+
+Why this is the verdict
+The repository implements a coherent “email-like” model for agents (threads, participants, attachments,
+receipts, store-and-forward outboxes, gateways to SMTP/IMAP) and adds agent-centric primitives
+(delegation chains, capability tokens, signed delivery wrappers). The design is conceptually aligned with
+“agent email” and meaningfully improves on classic email’s weak end-to-end authenticity and authorization
+model.
+At the same time, the current solution is not a drop-in replacement for the global email ecosystem (SMTP/
+IMAP/POP3, RFC 5322 message model, operational anti-abuse expectations), and it does not yet match the
+maturity of existing agent messaging protocols (e.g., DIDComm’s identity/key model and encryption
+packaging, ActivityPub’s federation semantics, and the long-standing ACL performative/message semantics
+in FIPA specifications). In particular, the identity trust anchor + key lifecycle, strong security posture
+under federation and bridging, and interoperability conformance remain under-specified or rely on
+assumptions that are plausible in private deployments but fragile at Internet scale.
+
+Top five prioritized recommendations
+Establish a trust anchor and key lifecycle policy (rotation, revocation, persistence, and auditability)
+(effort: High).
+The node’s federation keys and system keys are central to identity signatures, receipts, and wrapper
+signatures; a “new email protocol” must have a crisp trust model comparable to “DNS + WebPKI + DKIM/
+SPF/DMARC” in email. The RFC ecosystem for email authentication exists precisely because authentication
+and replay/impersonation are hard at scale. 2
+Publish canonical test vectors and conformance tests for signing/canonicalization across languages
+(effort: Medium).
+You already implement a canonical JSON strategy and Ed25519 signatures, but interoperability only holds if
+independent implementations produce identical bytes for signatures. Canonical JSON has a formal standard
+(RFC 8785) and should be validated with test vectors. 3
+
+1
+
+Complete (or explicitly defer) end-to-end encryption profiles and key agreement semantics (effort:
+High).
+If the goal is an “email-like” protocol for agents, confidentiality and forward secrecy are essential
+expectations (especially for autonomous agents that may exchange sensitive tool outputs). DIDComm is a
+useful reference point for packaging and crypto negotiations. 4
+Harden the email bridging + gateway boundary to avoid “email-smuggling” risks and semantics drift
+(effort: High).
+The system parses RFC 822/5322-ish text and maps it into LOOM threads and envelopes. Internet email
+message format and delivery rules are complex (header folding, multipart MIME, DSNs, idiosyncratic client
+behavior), and partial support can become a security and reliability liability. 5
+Operationalize scalability and abuse resistance beyond “MVP node” assumptions (effort: Medium–
+High).
+A new “agent email” network will be attacked: spam, credential stuffing, federation abuse, and resource
+exhaustion. Email’s history is instructive: SMTP became spam-prone without authentication and policy
+layers; modern deployments depend heavily on abuse mitigation. 6
+
+Repository scope and goals with assumptions
+What the project is building
+The repository positions LOOM MVN (Minimum Viable Node) as a reference implementation of a signed,
+federated, email-like messaging layer for humans and agents. The repo contains: - A LOOM protocol
+specification ( LOOM-Protocol-Spec-v1.1.md ) and earlier design/spec docs. - A node implementation
+with
+
+in-memory
+
+state
+
+plus
+
+persistence
+
+options
+
+( src/node/store.js ,
+
+src/node/
+
+persistence_postgres.js ). - A federation subsystem (signed HTTP delivery, node bootstrap via
+/.well-known/loom.json , remote identity resolution, receipts, abuse policies). - Bridging/gateways: SMTP/IMAP “wire gateway” ( src/node/wire_gateway.js ) to support legacy email clients and
+workflows. - Email relay integration ( src/node/email_relay.js ) to send outbound mail via SMTP
+providers and optionally DKIM-sign. - Inbound email ingestion into LOOM envelopes (bridge logic inside
+src/node/store.js ).
+
+Evidence from repository artifacts
+Protocol-as-code orientation. The LOOM envelope model is enforced in code: - Envelope validation and
+schema checks: src/protocol/envelope.js . - Canonical JSON canonicalization: src/protocol/
+canonical.js . - Sign/verify operations referenced by the node store: src/node/store.js imports
+signEnvelope , verifyEnvelopeSignature , etc.
+Threaded “email-like” semantics. The node uses a thread DAG with ordered envelopes, mailbox state
+(seen/flagged/archived/deleted), and IMAP folder mapping (INBOX/Sent/Archive/Spam/Trash/Quarantine/
+Drafts). This is implemented in src/node/store.js and surfaced through the IMAP gateway ( src/
+node/wire_gateway.js ).
+
+2
+
+Federation and identity resolution. The node stores “known nodes” and can bootstrap them via a
+.well-known document, then uses those node keys to verify remote identity documents and delivery
+receipts: - Federation request signing/verifying is done via canonical strings built from method/path/bodyhash/timestamp/nonce, with replay protection at the nonce-cache layer ( src/node/store.js ). - Node
+documents include deliver_url and identity_resolve_url , plus federation signing keys ( src/
+node/store.js ).
+
+Unstated or loosely stated assumptions
+These choices are reasonable for a reference node, but they are important assumptions if this becomes
+“agent email” infrastructure:
+Assumption about identity namespace. The code treats identities as loom://<email-like> URIs and
+extracts the “domain” after @ to determine federation authority ( parseLoomIdentityDomain and
+assertFederatedEnvelopeIdentityAuthority in src/node/store.js ). That effectively assumes: identities are globally unique and DNS-ish (domain-like), - a domain maps cleanly to a single authority node
+ID, and - the authority node is the correct trust anchor for identity keys.
+Assumption about time sync and replay windows. Federation freshness checks enforce a narrow
+timestamp window (±5 minutes) and nonce replay detection ( verifyFederationRequest in src/node/
+store.js ). This presumes reliable clock sync (e.g., NTP) across nodes and stable request delivery latencies.
+Assumption about gateway parsing completeness. The SMTP gateway parses “RFC822-like” text via a
+minimal parser ( parseRfc822 in src/node/wire_gateway.js ). This assumes “good enough” parsing
+for real-world email, but Internet email and MIME are much more complex.
+
+7
+
+Assumption about inbound email authenticity signals. Email bridging relies on “Authentication-Results”
+style
+signals
+(SPF/DKIM/DMARC)
+supplied
+either
+in
+payload
+or
+headers
+( resolveBridgeInboundAuthResults
+/
+evaluateBridgeInboundAuthPolicy
+in
+src/node/
+store.js ). In real deployments, correctness depends heavily on upstream MTA configuration and trust
+boundaries.
+
+8
+
+Assumption about storage and privacy. The node stores full message bodies and attachments (base64) in
+state or persistence; there is no default “always encrypted at rest” posture in code. This matters in any
+regulated or sensitive environment.
+
+Architecture and data flows
+Components and responsibilities in the current repo
+The implementation coalesces into a few core components:
+Node store (“authoritative state machine”).
+src/node/store.js is the central state manager: identities (local + cached remote), keys, threads,
+envelopes, mailbox state, capabilities, delegations, outboxes (federation/email/webhook), and audit chain.
+
+3
+
+HTTP API server.
+src/node/server.js
+
+wires HTTP endpoints (e.g., identity registration/challenge, envelope ingest,
+
+thread views, federation deliver/challenge, bridge ingress/egress, metrics/status).
+Wire gateway (SMTP + IMAP).
+src/node/wire_gateway.js runs TCP servers speaking subset SMTP and IMAP commands and maps
+them to store operations ( store.submitGatewaySmtp , store.listGatewayImapMessages , mailbox
+state mutations).
+Persistence backends.
+- Disk snapshot + JSONL audit log (built into store.js ). - Postgres persistence adapter ( src/node/
+persistence_postgres.js )
+loadStateAndAudit ,
+
+referenced
+
+by
+
+store.persistenceAdapter
+
+with
+
+functions
+
+like
+
+persistSnapshotAndAudit , and distributed guards for rate limits/outbox
+
+claims.
+Email relay integration.
+src/node/email_relay.js sends outbound mail for bridged flows (and supports provider responses
+and DSN-like update ingestion via applyEmailOutboxDsnReport in store.js ).
+
+Mermaid diagram of major components
+flowchart LR
+subgraph Clients
+A1[LOOM-native agent/client\nHTTP + WS]
+A2[Legacy email client\nSMTP/IMAP]
+A3[Remote LOOM node\nFederation HTTP]
+A4[External mail infra\nSMTP relays/MX]
+end
+subgraph LoomNode["LOOM MVN Node"]
+S1[HTTP API server\nsrc/node/server.js]
+S2[Core store/state machine\nsrc/node/store.js]
+S3[Wire gateway\nSMTP+IMAP\nsrc/node/wire_gateway.js]
+S4[Email relay adapter\nsrc/node/email_relay.js]
+S5[Persistence adapter\nPostgres\nsrc/node/persistence_postgres.js]
+S6[Disk snapshot + audit log\nstate.json + audit.log.jsonl]
+end
+A1 -->|REST/WS| S1
+S1 --> S2
+A2 -->|SMTP submit| S3
+A2 -->|IMAP read/flags| S3
+S3 --> S2
+S2 -->|federation outbox| A3
+
+4
+
+A3 -->|/v1/federation/deliver| S1
+S2 -->|email outbox| S4
+S4 -->|SMTP| A4
+S2 <--> S5
+S2 <--> S6
+
+Architectural observations and issues
+Single massive “god object” store. src/node/store.js is a monolith spanning: - security checks
+(replay, SSRF protections, signature verification), - business logic (thread DAG, mailbox state), - protocol
+adapters (email header parsing, rendering outbound email), - persistence orchestration (flush queues,
+backup/restore), - outbox processing and retry policies.
+This makes the system easy to run as a single binary, but harder to maintain, test, and independently scale.
+For “agent email” infrastructure, you will likely want: - clear module boundaries (protocol core vs adapters vs
+policy engine), - stable interfaces, and - a test-driven conformance suite for each surface.
+
+Protocol design and standards alignment
+LOOM message format and delivery semantics (as implemented)
+Envelope structure and validation (core)
+The envelope is JSON with: - loom version, - IDs ( id , thread_id , parent_id ), - type (e.g.,
+message , thread_op ), - sender ( from.identity , from.key_id , from.type ), - recipients ( to[]
+with roles), - audience.mode ( thread vs recipients for BCC-like behavior), - content ( human +
+structured , optional encrypted flag), - attachments (LOOM blobs), - signature object ( algorithm ,
+key_id , value ).
+This
+
+is
+
+enforced
+
+in
+
+src/protocol/envelope.js
+
+and
+
+then
+
+checked
+
+again
+
+contextually
+
+in
+
+store.ingestEnvelope() : - signature verified before quotas/rate limits are charged (good anti-abuse
+ordering), - agent senders require delegation chain verification ( verifyDelegationChainOrThrow ), thread DAG is validated to avoid cycles ( validateThreadDag ), - BCC privacy is enforced through delivery
+wrappers.
+Concrete example of federation request signing canonical form (HTTP-level) in src/node/store.js :
+
+const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n$
+{nonce}`;
+const signature = signUtf8Message(this.federationSigningPrivateKeyPem,
+canonical);
+
+5
+
+Routing model
+• Within a node: envelopes are added to a thread; participants determine visibility.
+• Across nodes: federation relies on:
+• node discovery (default https://<node_id>/.well-known/loom.json ),
+• deliver_url (default https://<node_id>/v1/federation/deliver ),
+• remote identity resolution endpoint ( /v1/identity/{identity} by default),
+• signed federation requests and optional signed receipts.
+The routing assumption is “node_id ~ DNS domain”. This is conceptually email-like, but not equivalent to
+SMTP relaying semantics.
+Delivery semantics
+LOOM delivers envelopes by pushing batches to remote nodes and expecting a JSON receipt with accepted
+IDs. This resembles an application-layer “federation POST” rather than SMTP’s store-and-forward relay
+network. SMTP’s semantics, queueing, retries, and DSN behaviors are well-defined at the transport layer for
+email. 9
+LOOM does implement: - outbox retry with exponential backoff and max attempts
+( processFederationOutboxItem , markOutboxFailure in src/node/store.js ), - idempotency
+keys for certain actions (idempotency cache in store.js ), - signed delivery receipts when configured
+( createFederationDeliveryReceipt , verifyFederationDeliveryReceipt ).
+
+Compatibility vs SMTP/IMAP/POP3 and RFC 5322
+SMTP alignment
+The repository includes an SMTP server in
+
+src/node/wire_gateway.js
+
+implementing: - basic
+
+commands: EHLO/HELO, MAIL FROM, RCPT TO, DATA, RSET, QUIT, - AUTH mechanisms: PLAIN, LOGIN,
+XOAUTH2 (token-based), - STARTTLS upgrade support when TLS is enabled.
+SMTP itself is defined by RFC 5321, and authentication/authorization is typically provided by SASL + policy at
+deployment time. 10
+This gateway is pragmatic, but it is not a full SMTP MTA and doesn’t attempt to replicate SMTP’s relay
+ecosystem.
+IMAP alignment
+The IMAP server in src/node/wire_gateway.js advertises IMAP4rev1 capabilities and supports a
+partial set of commands: - CAPABILITY, LOGIN/AUTHENTICATE (PLAIN), LIST/LSUB, SELECT/EXAMINE, FETCH/UID FETCH, STORE/UID STORE, SEARCH/UID SEARCH, - MOVE (but explicitly not COPY), IDLE,
+EXPUNGE (as a no-op compatibility behavior), CLOSE/UNSELECT.
+IMAP is standardized (current revision IMAP4rev2 is RFC 9051). 11
+The implementation itself notes gaps (e.g., APPEND literal syntax unsupported; COPY unsupported;
+
+6
+
+“minimal parser does not implement boolean group operators” for search). These gaps matter for real
+clients.
+POP3
+There is no POP3 server in this repository. POP3 is defined in RFC 1939. 12
+If “email protocol for agents” must integrate broadly with legacy clients, POP3 absence is acceptable (many
+modern clients do IMAP), but it should be explicitly documented as out-of-scope.
+RFC 5322 message model
+The SMTP gateway parses messages using a simplified header/body split and basic header unfolding
+( parseRfc822 in wire_gateway.js ). True Internet Message Format is RFC 5322 and includes
+complexities (folding, structured header fields, MIME layering via other RFCs). 13
+This implies: - incomplete fidelity for multipart email, attachments, and internationalized headers, potential mis-threading due to partial Message-ID , References , In-Reply-To handling, - risk of
+“semantic drift” when round-tripping between LOOM and email.
+
+Compatibility vs agent messaging protocols (FIPA, ActivityPub, DIDComm)
+FIPA ACL
+FIPA ACL (Agent Communication Language) defines performative-based message semantics and content
+language negotiation (historically used in agent platforms). 14
+LOOM’s
+content.structured.intent
+resembles
+an
+“intent
+label”
+(e.g.,
+thread.add_participant@v1 , message.general@v1 ) but does not implement: - ACL performatives
+(request, inform, propose, etc.), - formal content language / ontology declarations, - conversation-id
+semantics as formalized in ACL frameworks.
+Practical implication: LOOM is not an ACL-compatible protocol; adapters would need to map LOOM intents +
+parameters to ACL performatives and vice versa (with inevitable information loss unless LOOM adds explicit
+ACL fields).
+ActivityPub
+ActivityPub is a W3C recommendation for decentralized social networking, built around Actors, Inbox/
+Outbox endpoints, and ActivityStreams objects. 15
+LOOM federation is structurally similar (server-to-server delivery, signed objects), but mismatch areas
+include: - ActivityPub’s Actor model and object vocabulary (JSON-LD / ActivityStreams) vs LOOM’s envelope +
+thread DAG, - ActivityPub’s standard endpoints and HTTP interaction patterns vs LOOM’s bespoke /v1/
+federation/deliver + receipts, - compatibility with the broader Fediverse tooling ecosystem.
+An adapter could exist, but LOOM is not a “subset of ActivityPub” and cannot interoperate without
+translation.
+
+7
+
+DIDComm
+DIDComm Messaging v2 provides an identity/key management model based on decentralized identifiers,
+plus message packing mechanisms (authenticated encryption, routing) intended for interoperable secure
+messaging. 4
+LOOM overlaps in spirit (cryptographic authenticity, agent-to-agent messaging), but key mismatches are: LOOM identity URIs are not DIDs; there is no DID resolution surface. - LOOM’s signing is envelope-level with
+node/identity keys, but E2E encryption profiles are not clearly implemented in the repository (beyond
+encrypted: false/true flags and placeholders). - DIDComm includes routing/mediators patterns;
+LOOM’s routing is federated HTTP between nodes.
+If “agent email protocol” requires modern secure messaging guarantees, DIDComm is a strong comparative
+bar: LOOM should either adopt DID-based identity resolution or clearly define an alternative trust anchor
+(e.g., DNS + WebPKI + signed node docs).
+
+Protocol flow diagrams
+Federation delivery flow
+
+sequenceDiagram
+participant NodeA as Sender node (A)
+participant NodeB as Recipient node (B)
+participant StoreA as Store(A)
+participant StoreB as Store(B)
+StoreA->>StoreA: Queue federation outbox\n(envelope_ids, deliver_url,
+attempts, next_attempt_at)
+Note over StoreA: Canonical wrapper JSON\nincludes envelopes[]
+NodeA->>NodeB: POST /v1/federation/deliver\nHeaders: x-loom-node, x-loomtimestamp,\n x-loom-nonce, x-loom-key-id, x-loom-signature\nBody: {loom,
+sender_node, delivery_id, envelopes[]}
+NodeB->>StoreB: verifyFederationRequest()\n(timestamps, nonce replay,
+signature)
+StoreB->>StoreB: For each envelope:\n- ensureFederatedSenderIdentity()\nverifyEnvelopeSignature()\n- ingestEnvelope()
+StoreB-->>NodeB: Build signed receipt\n(accepted ids, status)
+NodeB-->>NodeA: 200 OK {receipt, accepted_count,...}
+NodeA->>StoreA: Verify receipt (optional)\nMark outbox delivered or retry
+
+Email inbound bridge flow
+
+sequenceDiagram
+participant MTA as Upstream MTA / parser
+participant API as LOOM HTTP API
+participant Store as LoomStore
+
+8
+
+MTA->>API: POST /v1/bridge/email/inbound\n(payload headers/body/auth_results)
+API->>Store: createBridgeInboundEnvelope()
+Store->>Store: Evaluate auth_results:\nSPF/DKIM/DMARC policy\n(reject/
+quarantine)
+Store->>Store: Map to envelope:\nfrom = bridge://smtp_from\nthread_id via
+Message-ID/References\ncontent.human/text\nsign with system key
+Store-->>API: {envelope_id, thread_id, quarantined}
+API-->>MTA: 200 OK or 403 reject
+
+Security, privacy, and compliance evaluation
+Authentication and authorization
+Identity authentication (LOOM-native).
+The
+node
+implements
+a
+challenge-based
+createAuthChallenge({
+identity,
+key_id
+
+auth
+})
+
+for
+local
+issues
+a
+
+identities:
+nonce.
+
+-
+
+exchangeAuthToken({ identity, key_id, challenge_id, signature }) verifies the signature
+on the nonce and returns bearer access/refresh tokens. - Tokens are stored in memory with expirations
+( accessTokens , refreshTokens ) and used by gateways and HTTP routes.
+This is a coherent design for a reference node. Security posture depends on TLS and token protection (see
+below).
+Gateway authentication.
+SMTP and IMAP gateways authenticate via bearer token values embedded in SASL payloads (PLAIN/LOGIN/
+XOAUTH2). The gateway enforces: - “encryption required” if auth is enabled but insecure auth is not allowed,
+- STARTTLS gating (and refuses unsafe configurations), e.g.:
+
+if (this.enabled && this.requireAuth && !this.allowInsecureAuth && !
+this.tlsEnabled) {
+throw new Error("Refusing authenticated wire gateway without TLS; ...");
+}
+(from src/node/wire_gateway.js )
+
+Cryptography choices and issues
+Ed25519 signatures.
+The system uses Ed25519 as its signature algorithm (envelope signature objects indicate algorithm:
+"Ed25519" ). This is a modern choice with a standardized spec (RFC 8032).
+
+16
+
+Canonical JSON for signatures.
+Canonicalization is central to signature stability, and the repo includes a canonicalizer in src/protocol/
+
+9
+
+canonical.js . Canonical JSON has an RFC standard (RFC 8785) and should be treated as a strict
+interoperability contract.
+
+17
+
+Key format mismatch risk.
+In practice, the node identity documents and node documents in src/node/store.js expect keys in
+PEM form ( public_key_pem ). This is workable, but if any spec text or ecosystem expects base64url keys
+or JWK, you need a single canonical representation plus conversion rules.
+
+Replay protection, abuse mitigation, and SSRF controls
+Replay protection (federation).
+verifyFederationRequest enforces: - a timestamp freshness window, - a nonce cache keyed by
+nodeId:nonce , - optional distributed guard support through persistence adapter APIs.
+This is a solid baseline for HTTP-level replay protection.
+Rate limits and quotas.
+src/node/store.js implements: - per-identity request rate windows (default vs sensitive routes), envelope daily quota, - blob daily quota and byte quota, - federation inbound node/global rate windows.
+Spam/abuse mitigation.
+The store contains a federation abuse auto-policy engine: - counts failures per node over a window, escalates to “quarantine” or “deny” policies, - optionally requires a “challenge token” for nodes with elevated
+abuse signals.
+This is a strong direction, but it is not equivalent to decades of email anti-spam mechanisms (reputation
+networks, content filtering, domain authentication enforcement). Historically, SMTP required DKIM/SPF/
+DMARC layers to even begin resisting spoofing and spam. 2
+SSRF and outbound pinning controls.
+A notable positive: the store implements outbound URL checks and DNS pinning to reduce SSRF risk and
+metadata service access: - denylist includes common metadata hostnames and link-local metadata IPs, - can
+enforce host allowlists, - resolves DNS and rejects private/local targets unless explicitly allowed, - can reject
+redirects.
+This is a meaningful control for webhooks, federation bootstrap, and remote identity resolution.
+
+Privacy and data protection considerations
+Data stored includes message bodies, headers, and attachments. - Inbound mail bridge stores
+original_headers and auth_results in meta.bridge . - Attachments are stored in base64 in
+blobs. - Audit logs encode action payloads and can include trace IDs / request IDs.
+This has GDPR and general privacy implications: - retention policy requirements, - access control and audit
+access segregation, - right-to-erasure workflows, - encryption-at-rest expectations, - breach impact scope.
+
+10
+
+Email ecosystems often treat message content as highly sensitive. For compliance readiness (GDPR/industry
+standards), “at rest encryption + retention + deletion” policies should be explicit and testable.
+
+Threat model maturity
+The repository includes a threat model doc and a production readiness doc ( docs/THREAT-MODEL.md ,
+docs/PRODUCTION-READINESS.md ). This is a strong sign of deliberate engineering. However: - the
+inability to retrieve docs/RATE-LIMIT-POLICY.md via the connector (tooling block) means parts of
+operational policy documentation could not be directly verified here; conclusions rely on code-level rate
+limiting and quotas instead.
+
+Interoperability, performance, reliability, and maintainability
+Interoperability requirements and needed gateways/adapters
+Integration with existing email infrastructure
+To interoperate with classic email clients and MTAs, LOOM MVN currently offers: - SMTP submit + IMAP
+read/update via LoomWireGateway . - Outbound email relay support via email_relay path and email
+outbox
+processing.
+Inbound
+( createBridgeInboundEnvelope ).
+
+“email
+
+→
+
+LOOM”
+
+ingress
+
+via
+
+bridge
+
+However, the mapping is “best-effort” and not equivalent to full RFC 5322 + MIME fidelity.
+
+functions
+
+7
+
+Required adapters/gateways for full enterprise compatibility - A robust MIME parser/renderer
+(multipart/attachments) aligned with common MTAs and clients. - Optional POP3 gateway if required by
+legacy tooling. 12 - DKIM/SPF/DMARC enforcement integration (ideally at the MTA boundary), with clear
+trust model for Authentication-Results headers. 2
+Integration with agent frameworks
+To interoperate with agent ecosystems, you would likely need: - FIPA ACL adapter: map LOOM intent
+and parameters to ACL performatives and content languages.
+
+14
+
+- ActivityPub adapter: map LOOM
+
+threads/envelopes to ActivityStreams objects, define Actor mapping. 15 - DIDComm adapter or native
+DID support: DID-based identity resolution, encryption packaging, mediation/routing patterns. 4
+
+Performance, scalability, and reliability
+Current strengths - Outbox processing uses retries with exponential backoff and max attempts
+(federation/email/webhooks) in src/node/store.js . - There is a claim/lease mechanism for outbox
+items,
+
+with
+
+optional
+
+backing
+
+by
+
+persistence
+
+adapter
+
+( claimOutboxItemForProcessing ,
+
+releaseOutboxItemClaim ). - There are multiple quota levers: blob size/parts, fanout caps, envelope/day
+quotas, and outbox backpressure.
+Scaling risks - The in-memory maps in the store ( envelopesById , threadsById , blobsById , etc.)
+imply memory growth proportional to history unless retention/purging is implemented and enforced. -
+
+11
+
+Search is linear scan over envelopes for a participant ( searchEnvelopes ), which will not scale without
+indexing. - IMAP gateway truncates message lists to a bounded number (it frequently uses 1000 limits); this
+is pragmatic but will surprise clients expecting full mailbox access.
+Failure modes to plan for - Process restart: state persistence is optional; if misconfigured, key material and
+verification continuity can break. - Partial federation deliveries: receipts mark accepted/rejected; depending
+on require_signed_receipts , delivery can fail and retry even if remote accepted but receipt verify
+failed. - Bridge failures: inbound email auth results incorrect → reject/quarantine; either can cause message
+loss or “silent quarantine” backlog.
+
+Developer experience and maintainability
+Positives - The code demonstrates systematic error handling ( LoomError with codes/status). - Built-in
+operational hooks: audit chain, backup/restore, guard status, outbox stats, and webhook delivery flows.
+Key maintainability concern - src/node/store.js is an extremely large multi-domain module. This
+makes it difficult to: - unit test protocol logic independently from storage and adapters, - reason about
+security boundaries, - replace components (e.g., swap email parsing) without regression risk.
+CI/tests visibility - Repository issue/PR search returned no results via connector search. This limits
+evidence about active review workflows and test culture from issues/PRs alone. - The production readiness
+doc references additional artifacts, but only a subset was explicitly requested and retrievable in this
+analysis.
+
+Standards comparison tables and prioritized action plan
+Design vs standards/protocols comparison
+Area
+
+LOOM MVN design
+(repo)
+
+Standard
+baseline
+
+Primary gaps / mismatches
+
+Email
+transport
+
+SMTP submit gateway
+(subset) + HTTP
+federation
+
+SMTP (RFC
+5321)
+
+Not an SMTP relay network; gateway is
+“submit into LOOM,” not full mail
+transfer with MX semantics. 10
+
+Email message
+format
+
+Minimal RFC822
+parsing + LOOM JSON
+envelopes
+
+RFC 5322
+Internet
+Message
+Format
+
+MIME + header edge cases not
+covered; round-trip fidelity risks.
+
+Mail access
+
+IMAP subset with
+LOOM folder
+mapping
+
+IMAP4rev2 (RFC
+9051)
+
+COPY unsupported, literal APPEND
+unsupported, SEARCH limited; some
+IMAP behaviors are compatibility noops. 11
+
+POP3 access
+
+Not implemented
+
+POP3 (RFC
+1939)
+
+POP3 clients cannot interoperate
+without new gateway. 12
+
+12
+
+13
+
+Area
+
+LOOM MVN design
+(repo)
+
+Standard
+baseline
+
+Primary gaps / mismatches
+
+Email
+authenticity
+
+Inbound auth policy
+checks and optional
+DKIM in relay
+
+DKIM/SPF/
+DMARC
+
+Needs explicit trust boundary
+assumptions; policy alignment and
+reporting not fully evidenced in repo
+docs fetched here. 2
+
+Envelope
+signing
+
+Ed25519 signatures
+over canonical JSON
+
+Ed25519 (RFC
+8032) + JCS (RFC
+8785)
+
+Agent
+messaging
+semantics
+
+Intents + parameters
++ delegation chains
+
+FIPA ACL
+
+Lacks ACL performatives, content
+language/ontology negotiation. 14
+
+Federation
+model
+
+Node-to-node POST
+delivery + receipts
+
+ActivityPub
+
+Different object model and endpoint
+semantics; requires adapter for
+Fediverse interop. 15
+
+Secure
+messaging
+
+Signatures +
+(placeholder)
+encryption flags
+
+DIDComm v2
+
+No DID-based identity model; E2E
+encryption packaging not clearly
+complete. 4
+
+Strong direction; requires test vectors +
+cross-language canonicalization proof.
+18
+
+Missing or incomplete features for a “new email protocol for agents”
+Capability
+
+Status in repo
+
+Why it matters for “agent email”
+
+Explicit trust anchor
+(DNS/WebPKI/DID)
+
+Partially implicit (node_id/
+domain assumptions)
+
+Without a trustworthy root of identity
+and node keys, federation authenticity
+breaks under adversaries.
+
+Key rotation and
+revocation story
+
+Partial (key sets exist; revocation
+not clearly end-to-end)
+
+Long-lived messaging networks require
+rotation and revocation at scale.
+
+Not clearly complete (envelope
+has encrypted flag; no full
+
+Agents often exchange sensitive data;
+confidentiality is mandatory in many
+deployments.
+
+End-to-end encryption
+profile
+
+DIDComm-like packing)
+
+Full MIME fidelity
+
+Partial/minimal parsing/
+rendering
+
+Email clients and MTAs rely heavily on
+MIME; partial fidelity causes loss and
+parsing vulnerabilities.
+
+Comprehensive spam/
+content filtering
+
+Not present as full pipeline
+
+New messaging networks get spammed;
+email history shows transport-only
+defenses are insufficient. 19
+
+Federated reputation
+ecosystem
+
+Local heuristics, configurable
+policies
+
+Federation at scale needs shared signals
+and tooling similar to email reputation
+ecosystems.
+
+13
+
+Capability
+
+Status in repo
+
+Why it matters for “agent email”
+
+Multi-implementation
+interoperability suite
+
+Not evidenced
+
+A protocol only becomes “real” when
+multiple independent implementations
+interoperate reliably. 17
+
+Prioritized action plan with effort estimates
+Priority
+
+Action
+
+P0
+
+Define and
+implement the trust
+anchor for nodes
+and identities (DNS/
+WebPKI binding, or
+DID-based binding)
+
+P0
+
+Make node/system
+signing keys stable
+across restarts and
+define rotation/
+revocation
+
+Effort
+
+Rationale and concrete repo touchpoints
+
+High
+
+Federation and remote identity validation rely on node
+keys and node_id/domain assumptions
+( getNodeDocument ,
+verifyRemoteIdentityDocumentSignature ,
+bootstrapFederationNode ).
+
+initializeSystemSigningKeys() auto-generates
+High
+
+keys; production must load from secret manager and
+support rotation without breaking verification/audit.
+
+Publish
+P0
+
+P0
+
+canonicalization +
+signature test
+vectors and add
+conformance tests
+Harden email
+ingress/egress:
+robust MIME parsing,
+strict header
+handling, explicit
+trust boundary for
+AuthenticationResults
+
+Medium
+
+Canonical JSON and signatures are core; RFC 8785 and
+RFC 8032 style interoperability needs proof. 20
+
+createBridgeInboundEnvelope , parseRfc822 ,
+High
+
+outbound renderers and DSN updates depend on
+correct email semantics. 21
+
+Implement an E2E
+P1
+
+encryption profile
+(or explicitly scope it
+out) and key
+agreement model
+
+High
+
+“Agent email” often requires confidentiality; DIDComm
+provides reference packaging. 22
+
+Medium
+
+Improves maintainability/testability and reduces
+security regression risk.
+
+Separate store.js
+P1
+
+into modules: core
+protocol engine vs
+adapters vs policy
+
+14
+
+Priority
+
+Action
+
+Effort
+
+Rationale and concrete repo touchpoints
+
+P1
+
+Add durable
+indexing/search and
+retention controls
+
+Medium
+
+P1
+
+Expand IMAP
+compatibility or
+clearly brand as
+“subset gateway”
+with client
+compatibility matrix
+
+Medium
+
+Current IMAP subset will break some clients; align with
+RFC 9051 behaviors or document limitations. 11
+
+P2
+
+Add a standard
+adapter layer for
+ActivityPub/FIPA ACL
+mappings (optional)
+
+Medium
+
+Enables broader agent ecosystem adoption.
+
+P2
+
+Formalize compliance
+controls: retention,
+deletion, encryption
+at rest, audit access
+segregation
+
+Medium
+
+Needed for enterprise/GDPR readiness; current design
+stores headers, bodies, attachments, and audit
+payloads.
+
+searchEnvelopes is linear; state grows unbounded
+without retention policies.
+
+23
+
+File availability notes
+The user requested specific files. The following were not present or not retrievable in the repo evaluation:
+- server.js and store.js at repository root: not found (the implementation lives in src/node/
+server.js
+
+and
+
+src/node/store.js ). -
+
+persistence is in
+
+src/node/postgres_adapter.js : not found (Postgres
+
+src/node/persistence_postgres.js ). -
+
+docs/RATE-LIMIT-POLICY.md : tool
+
+retrieval was blocked in this environment during attempted fetch; analysis relied on code-level rate
+limiting and quotas in src/node/store.js instead.
+
+1
+
+6
+
+9
+
+10
+
+19
+
+https://www.rfc-editor.org/rfc/rfc5321.html
+
+https://www.rfc-editor.org/rfc/rfc5321.html
+2
+
+https://www.rfc-editor.org/rfc/rfc9051.html
+
+https://www.rfc-editor.org/rfc/rfc9051.html
+3
+
+17
+
+20
+
+https://www.rfc-editor.org/rfc/rfc8785
+
+https://www.rfc-editor.org/rfc/rfc8785
+
+https://posomas.isse.de/PosoMAS/aose.core.tech.common.base/guidances/concepts/
+agent_communication_language_3392A674.html
+4
+
+22
+
+https://posomas.isse.de/PosoMAS/aose.core.tech.common.base/guidances/concepts/
+agent_communication_language_3392A674.html
+5
+
+7
+
+13
+
+21
+
+https://www.rfc-editor.org/rfc/rfc5322
+
+https://www.rfc-editor.org/rfc/rfc5322
+
+15
+
+8
+
+https://www.rfc-editor.org/info/std76
+
+https://www.rfc-editor.org/info/std76
+11
+
+https://www.rfc-editor.org/info/rfc6376
+
+https://www.rfc-editor.org/info/rfc6376
+12
+
+https://www.w3.org/TR/activitypub/
+
+https://www.w3.org/TR/activitypub/
+14
+
+https://agent-skills.md/skills/cosmix/claude-loom/threat-model
+
+https://agent-skills.md/skills/cosmix/claude-loom/threat-model
+15
+
+23
+
+https://www.rfc-editor.org/rfc/rfc1939
+
+https://www.rfc-editor.org/rfc/rfc1939
+16
+
+18
+
+https://www.rfc-editor.org/rfc/rfc8032
+
+https://www.rfc-editor.org/rfc/rfc8032
+
+16
+
+

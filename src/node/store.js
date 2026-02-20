@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   appendFileSync,
@@ -13,29 +13,64 @@ import {
 } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { lookup } from "node:dns/promises";
+import { lookup, resolveTxt } from "node:dns/promises";
 import { isIP } from "node:net";
 import { join } from "node:path";
 
 import {
   derivePublicKeyPemFromPrivateKeyPem,
+  fromBase64Url,
   generateSigningKeyPair,
   signEnvelope,
   signUtf8Message,
-  verifyEnvelopeSignature,
+  toBase64Url,
   verifyUtf8MessageSignature
 } from "../protocol/crypto.js";
-import { validateEnvelopeOrThrow } from "../protocol/envelope.js";
 import { LoomError } from "../protocol/errors.js";
 import { canonicalizeEnvelope, canonicalizeJson } from "../protocol/canonical.js";
 import { canonicalThreadOrder, validateThreadDag } from "../protocol/thread.js";
 import { isIdentity, normalizeLoomIdentity } from "../protocol/ids.js";
 import { generateUlid } from "../protocol/ulid.js";
+import { verifyDelegationLinkOrThrow } from "../protocol/delegation.js";
+import { isSigningKeyUsableAt } from "../protocol/key_lifecycle.js";
 import {
-  verifyDelegationChainOrThrow,
-  verifyDelegationLinkOrThrow
-} from "../protocol/delegation.js";
+  listSupportedE2eeProfileCapabilities,
+  listSupportedE2eeProfiles,
+  resolveE2eeProfile
+} from "../protocol/e2ee.js";
+import {
+  parseLoomIdentityAuthority,
+  parseTrustAnchorBindings
+} from "../protocol/trust.js";
 import { parseBoolean } from "./env.js";
+import {
+  enforceThreadEnvelopeEncryptionPolicyCore,
+  getThreadEnvelopesCore,
+  ingestEnvelopeCore,
+  prepareThreadOperationCore,
+  resolveAuthoritativeEnvelopeSenderTypeCore,
+  resolveEnvelopeSignaturePublicKeyCore,
+  resolvePendingParentsForThreadCore
+} from "./store/protocol_core.js";
+import {
+  assertFederatedEnvelopeIdentityAuthorityPolicy,
+  enforceIdentityRateLimitPolicy,
+  isIdentitySensitiveRoutePolicy
+} from "./store/policy_engine.js";
+import {
+  buildRecipientListAdapter,
+  htmlToTextAdapter,
+  inferEmailFromIdentityAdapter,
+  inferIdentityFromAddressAdapter,
+  normalizeEmailAddressAdapter,
+  normalizeEmailAddressListAdapter,
+  parseMessageIdAdapter,
+  parseMessageIdListAdapter,
+  parseReferencesAdapter,
+  resolveHeaderValueAdapter,
+  resolveIdentitiesFromAddressInputAdapter,
+  splitAddressListAdapter
+} from "./store/adapters.js";
 
 function nowIso() {
   return new Date().toISOString();
@@ -58,6 +93,604 @@ function parsePositiveInteger(value, fallback) {
 function parseNonNegativeInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+const STATE_ENCRYPTION_NONCE_BYTES = 12;
+const STATE_ENCRYPTION_TAG_BYTES = 16;
+const STATE_ENCRYPTION_WRAPPER_TYPE = "loom.state.encrypted@v1";
+const STATE_ENCRYPTION_ALGORITHM = "aes-256-gcm";
+const DEFAULT_BRIDGE_INBOUND_HEADER_ALLOWLIST = [
+  "date",
+  "from",
+  "to",
+  "cc",
+  "bcc",
+  "subject",
+  "message-id",
+  "in-reply-to",
+  "references",
+  "reply-to",
+  "mime-version",
+  "content-type",
+  "content-transfer-encoding",
+  "authentication-results",
+  "x-authentication-results"
+];
+
+const E2EE_PROFILE_SECURITY_RANK = new Map([
+  ["loom-e2ee-x25519-xchacha20-v1", 100],
+  ["loom-e2ee-x25519-xchacha20-v2", 200]
+]);
+
+const CONTENT_FILTER_URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
+const CONTENT_FILTER_SHORTENER_HOSTS = new Set([
+  "bit.ly",
+  "tinyurl.com",
+  "t.co",
+  "goo.gl",
+  "is.gd",
+  "ow.ly",
+  "shorturl.at",
+  "rb.gy"
+]);
+const CONTENT_FILTER_MALWARE_EXTENSIONS = new Set([
+  "exe",
+  "scr",
+  "com",
+  "msi",
+  "ps1",
+  "vbs",
+  "js",
+  "jar",
+  "bat",
+  "cmd",
+  "hta",
+  "lnk",
+  "iso",
+  "img",
+  "docm",
+  "xlsm",
+  "pptm"
+]);
+const CONTENT_FILTER_ARCHIVE_EXTENSIONS = new Set(["zip", "rar", "7z", "tar", "gz"]);
+const CONTENT_FILTER_MALWARE_MIME_SNIPPETS = [
+  "application/x-msdownload",
+  "application/x-dosexec",
+  "application/x-ms-installer",
+  "application/x-sh",
+  "application/x-bat"
+];
+const CONTENT_FILTER_SPAM_KEYWORDS = [
+  "limited time offer",
+  "act now",
+  "urgent response",
+  "winner",
+  "lottery",
+  "free gift",
+  "risk free",
+  "guaranteed income",
+  "double your money",
+  "exclusive deal"
+];
+const CONTENT_FILTER_PHISH_KEYWORDS = [
+  "verify your account",
+  "confirm your password",
+  "account suspended",
+  "security alert",
+  "unusual activity",
+  "reset your password",
+  "payment failed",
+  "login required",
+  "click the link",
+  "update your billing"
+];
+const INBOUND_CONTENT_FILTER_DECISION_ACTIONS = Object.freeze(["allow", "quarantine", "reject"]);
+const INBOUND_CONTENT_FILTER_PROFILES = new Set(["strict", "balanced", "agent"]);
+const INBOUND_CONTENT_FILTER_CONFIG_MODES = new Set(["canary", "apply", "rollback"]);
+const INBOUND_CONTENT_FILTER_CONFIG_FIELDS = Object.freeze([
+  "enabled",
+  "reject_malware",
+  "spam_threshold",
+  "phish_threshold",
+  "quarantine_threshold",
+  "reject_threshold",
+  "profile_default",
+  "profile_bridge_email",
+  "profile_federation"
+]);
+const INBOUND_CONTENT_FILTER_PROFILE_CONFIG = Object.freeze({
+  strict: Object.freeze({
+    threshold_deltas: Object.freeze({
+      spam: -1,
+      phish: -1,
+      quarantine: -1,
+      reject: -1
+    }),
+    weights: Object.freeze({
+      keyword_spam: 1,
+      keyword_phish: 2,
+      keyword_phish_cluster: 3,
+      subject_all_caps: 2,
+      url_volume: 2,
+      url_shortener: 1,
+      url_punycode: 2,
+      url_ip_literal: 2,
+      attachment_archive_lure: 1,
+      auth_dmarc_not_pass: 2,
+      auth_dkim_not_pass: 1,
+      auth_spf_not_pass: 1
+    }),
+    clusters: Object.freeze({
+      spam_keyword_min: 3,
+      spam_keyword_weight: 2,
+      phish_keyword_min: 2,
+      phish_keyword_weight: 3
+    })
+  }),
+  balanced: Object.freeze({
+    threshold_deltas: Object.freeze({
+      spam: 0,
+      phish: 0,
+      quarantine: 0,
+      reject: 0
+    }),
+    weights: Object.freeze({
+      keyword_spam: 1,
+      keyword_phish: 2,
+      keyword_phish_cluster: 3,
+      subject_all_caps: 1,
+      url_volume: 1,
+      url_shortener: 1,
+      url_punycode: 2,
+      url_ip_literal: 2,
+      attachment_archive_lure: 1,
+      auth_dmarc_not_pass: 2,
+      auth_dkim_not_pass: 1,
+      auth_spf_not_pass: 1
+    }),
+    clusters: Object.freeze({
+      spam_keyword_min: 4,
+      spam_keyword_weight: 2,
+      phish_keyword_min: 3,
+      phish_keyword_weight: 3
+    })
+  }),
+  agent: Object.freeze({
+    threshold_deltas: Object.freeze({
+      spam: 2,
+      phish: 1,
+      quarantine: 2,
+      reject: 2
+    }),
+    weights: Object.freeze({
+      keyword_spam: 0,
+      keyword_phish: 1,
+      keyword_phish_cluster: 3,
+      subject_all_caps: 0,
+      url_volume: 0,
+      url_shortener: 1,
+      url_punycode: 2,
+      url_ip_literal: 2,
+      attachment_archive_lure: 1,
+      auth_dmarc_not_pass: 2,
+      auth_dkim_not_pass: 1,
+      auth_spf_not_pass: 1
+    }),
+    clusters: Object.freeze({
+      spam_keyword_min: 5,
+      spam_keyword_weight: 2,
+      phish_keyword_min: 3,
+      phish_keyword_weight: 3
+    })
+  })
+});
+
+function normalizeInboundContentFilterProfile(value, fallback = "balanced") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (INBOUND_CONTENT_FILTER_PROFILES.has(normalized)) {
+    return normalized;
+  }
+  const fallbackNormalized = String(fallback || "balanced")
+    .trim()
+    .toLowerCase();
+  return INBOUND_CONTENT_FILTER_PROFILES.has(fallbackNormalized) ? fallbackNormalized : "balanced";
+}
+
+function createInboundContentFilterProfileDecisionStats() {
+  return {
+    evaluated: 0,
+    allow: 0,
+    quarantine: 0,
+    reject: 0,
+    spam_labeled: 0
+  };
+}
+
+function createInboundContentFilterDecisionStatsByProfile() {
+  return {
+    strict: createInboundContentFilterProfileDecisionStats(),
+    balanced: createInboundContentFilterProfileDecisionStats(),
+    agent: createInboundContentFilterProfileDecisionStats()
+  };
+}
+
+function createInboundContentFilterStats() {
+  return {
+    evaluated: 0,
+    rejected: 0,
+    quarantined: 0,
+    spam_labeled: 0,
+    last_evaluated_at: null,
+    decision_counts_by_profile: createInboundContentFilterDecisionStatsByProfile()
+  };
+}
+
+function cloneInboundContentFilterConfig(config = {}) {
+  const quarantineThreshold = Math.max(1, Number(config?.quarantine_threshold || 1));
+  const rejectThreshold = Math.max(quarantineThreshold + 1, Number(config?.reject_threshold || quarantineThreshold + 1));
+  return {
+    enabled: config?.enabled === true,
+    reject_malware: config?.reject_malware === true,
+    spam_threshold: Math.max(1, Number(config?.spam_threshold || 1)),
+    phish_threshold: Math.max(1, Number(config?.phish_threshold || 1)),
+    quarantine_threshold: quarantineThreshold,
+    reject_threshold: rejectThreshold,
+    profile_default: normalizeInboundContentFilterProfile(config?.profile_default, "balanced"),
+    profile_bridge_email: normalizeInboundContentFilterProfile(
+      config?.profile_bridge_email,
+      normalizeInboundContentFilterProfile(config?.profile_default, "balanced")
+    ),
+    profile_federation: normalizeInboundContentFilterProfile(config?.profile_federation, "agent")
+  };
+}
+
+function areInboundContentFilterConfigsEqual(left = {}, right = {}) {
+  return INBOUND_CONTENT_FILTER_CONFIG_FIELDS.every((field) => left[field] === right[field]);
+}
+
+function cloneInboundContentFilterCanaryState(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  return {
+    canary_id: String(value.canary_id || "").trim() || null,
+    mode: "canary",
+    created_at:
+      typeof value.created_at === "string" && value.created_at.trim().length > 0
+        ? value.created_at.trim()
+        : null,
+    updated_at:
+      typeof value.updated_at === "string" && value.updated_at.trim().length > 0
+        ? value.updated_at.trim()
+        : null,
+    actor:
+      typeof value.actor === "string" && value.actor.trim().length > 0
+        ? value.actor.trim()
+        : "system",
+    note:
+      typeof value.note === "string" && value.note.trim().length > 0
+        ? value.note.trim().slice(0, 240)
+        : null,
+    config: cloneInboundContentFilterConfig(value.config || {})
+  };
+}
+
+function cloneInboundContentFilterRollbackState(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  return {
+    rollback_id: String(value.rollback_id || "").trim() || null,
+    from_version: Math.max(0, parseNonNegativeInteger(value.from_version, 0)),
+    source:
+      typeof value.source === "string" && value.source.trim().length > 0
+        ? value.source.trim()
+        : "unknown",
+    stored_at:
+      typeof value.stored_at === "string" && value.stored_at.trim().length > 0
+        ? value.stored_at.trim()
+        : null,
+    actor:
+      typeof value.actor === "string" && value.actor.trim().length > 0
+        ? value.actor.trim()
+        : "system",
+    config: cloneInboundContentFilterConfig(value.config || {})
+  };
+}
+
+function normalizeInboundContentFilterConfigMode(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return "canary";
+  }
+  return INBOUND_CONTENT_FILTER_CONFIG_MODES.has(normalized) ? normalized : null;
+}
+
+function parseInboundContentFilterBooleanField(value, field, fallback) {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number" && (value === 0 || value === 1)) {
+    return value === 1;
+  }
+
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on") {
+    return true;
+  }
+  if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off") {
+    return false;
+  }
+
+  throw new LoomError("ENVELOPE_INVALID", `${field} must be a boolean`, 400, {
+    field
+  });
+}
+
+function parseInboundContentFilterThresholdField(value, field, fallback) {
+  if (value === undefined) {
+    return fallback;
+  }
+  const parsed = parsePositiveInteger(value, Number.NaN);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new LoomError("ENVELOPE_INVALID", `${field} must be an integer >= 1`, 400, {
+      field
+    });
+  }
+  return parsed;
+}
+
+function parseInboundContentFilterProfileField(value, field, fallback) {
+  if (value === undefined) {
+    return fallback;
+  }
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    throw new LoomError("ENVELOPE_INVALID", `${field} must be a non-empty string`, 400, {
+      field
+    });
+  }
+  if (!INBOUND_CONTENT_FILTER_PROFILES.has(normalized)) {
+    throw new LoomError("ENVELOPE_INVALID", `${field} must be one of strict, balanced, agent`, 400, {
+      field
+    });
+  }
+  return normalized;
+}
+
+function hashInboundContentTelemetryValue(value, salt) {
+  const normalized = String(value || "");
+  if (!normalized) {
+    return null;
+  }
+  return createHash("sha256")
+    .update(`${String(salt || "")}:${normalized}`, "utf-8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function isIpv4Host(value) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(value || "").trim());
+}
+
+function normalizeUrlHost(value) {
+  try {
+    return new URL(String(value || "").trim()).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function extractContentUrls(value) {
+  const text = String(value || "");
+  const matches = text.match(CONTENT_FILTER_URL_RE) || [];
+  return Array.from(new Set(matches.map((entry) => String(entry || "").trim()).filter(Boolean)));
+}
+
+function normalizeAttachmentExtension(filename) {
+  const normalizedName = String(filename || "")
+    .trim()
+    .toLowerCase();
+  const index = normalizedName.lastIndexOf(".");
+  if (index < 0 || index === normalizedName.length - 1) {
+    return "";
+  }
+  return normalizedName.slice(index + 1);
+}
+
+function normalizeBridgeInboundHeaderAllowlist(value) {
+  const list = Array.isArray(value) ? value : String(value || "").split(/[,\n;]+/);
+  const normalized = Array.from(
+    new Set(
+      list
+        .map((entry) => String(entry || "").trim().toLowerCase())
+        .filter(Boolean)
+        .map((entry) => entry.replace(/:+$/, ""))
+    )
+  );
+  if (normalized.length === 0) {
+    return [...DEFAULT_BRIDGE_INBOUND_HEADER_ALLOWLIST];
+  }
+  return normalized;
+}
+
+function sanitizeBridgeInboundHeaders(headers, allowlist = DEFAULT_BRIDGE_INBOUND_HEADER_ALLOWLIST) {
+  if (!headers || typeof headers !== "object") {
+    return {};
+  }
+
+  const allowed = new Set(
+    (Array.isArray(allowlist) ? allowlist : DEFAULT_BRIDGE_INBOUND_HEADER_ALLOWLIST)
+      .map((entry) => String(entry || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const sanitized = {};
+  for (const [rawKey, rawValue] of Object.entries(headers)) {
+    const key = String(rawKey || "").trim();
+    if (!key || containsHeaderUnsafeChars(key)) {
+      continue;
+    }
+
+    const normalizedKey = key.toLowerCase();
+    if (allowed.size > 0 && !allowed.has(normalizedKey)) {
+      continue;
+    }
+
+    const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+    const normalizedValue = values
+      .map((entry) => String(entry == null ? "" : entry))
+      .map((entry) => entry.replace(/\0/g, "").trim())
+      .filter((entry) => entry.length > 0 && !containsHeaderUnsafeChars(entry))
+      .slice(0, 16)
+      .join(", ");
+    if (!normalizedValue) {
+      continue;
+    }
+    sanitized[key] = normalizedValue.slice(0, 8192);
+  }
+  return sanitized;
+}
+
+function normalizeE2eeProfileMigrationAllowlist(value) {
+  const entries = Array.isArray(value) ? value : String(value || "").split(/[,\n;]+/);
+  const normalized = new Set();
+  for (const rawEntry of entries) {
+    const entry = String(rawEntry || "").trim().toLowerCase();
+    if (!entry) {
+      continue;
+    }
+    const [fromProfile, toProfile] = entry.split(">", 2).map((part) => String(part || "").trim());
+    if (!fromProfile || !toProfile) {
+      continue;
+    }
+    const normalizedFrom = resolveE2eeProfile(fromProfile)?.id || fromProfile;
+    const normalizedTo = resolveE2eeProfile(toProfile)?.id || toProfile;
+    normalized.add(`${normalizedFrom.toLowerCase()}>${normalizedTo.toLowerCase()}`);
+  }
+  return normalized;
+}
+
+function normalizeStateEncryptionKey(value) {
+  if (value == null) {
+    return null;
+  }
+  const raw = String(value).trim();
+  if (!raw) {
+    return null;
+  }
+
+  let bytes = null;
+  if (/^[A-Fa-f0-9]{64}$/.test(raw)) {
+    bytes = Buffer.from(raw, "hex");
+  } else {
+    try {
+      bytes = fromBase64Url(raw);
+    } catch {}
+    if ((!bytes || bytes.length !== 32) && /^[A-Za-z0-9+/=_-]+$/.test(raw)) {
+      try {
+        bytes = Buffer.from(raw, "base64");
+      } catch {}
+    }
+  }
+
+  if (!bytes || bytes.length !== 32) {
+    throw new Error("stateEncryptionKey must decode to 32 bytes (base64url/base64/hex)");
+  }
+  return Buffer.from(bytes);
+}
+
+function normalizeProtocolCapabilityE2eeProfiles(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      value
+        .map((entry) => {
+          const normalize = (candidate) => {
+            const raw = String(candidate || "").trim();
+            if (!raw) {
+              return "";
+            }
+            const resolved = resolveE2eeProfile(raw);
+            return resolved?.id || raw;
+          };
+          if (typeof entry === "string") {
+            return normalize(entry);
+          }
+          if (entry && typeof entry === "object") {
+            return normalize(entry.id);
+          }
+          return "";
+        })
+        .filter(Boolean)
+    )
+  );
+}
+
+function normalizeProtocolCapabilityTrustModes(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      value
+        .map((entry) => String(entry || "").trim().toLowerCase())
+        .filter((entry) => FEDERATION_TRUST_MODES.has(entry))
+    )
+  );
+}
+
+function normalizeProtocolCapabilitiesDocument(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const negotiation = value.federation_negotiation && typeof value.federation_negotiation === "object"
+    ? value.federation_negotiation
+    : {};
+  const trustAnchorMode = normalizeFederationTrustMode(negotiation.trust_anchor_mode, { hasTrustAnchors: false });
+  const trustModesSupported = normalizeProtocolCapabilityTrustModes(negotiation.trust_anchor_modes_supported);
+  const e2eeProfiles = normalizeProtocolCapabilityE2eeProfiles(negotiation.e2ee_profiles);
+
+  return {
+    loom_version: String(value.loom_version || "").trim() || null,
+    node_id: String(value.node_id || "").trim() || null,
+    generated_at: String(value.generated_at || "").trim() || null,
+    federation_negotiation: {
+      trust_anchor_mode: trustAnchorMode,
+      trust_anchor_modes_supported:
+        trustModesSupported.length > 0
+          ? trustModesSupported
+          : Array.from(new Set([trustAnchorMode].filter(Boolean))),
+      e2ee_profiles: e2eeProfiles
+    }
+  };
+}
+
+function intersectStrings(left = [], right = []) {
+  const rightSet = new Set((Array.isArray(right) ? right : []).map((value) => String(value || "").trim()));
+  return Array.from(
+    new Set(
+      (Array.isArray(left) ? left : [])
+        .map((value) => String(value || "").trim())
+        .filter((value) => value && rightSet.has(value))
+    )
+  );
 }
 
 function normalizeTraceField(value) {
@@ -587,6 +1220,93 @@ function normalizeFederationIdentityResolveUrl(value, options = {}) {
   return normalized.split(placeholderToken).join("{identity}");
 }
 
+function normalizeFederationNodeDocumentUrl(value, options = {}) {
+  if (value == null || String(value).trim().length === 0) {
+    return null;
+  }
+
+  let target;
+  try {
+    target = new URL(String(value));
+  } catch {
+    throw new LoomError("ENVELOPE_INVALID", "node_document_url must be a valid absolute URL", 400, {
+      field: "node_document_url"
+    });
+  }
+
+  if (target.username || target.password) {
+    throw new LoomError("ENVELOPE_INVALID", "node_document_url must not include credentials", 400, {
+      field: "node_document_url"
+    });
+  }
+
+  const allowInsecureHttp = options.allowInsecureHttp === true;
+  if (target.protocol !== "https:" && !(allowInsecureHttp && target.protocol === "http:")) {
+    throw new LoomError("ENVELOPE_INVALID", "node_document_url must use https unless allow_insecure_http=true", 400, {
+      field: "node_document_url",
+      protocol: target.protocol
+    });
+  }
+
+  if (options.allowPrivateNetwork !== true) {
+    const hostname = target.hostname;
+    if (isIP(hostname) > 0 && isPrivateOrLocalIp(hostname)) {
+      throw new LoomError("CAPABILITY_DENIED", "node_document_url cannot target private or local IPs", 403, {
+        field: "node_document_url",
+        host: hostname
+      });
+    }
+  }
+
+  return target.toString();
+}
+
+function normalizeFederationProtocolCapabilitiesUrl(value, options = {}) {
+  if (value == null || String(value).trim().length === 0) {
+    return null;
+  }
+
+  let target;
+  try {
+    target = new URL(String(value));
+  } catch {
+    throw new LoomError("ENVELOPE_INVALID", "protocol_capabilities_url must be a valid absolute URL", 400, {
+      field: "protocol_capabilities_url"
+    });
+  }
+
+  if (target.username || target.password) {
+    throw new LoomError("ENVELOPE_INVALID", "protocol_capabilities_url must not include credentials", 400, {
+      field: "protocol_capabilities_url"
+    });
+  }
+
+  const allowInsecureHttp = options.allowInsecureHttp === true;
+  if (target.protocol !== "https:" && !(allowInsecureHttp && target.protocol === "http:")) {
+    throw new LoomError(
+      "ENVELOPE_INVALID",
+      "protocol_capabilities_url must use https unless allow_insecure_http=true",
+      400,
+      {
+        field: "protocol_capabilities_url",
+        protocol: target.protocol
+      }
+    );
+  }
+
+  if (options.allowPrivateNetwork !== true) {
+    const hostname = target.hostname;
+    if (isIP(hostname) > 0 && isPrivateOrLocalIp(hostname)) {
+      throw new LoomError("CAPABILITY_DENIED", "protocol_capabilities_url cannot target private or local IPs", 403, {
+        field: "protocol_capabilities_url",
+        host: hostname
+      });
+    }
+  }
+
+  return target.toString();
+}
+
 function isExpiredIso(value) {
   if (!value) {
     return false;
@@ -599,19 +1319,259 @@ function isExpiredIso(value) {
 }
 
 function parseLoomIdentityDomain(identityUri) {
-  const normalized = normalizeLoomIdentity(identityUri);
+  return parseLoomIdentityAuthority(identityUri);
+}
+
+const FEDERATION_TRUST_MODES = new Set([
+  "strict_identity_authority",
+  "curated_trust_anchors",
+  "public_dns_webpki"
+]);
+
+function normalizeFederationTrustMode(value, { hasTrustAnchors = false } = {}) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return hasTrustAnchors ? "curated_trust_anchors" : "strict_identity_authority";
+  }
+  if (normalized === "strict" || normalized === "strict_identity") {
+    return "strict_identity_authority";
+  }
+  if (normalized === "curated" || normalized === "trust_anchors") {
+    return "curated_trust_anchors";
+  }
+  if (FEDERATION_TRUST_MODES.has(normalized)) {
+    return normalized;
+  }
+  return hasTrustAnchors ? "curated_trust_anchors" : "strict_identity_authority";
+}
+
+function normalizeHexDigest(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized || !/^[a-f0-9]{64}$/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizePemForFingerprint(value) {
+  const trimmed = String(value || "").replace(/\r\n/g, "\n").trim();
+  return trimmed ? `${trimmed}\n` : null;
+}
+
+function fingerprintPublicKeyPem(publicKeyPem) {
+  const normalizedPem = normalizePemForFingerprint(publicKeyPem);
+  if (!normalizedPem) {
+    return null;
+  }
+  return createHash("sha256").update(normalizedPem, "utf-8").digest("hex");
+}
+
+function parseFederationTrustDnsTxtRecord(record) {
+  const fields = {};
+  for (const part of String(record || "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean)) {
+    const separator = part.indexOf("=");
+    if (separator <= 0 || separator >= part.length - 1) {
+      continue;
+    }
+    const key = part
+      .slice(0, separator)
+      .trim()
+      .toLowerCase();
+    const value = part.slice(separator + 1).trim();
+    if (!key || !value) {
+      continue;
+    }
+    fields[key] = value;
+  }
+  return fields;
+}
+
+function normalizeFederationTrustDnsFields(fields) {
+  const normalized = fields && typeof fields === "object" ? fields : {};
+  const digest = normalizeSha256Digest(
+    normalized.digest || normalized.sha256 || normalized.hash || normalized.h || ""
+  );
+  const keysetUrl = String(normalized.keyset || normalized.ks || normalized.k || "").trim();
+  const revocationsUrl = String(normalized.revocations || normalized.revocation || "").trim();
+  const trustEpoch = parseOptionalNonNegativeInteger(normalized.trust_epoch || normalized.epoch);
+  const version = parseOptionalNonNegativeInteger(normalized.version);
+  const formatVersion = String(normalized.v || "").trim().toLowerCase();
+
+  return {
+    format_version: formatVersion || null,
+    keyset_url: keysetUrl || null,
+    digest_sha256: digest || null,
+    revocations_url: revocationsUrl || null,
+    trust_epoch: trustEpoch,
+    version
+  };
+}
+
+function canonicalizeSignedDocumentPayload(document) {
+  const payload = {
+    ...(document && typeof document === "object" ? document : {})
+  };
+  delete payload.signature;
+  return canonicalizeJson(payload);
+}
+
+function hashCanonicalSignedDocumentPayload(document) {
+  return createHash("sha256")
+    .update(canonicalizeSignedDocumentPayload(document), "utf-8")
+    .digest("hex");
+}
+
+function normalizeKeysetSigningKeys(value) {
+  const rawKeys = Array.isArray(value?.signing_keys)
+    ? value.signing_keys
+    : Array.isArray(value?.keys)
+      ? value.keys
+      : [];
+
+  return normalizeFederationSigningKeys(
+    rawKeys.map((key) => ({
+      key_id: String(key?.key_id || "").trim(),
+      public_key_pem: String(key?.public_key_pem || key?.public_key || "").trim(),
+      status: key?.status,
+      not_before: key?.not_before || key?.valid_from || null,
+      not_after: key?.not_after || key?.valid_until || key?.expires_at || null,
+      revoked_at: key?.revoked_at || null
+    }))
+  );
+}
+
+function normalizeRevokedKeyIds(value) {
+  return Array.from(
+    new Set(
+      (Array.isArray(value) ? value : [])
+        .map((entry) => String(entry || "").trim())
+        .filter(Boolean)
+    )
+  ).sort();
+}
+
+function parseOptionalNonNegativeInteger(value) {
+  if (value == null || String(value).trim().length === 0) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function normalizeDnsTxtAnswerRecords(records) {
+  if (!Array.isArray(records)) {
+    return [];
+  }
+  return records
+    .map((entry) => {
+      if (Array.isArray(entry)) {
+        return entry.join("");
+      }
+      return String(entry || "");
+    })
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizeFederationTrustDnsResolverResult(result) {
+  if (Array.isArray(result)) {
+    return {
+      records: normalizeDnsTxtAnswerRecords(result),
+      dnssec_validated: null,
+      dnssec_source: null,
+      transparency: null
+    };
+  }
+
+  if (!result || typeof result !== "object") {
+    return {
+      records: normalizeDnsTxtAnswerRecords([]),
+      dnssec_validated: null,
+      dnssec_source: null,
+      transparency: null
+    };
+  }
+
+  const answers = Array.isArray(result.answers)
+    ? result.answers
+    : Array.isArray(result.records)
+      ? result.records
+      : Array.isArray(result.txt_records)
+        ? result.txt_records
+        : [];
+
+  const dnssecValidated = (() => {
+    if (typeof result.dnssec_validated === "boolean") {
+      return result.dnssec_validated;
+    }
+    if (typeof result.dnssec === "boolean") {
+      return result.dnssec;
+    }
+    if (typeof result.ad === "boolean") {
+      return result.ad;
+    }
+    if (typeof result.authenticated_data === "boolean") {
+      return result.authenticated_data;
+    }
+    return null;
+  })();
+
+  const dnssecSource = (() => {
+    const normalized = String(result.dnssec_source || result.resolver || result.source || "").trim();
+    return normalized || null;
+  })();
+
+  const transparency = result.transparency && typeof result.transparency === "object" ? result.transparency : null;
+
+  return {
+    records: normalizeDnsTxtAnswerRecords(answers),
+    dnssec_validated: dnssecValidated,
+    dnssec_source: dnssecSource,
+    transparency
+  };
+}
+
+function normalizeSha256Digest(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
   if (!normalized) {
     return null;
   }
+  const withoutPrefix = normalized.startsWith("sha256:") ? normalized.slice("sha256:".length).trim() : normalized;
+  return normalizeHexDigest(withoutPrefix);
+}
 
-  const raw = normalized.slice("loom://".length);
-  const atIndex = raw.indexOf("@");
-  if (atIndex <= 0 || atIndex >= raw.length - 1) {
-    return null;
+function applyRevokedKeyIdsToFederationSigningKeys(signingKeys = [], revokedKeyIds = [], revokedAt = null) {
+  const revokedKeySet = new Set(normalizeRevokedKeyIds(revokedKeyIds));
+  if (revokedKeySet.size === 0) {
+    return normalizeFederationSigningKeys(signingKeys);
   }
 
-  return raw.slice(atIndex + 1).toLowerCase();
+  const normalizedRevokedAt = revokedAt ? String(revokedAt).trim() : null;
+  return normalizeFederationSigningKeys(signingKeys).map((key) => {
+    if (!revokedKeySet.has(key.key_id)) {
+      return key;
+    }
+    return {
+      ...key,
+      status: "revoked",
+      revoked_at: key.revoked_at || normalizedRevokedAt
+    };
+  });
 }
+
+const IDENTITY_ENCRYPTION_KEY_ALGORITHM_ALIAS_TO_ID = new Map([["x25519", "X25519"]]);
 
 function normalizeIdentitySigningKeys(signingKeys = []) {
   const normalized = signingKeys
@@ -625,19 +1585,74 @@ function normalizeIdentitySigningKeys(signingKeys = []) {
   return normalized;
 }
 
+function normalizeIdentityEncryptionKeyAlgorithm(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  return IDENTITY_ENCRYPTION_KEY_ALGORITHM_ALIAS_TO_ID.get(normalized) || null;
+}
+
+function resolveIdentityEncryptionKeysInput(value) {
+  if (Array.isArray(value?.encryption_keys)) {
+    return value.encryption_keys;
+  }
+  if (Array.isArray(value?.public_keys?.encryption)) {
+    return value.public_keys.encryption;
+  }
+  return [];
+}
+
+function normalizeIdentityEncryptionKeys(encryptionKeys = []) {
+  const normalized = [];
+  for (const key of Array.isArray(encryptionKeys) ? encryptionKeys : []) {
+    const keyId = String(key?.key_id || "").trim();
+    const algorithm = normalizeIdentityEncryptionKeyAlgorithm(key?.algorithm);
+    const publicKey = String(key?.public_key || "").trim();
+    const publicKeyPem = String(key?.public_key_pem || "").trim();
+    if (!keyId || !algorithm || (!publicKey && !publicKeyPem)) {
+      continue;
+    }
+    normalized.push({
+      key_id: keyId,
+      algorithm,
+      public_key: publicKey || null,
+      public_key_pem: publicKeyPem || null,
+      status: String(key?.status || "active")
+        .trim()
+        .toLowerCase() || "active",
+      not_before: key?.not_before ? String(key.not_before).trim() : null,
+      not_after: key?.not_after ? String(key.not_after).trim() : null,
+      revoked_at: key?.revoked_at ? String(key.revoked_at).trim() : null
+    });
+  }
+  normalized.sort((left, right) => left.key_id.localeCompare(right.key_id));
+  return normalized;
+}
+
 function buildIdentityRegistrationDocument({
   identity,
   type = "human",
   displayName = null,
-  signingKeys = []
+  signingKeys = [],
+  encryptionKeys = []
 }) {
-  return {
+  const document = {
     loom: "1.1",
     id: identity,
     type: String(type || "human"),
     display_name: String(displayName || identity),
     signing_keys: normalizeIdentitySigningKeys(signingKeys)
   };
+
+  const normalizedEncryptionKeys = normalizeIdentityEncryptionKeys(encryptionKeys);
+  if (normalizedEncryptionKeys.length > 0) {
+    document.encryption_keys = normalizedEncryptionKeys;
+  }
+
+  return document;
 }
 
 function hashIdentityRegistrationDocument(documentPayload) {
@@ -716,6 +1731,24 @@ function canonicalizeFederationReceipt(receipt) {
   ].join("\n");
 }
 
+function canonicalizeFederationRequestSignatureInput({
+  method,
+  path,
+  bodyHash,
+  timestamp,
+  nonce,
+  trustEpoch = ""
+}) {
+  return [
+    String(method || "POST").toUpperCase(),
+    String(path || ""),
+    String(bodyHash || ""),
+    String(timestamp || ""),
+    String(nonce || ""),
+    String(trustEpoch || "")
+  ].join("\n");
+}
+
 function canonicalizeDeliveryWrapper(wrapper) {
   const canonical = {};
   for (const [key, value] of Object.entries(wrapper || {})) {
@@ -776,9 +1809,19 @@ function mergeFederationSigningKeys(baseKeys = [], nextKeys = []) {
     if (!keyId || !publicKeyPem) {
       continue;
     }
+
+    const status = String(key?.status || "").trim().toLowerCase() || "active";
+    const notBefore = key?.not_before || key?.valid_from || null;
+    const notAfter = key?.not_after || key?.valid_until || key?.expires_at || null;
+    const revokedAt = key?.revoked_at || null;
+
     merged.set(keyId, {
       key_id: keyId,
-      public_key_pem: publicKeyPem
+      public_key_pem: publicKeyPem,
+      status,
+      not_before: notBefore ? String(notBefore).trim() : null,
+      not_after: notAfter ? String(notAfter).trim() : null,
+      revoked_at: revokedAt ? String(revokedAt).trim() : null
     });
   }
   return Array.from(merged.values());
@@ -817,7 +1860,14 @@ function resolveFederationNodeSigningKey(node, keyId) {
     return null;
   }
   const keys = getFederationNodeSigningKeys(node);
-  return keys.find((key) => key.key_id === normalizedKeyId) || null;
+  const key = keys.find((candidate) => candidate.key_id === normalizedKeyId) || null;
+  if (!key) {
+    return null;
+  }
+  if (!isSigningKeyUsableAt(key)) {
+    return null;
+  }
+  return key;
 }
 
 function extractFederationSigningKeysFromNodeDocument(nodeDocument) {
@@ -847,6 +1897,8 @@ const THREAD_OP_TO_GRANT = {
   "thread.fork@v1": "fork",
   "thread.merge@v1": "merge",
   "thread.link@v1": "forward",
+  "encryption.epoch@v1": "admin",
+  "encryption.rotate@v1": "admin",
   "capability.revoked@v1": "admin",
   "capability.spent@v1": "admin"
 };
@@ -889,8 +1941,16 @@ export class LoomStore {
     this.systemSigningKeyId = options.systemSigningKeyId || "k_sign_system_1";
     this.systemSigningPrivateKeyPem = options.systemSigningPrivateKeyPem || null;
     this.systemSigningPublicKeyPem = options.systemSigningPublicKeyPem || null;
+    this.requireExternalSigningKeys = options.requireExternalSigningKeys === true;
+    this.requireDistinctFederationSigningKey = options.requireDistinctFederationSigningKey === true;
     this.federationSigningKeyId = options.federationSigningKeyId || "k_node_sign_local_1";
     this.federationSigningPrivateKeyPem = options.federationSigningPrivateKeyPem || null;
+    this.federationRequireProtocolCapabilities = options.federationRequireProtocolCapabilities === true;
+    this.federationRequireE2eeProfileOverlap = options.federationRequireE2eeProfileOverlap === true;
+    this.federationRequireTrustModeParity = options.federationRequireTrustModeParity === true;
+    this.e2eeProfileMigrationAllowlist = normalizeE2eeProfileMigrationAllowlist(
+      options.e2eeProfileMigrationAllowlist
+    );
     this.federationRequireSignedReceipts = options.federationRequireSignedReceipts === true;
     this.identityRegistrationProofRequired = options.identityRegistrationProofRequired === true;
     this.identityRegistrationChallengeTtlMs = Math.max(
@@ -928,6 +1988,44 @@ export class LoomStore {
     this.bridgeInboundRequireDmarcPass = options.bridgeInboundRequireDmarcPass === true;
     this.bridgeInboundRejectOnAuthFailure = options.bridgeInboundRejectOnAuthFailure === true;
     this.bridgeInboundQuarantineOnAuthFailure = options.bridgeInboundQuarantineOnAuthFailure !== false;
+    this.bridgeInboundAllowPayloadAuthResults = options.bridgeInboundAllowPayloadAuthResults !== false;
+    this.bridgeInboundHeaderAllowlist = normalizeBridgeInboundHeaderAllowlist(
+      options.bridgeInboundHeaderAllowlist
+    );
+    this.inboundContentFilterEnabled = options.inboundContentFilterEnabled !== false;
+    this.inboundContentFilterRejectMalware = options.inboundContentFilterRejectMalware !== false;
+    this.inboundContentFilterSpamThreshold = Math.max(
+      1,
+      parsePositiveInteger(options.inboundContentFilterSpamThreshold, 3)
+    );
+    this.inboundContentFilterPhishThreshold = Math.max(
+      1,
+      parsePositiveInteger(options.inboundContentFilterPhishThreshold, 3)
+    );
+    this.inboundContentFilterQuarantineThreshold = Math.max(
+      1,
+      parsePositiveInteger(options.inboundContentFilterQuarantineThreshold, 4)
+    );
+    this.inboundContentFilterRejectThreshold = Math.max(
+      this.inboundContentFilterQuarantineThreshold + 1,
+      parsePositiveInteger(options.inboundContentFilterRejectThreshold, 7)
+    );
+    this.inboundContentFilterProfileDefault = normalizeInboundContentFilterProfile(
+      options.inboundContentFilterProfileDefault,
+      "balanced"
+    );
+    this.inboundContentFilterProfileBridge = normalizeInboundContentFilterProfile(
+      options.inboundContentFilterProfileBridge,
+      this.inboundContentFilterProfileDefault
+    );
+    this.inboundContentFilterProfileFederation = normalizeInboundContentFilterProfile(
+      options.inboundContentFilterProfileFederation,
+      "agent"
+    );
+    this.messageRetentionDays = Math.max(0, parseNonNegativeInteger(options.messageRetentionDays, 0));
+    this.blobRetentionDays = Math.max(0, parseNonNegativeInteger(options.blobRetentionDays, 0));
+    this.requireStateEncryptionAtRest = options.requireStateEncryptionAtRest === true;
+    this.stateEncryptionKey = normalizeStateEncryptionKey(options.stateEncryptionKey);
     this.auditHmacKey =
       typeof options.auditHmacKey === "string" && options.auditHmacKey.trim().length > 0
         ? options.auditHmacKey.trim()
@@ -941,6 +2039,47 @@ export class LoomStore {
       typeof options.localIdentityDomain === "string" && options.localIdentityDomain.trim()
         ? options.localIdentityDomain.trim().toLowerCase()
         : null;
+    this.federationTrustAnchorBindings = parseTrustAnchorBindings(options.federationTrustAnchorBindings);
+    this.federationTrustMode = normalizeFederationTrustMode(options.federationTrustMode, {
+      hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+    });
+    this.federationTrustFailClosed = parseBoolean(options.federationTrustFailClosed, true);
+    this.federationTrustMaxClockSkewMs = Math.max(
+      1000,
+      parsePositiveInteger(options.federationTrustMaxClockSkewMs, 5 * 60 * 1000)
+    );
+    this.federationTrustKeysetMaxAgeMs = Math.max(
+      60 * 1000,
+      parsePositiveInteger(options.federationTrustKeysetMaxAgeMs, 24 * 60 * 60 * 1000)
+    );
+    this.federationTrustKeysetPublishTtlMs = Math.max(
+      60 * 1000,
+      parsePositiveInteger(options.federationTrustKeysetPublishTtlMs, 24 * 60 * 60 * 1000)
+    );
+    this.federationTrustDnsTxtLabel =
+      typeof options.federationTrustDnsTxtLabel === "string" && options.federationTrustDnsTxtLabel.trim().length > 0
+        ? options.federationTrustDnsTxtLabel.trim()
+        : "_loomfed";
+    this.federationTrustDnsTxtResolver =
+      typeof options.federationTrustDnsTxtResolver === "function" ? options.federationTrustDnsTxtResolver : resolveTxt;
+    this.federationTrustRequireDnssec = parseBoolean(
+      options.federationTrustRequireDnssec,
+      this.federationTrustMode === "public_dns_webpki"
+    );
+    this.federationTrustTransparencyMode = "local_append_only";
+    this.federationTrustRequireTransparency = parseBoolean(
+      options.federationTrustRequireTransparency,
+      this.federationTrustMode === "public_dns_webpki"
+    );
+    this.federationTrustLocalEpoch = Math.max(
+      0,
+      parseNonNegativeInteger(options.federationTrustLocalEpoch, 1)
+    );
+    this.federationTrustKeysetVersion = Math.max(
+      0,
+      parseNonNegativeInteger(options.federationTrustKeysetVersion, 1)
+    );
+    this.federationTrustRevokedKeyIds = normalizeRevokedKeyIds(options.federationTrustRevokedKeyIds);
     this.federationOutboundHostAllowlist = normalizeHostnameAllowlist(options.federationOutboundHostAllowlist);
     this.federationBootstrapHostAllowlist = normalizeHostnameAllowlist(options.federationBootstrapHostAllowlist);
     this.webhookOutboundHostAllowlist = normalizeHostnameAllowlist(options.webhookOutboundHostAllowlist);
@@ -957,6 +2096,21 @@ export class LoomStore {
     this.dataDir = options.dataDir || null;
     this.stateFile = this.dataDir ? join(this.dataDir, "state.json") : null;
     this.auditFile = this.dataDir ? join(this.dataDir, "audit.log.jsonl") : null;
+    this.inboundContentFilterDecisionLogEnabled = options.inboundContentFilterDecisionLogEnabled === true;
+    const inboundContentFilterDecisionLogFileRaw =
+      typeof options.inboundContentFilterDecisionLogFile === "string"
+        ? options.inboundContentFilterDecisionLogFile.trim()
+        : "";
+    this.inboundContentFilterDecisionLogFile =
+      inboundContentFilterDecisionLogFileRaw || (this.dataDir ? join(this.dataDir, "content-filter-decisions.jsonl") : null);
+    this.inboundContentFilterDecisionLogSalt =
+      typeof options.inboundContentFilterDecisionLogSalt === "string" &&
+      options.inboundContentFilterDecisionLogSalt.trim().length > 0
+        ? options.inboundContentFilterDecisionLogSalt.trim()
+        : this.nodeId;
+    if (this.requireStateEncryptionAtRest && this.stateFile && !this.stateEncryptionKey) {
+      throw new Error("requireStateEncryptionAtRest=true requires stateEncryptionKey");
+    }
     this.persistenceAdapter = options.persistenceAdapter || null;
     this.outboxClaimLeaseMs = Math.max(
       5 * 1000,
@@ -971,6 +2125,8 @@ export class LoomStore {
     this.remoteIdentities = new Map();
     this.publicKeysById = new Map();
     this.keyOwnerById = new Map();
+    this.encryptionKeysById = new Map();
+    this.encryptionKeyOwnerById = new Map();
     this.envelopesById = new Map();
     this.threadsById = new Map();
 
@@ -1091,6 +2247,14 @@ export class LoomStore {
     this.persistenceLastSyncAt = null;
     this.persistenceHydratedAt = null;
     this.traceContextStorage = new AsyncLocalStorage();
+    this.federationPublishedKeysetsByDomain = new Map();
+    this.federationPublishedRevocationsByDomain = new Map();
+    this.inboundContentFilterStats = createInboundContentFilterStats();
+    this.inboundContentFilterConfigVersion = 1;
+    this.inboundContentFilterConfigUpdatedAt = nowIso();
+    this.inboundContentFilterConfigUpdatedBy = "system";
+    this.inboundContentFilterConfigCanary = null;
+    this.inboundContentFilterConfigRollback = null;
 
     this.initializeSystemSigningKeys();
 
@@ -1144,21 +2308,43 @@ export class LoomStore {
   }
 
   initializeSystemSigningKeys() {
-    if (this.systemSigningPrivateKeyPem && this.systemSigningPublicKeyPem) {
-      return;
+    if (this.requireExternalSigningKeys) {
+      if (!this.systemSigningPrivateKeyPem) {
+        throw new Error("System signing private key must be externally provisioned when requireExternalSigningKeys=true");
+      }
+      if (!this.systemSigningPublicKeyPem) {
+        this.systemSigningPublicKeyPem = derivePublicKeyPemFromPrivateKeyPem(this.systemSigningPrivateKeyPem);
+      }
+      if (!this.federationSigningPrivateKeyPem) {
+        throw new Error(
+          "Federation signing private key must be externally provisioned when requireExternalSigningKeys=true"
+        );
+      }
+    } else {
+      if (!this.systemSigningPrivateKeyPem || !this.systemSigningPublicKeyPem) {
+        const generated = generateSigningKeyPair();
+        if (!this.systemSigningPrivateKeyPem) {
+          this.systemSigningPrivateKeyPem = generated.privateKeyPem;
+        }
+        if (!this.systemSigningPublicKeyPem) {
+          this.systemSigningPublicKeyPem = generated.publicKeyPem;
+        }
+      }
+
+      if (!this.federationSigningPrivateKeyPem) {
+        this.federationSigningPrivateKeyPem = this.systemSigningPrivateKeyPem;
+      }
     }
 
-    const generated = generateSigningKeyPair();
-    if (!this.systemSigningPrivateKeyPem) {
-      this.systemSigningPrivateKeyPem = generated.privateKeyPem;
-    }
-
-    if (!this.systemSigningPublicKeyPem) {
-      this.systemSigningPublicKeyPem = generated.publicKeyPem;
-    }
-
-    if (!this.federationSigningPrivateKeyPem) {
-      this.federationSigningPrivateKeyPem = this.systemSigningPrivateKeyPem;
+    if (this.requireDistinctFederationSigningKey) {
+      const sameKeyMaterial =
+        String(this.federationSigningPrivateKeyPem || "").trim() ===
+        String(this.systemSigningPrivateKeyPem || "").trim();
+      if (sameKeyMaterial) {
+        throw new Error(
+          "Federation signing key must be distinct from system signing key when requireDistinctFederationSigningKey=true"
+        );
+      }
     }
   }
 
@@ -1181,6 +2367,31 @@ export class LoomStore {
     }
   }
 
+  applyIdentityEncryptionKeys(identityId, encryptionKeys = []) {
+    for (const key of Array.isArray(encryptionKeys) ? encryptionKeys : []) {
+      const keyId = String(key?.key_id || "").trim();
+      const algorithm = normalizeIdentityEncryptionKeyAlgorithm(key?.algorithm);
+      const publicKey = String(key?.public_key || "").trim();
+      const publicKeyPem = String(key?.public_key_pem || "").trim();
+      if (!keyId || !algorithm || (!publicKey && !publicKeyPem)) {
+        continue;
+      }
+      this.encryptionKeysById.set(keyId, {
+        key_id: keyId,
+        algorithm,
+        public_key: publicKey || null,
+        public_key_pem: publicKeyPem || null,
+        status: String(key?.status || "active")
+          .trim()
+          .toLowerCase() || "active",
+        not_before: key?.not_before ? String(key.not_before).trim() : null,
+        not_after: key?.not_after ? String(key.not_after).trim() : null,
+        revoked_at: key?.revoked_at ? String(key.revoked_at).trim() : null
+      });
+      this.encryptionKeyOwnerById.set(keyId, identityId);
+    }
+  }
+
   removeIdentitySigningKeys(identityId, signingKeys = []) {
     for (const key of Array.isArray(signingKeys) ? signingKeys : []) {
       const keyId = String(key?.key_id || "").trim();
@@ -1195,17 +2406,35 @@ export class LoomStore {
     }
   }
 
+  removeIdentityEncryptionKeys(identityId, encryptionKeys = []) {
+    for (const key of Array.isArray(encryptionKeys) ? encryptionKeys : []) {
+      const keyId = String(key?.key_id || "").trim();
+      if (!keyId) {
+        continue;
+      }
+      const owner = this.encryptionKeyOwnerById.get(keyId);
+      if (owner === identityId) {
+        this.encryptionKeyOwnerById.delete(keyId);
+        this.encryptionKeysById.delete(keyId);
+      }
+    }
+  }
+
   rebuildIdentityKeyIndexes() {
     this.publicKeysById = new Map();
     this.keyOwnerById = new Map();
+    this.encryptionKeysById = new Map();
+    this.encryptionKeyOwnerById = new Map();
     this.ensureSystemSigningKeyRegistered();
 
     for (const identityDoc of this.identities.values()) {
       this.applyIdentitySigningKeys(identityDoc.id, identityDoc.signing_keys);
+      this.applyIdentityEncryptionKeys(identityDoc.id, identityDoc.encryption_keys);
     }
 
     for (const identityDoc of this.remoteIdentities.values()) {
       this.applyIdentitySigningKeys(identityDoc.id, identityDoc.signing_keys);
+      this.applyIdentityEncryptionKeys(identityDoc.id, identityDoc.encryption_keys);
     }
   }
 
@@ -1507,6 +2736,7 @@ export class LoomStore {
       return;
     }
     this.removeIdentitySigningKeys(identityUri, remoteIdentity.signing_keys);
+    this.removeIdentityEncryptionKeys(identityUri, remoteIdentity.encryption_keys);
     this.remoteIdentities.delete(identityUri);
   }
 
@@ -1516,6 +2746,137 @@ export class LoomStore {
     }
 
     this.nodeId = state.node_id || this.nodeId;
+    const trustState =
+      state.federation_trust && typeof state.federation_trust === "object" ? state.federation_trust : null;
+    if (trustState) {
+      const modeInput =
+        trustState.mode ?? trustState.trust_anchor_mode ?? trustState.trust_mode ?? this.federationTrustMode;
+      this.federationTrustMode = normalizeFederationTrustMode(modeInput, {
+        hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+      });
+      this.federationTrustFailClosed = parseBoolean(
+        trustState.fail_closed ?? trustState.trust_fail_closed,
+        this.federationTrustFailClosed
+      );
+      this.federationTrustMaxClockSkewMs = Math.max(
+        1000,
+        parsePositiveInteger(
+          trustState.max_clock_skew_ms ?? trustState.trust_max_clock_skew_ms,
+          this.federationTrustMaxClockSkewMs
+        )
+      );
+      this.federationTrustKeysetMaxAgeMs = Math.max(
+        60 * 1000,
+        parsePositiveInteger(
+          trustState.keyset_max_age_ms ?? trustState.trust_keyset_max_age_ms,
+          this.federationTrustKeysetMaxAgeMs
+        )
+      );
+      this.federationTrustKeysetPublishTtlMs = Math.max(
+        60 * 1000,
+        parsePositiveInteger(
+          trustState.keyset_publish_ttl_ms ?? trustState.trust_keyset_publish_ttl_ms,
+          this.federationTrustKeysetPublishTtlMs
+        )
+      );
+      const dnsLabel = String(
+        trustState.dns_txt_label ?? trustState.trust_dns_txt_label ?? this.federationTrustDnsTxtLabel ?? ""
+      ).trim();
+      if (dnsLabel) {
+        this.federationTrustDnsTxtLabel = dnsLabel;
+      }
+      this.federationTrustRequireDnssec = parseBoolean(
+        trustState.require_dnssec ?? trustState.trust_require_dnssec,
+        this.federationTrustRequireDnssec
+      );
+      this.federationTrustRequireTransparency = parseBoolean(
+        trustState.require_transparency ?? trustState.trust_require_transparency,
+        this.federationTrustRequireTransparency
+      );
+      const transparencyMode = String(
+        trustState.transparency_mode ?? trustState.trust_transparency_mode ?? this.federationTrustTransparencyMode
+      )
+        .trim()
+        .toLowerCase();
+      this.federationTrustTransparencyMode = transparencyMode || "local_append_only";
+      this.federationTrustLocalEpoch = Math.max(
+        0,
+        parseNonNegativeInteger(
+          trustState.local_epoch ?? trustState.trust_epoch ?? trustState.epoch,
+          this.federationTrustLocalEpoch
+        )
+      );
+      this.federationTrustKeysetVersion = Math.max(
+        0,
+        parseNonNegativeInteger(
+          trustState.keyset_version ?? trustState.version,
+          this.federationTrustKeysetVersion
+        )
+      );
+      this.federationTrustRevokedKeyIds = normalizeRevokedKeyIds(
+        trustState.revoked_key_ids ?? this.federationTrustRevokedKeyIds
+      );
+    }
+    const inboundContentFilterState =
+      state.inbound_content_filter && typeof state.inbound_content_filter === "object"
+        ? state.inbound_content_filter
+        : null;
+    if (inboundContentFilterState) {
+      const configSource =
+        inboundContentFilterState.config &&
+        typeof inboundContentFilterState.config === "object" &&
+        !Array.isArray(inboundContentFilterState.config)
+          ? inboundContentFilterState.config
+          : inboundContentFilterState;
+      try {
+        const restoredConfig = this.buildInboundContentFilterConfigUpdate(
+          configSource,
+          this.getInboundContentFilterActiveConfig()
+        );
+        this.applyInboundContentFilterActiveConfig(restoredConfig.config);
+      } catch {}
+
+      if (
+        inboundContentFilterState.stats &&
+        typeof inboundContentFilterState.stats === "object" &&
+        !Array.isArray(inboundContentFilterState.stats)
+      ) {
+        this.inboundContentFilterStats = { ...inboundContentFilterState.stats };
+      } else if (
+        inboundContentFilterState.decision_stats &&
+        typeof inboundContentFilterState.decision_stats === "object" &&
+        !Array.isArray(inboundContentFilterState.decision_stats)
+      ) {
+        this.inboundContentFilterStats = { ...inboundContentFilterState.decision_stats };
+      }
+
+      this.inboundContentFilterConfigVersion = Math.max(
+        1,
+        parsePositiveInteger(inboundContentFilterState.version, this.inboundContentFilterConfigVersion)
+      );
+      this.inboundContentFilterConfigUpdatedAt =
+        typeof inboundContentFilterState.updated_at === "string" && inboundContentFilterState.updated_at.trim().length > 0
+          ? inboundContentFilterState.updated_at.trim()
+          : this.inboundContentFilterConfigUpdatedAt;
+      this.inboundContentFilterConfigUpdatedBy =
+        typeof inboundContentFilterState.updated_by === "string" && inboundContentFilterState.updated_by.trim().length > 0
+          ? inboundContentFilterState.updated_by.trim()
+          : this.inboundContentFilterConfigUpdatedBy;
+      this.inboundContentFilterConfigCanary = this.normalizeInboundContentFilterCanaryState(
+        inboundContentFilterState.canary
+      );
+      this.inboundContentFilterConfigRollback = this.normalizeInboundContentFilterRollbackState(
+        inboundContentFilterState.rollback
+      );
+    } else if (
+      state.inbound_content_filter_stats &&
+      typeof state.inbound_content_filter_stats === "object" &&
+      !Array.isArray(state.inbound_content_filter_stats)
+    ) {
+      this.inboundContentFilterStats = { ...state.inbound_content_filter_stats };
+    }
+    this.ensureInboundContentFilterStatsShape();
+
     const localIdentityEntries = [];
     const remoteIdentityEntries = [];
     for (const identityDoc of state.identities || []) {
@@ -1600,13 +2961,83 @@ export class LoomStore {
     }
     this.knownNodesById = new Map((state.known_nodes || []).map((item) => [item.node_id, item]));
     for (const node of this.knownNodesById.values()) {
-      const signingKeys = getFederationNodeSigningKeys(node);
+      node.revoked_key_ids = normalizeRevokedKeyIds(node.revoked_key_ids);
+      const signingKeys = applyRevokedKeyIdsToFederationSigningKeys(
+        getFederationNodeSigningKeys(node),
+        node.revoked_key_ids,
+        node.updated_at
+      );
       node.signing_keys = signingKeys;
       if (signingKeys.length > 0) {
-        const activeKey = signingKeys.find((key) => key.key_id === node.key_id) || signingKeys[0];
+        const activeKey =
+          resolveFederationNodeSigningKey({ signing_keys: signingKeys }, node.key_id) ||
+          signingKeys.find((key) => isSigningKeyUsableAt(key)) ||
+          signingKeys[0];
         node.key_id = activeKey.key_id;
         node.public_key_pem = activeKey.public_key_pem;
       }
+
+      node.trust_anchor_mode = normalizeFederationTrustMode(node.trust_anchor_mode || this.federationTrustMode, {
+        hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+      });
+      node.trust_anchor_dns_name =
+        typeof node.trust_anchor_dns_name === "string" && node.trust_anchor_dns_name.trim().length > 0
+          ? node.trust_anchor_dns_name.trim()
+          : null;
+      node.trust_anchor_dns_record =
+        typeof node.trust_anchor_dns_record === "string" && node.trust_anchor_dns_record.trim().length > 0
+          ? node.trust_anchor_dns_record.trim()
+          : null;
+      node.trust_anchor_keyset_url =
+        typeof node.trust_anchor_keyset_url === "string" && node.trust_anchor_keyset_url.trim().length > 0
+          ? node.trust_anchor_keyset_url.trim()
+          : null;
+      node.trust_anchor_revocations_url =
+        typeof node.trust_anchor_revocations_url === "string" && node.trust_anchor_revocations_url.trim().length > 0
+          ? node.trust_anchor_revocations_url.trim()
+          : null;
+      node.trust_anchor_verified_at =
+        typeof node.trust_anchor_verified_at === "string" && node.trust_anchor_verified_at.trim().length > 0
+          ? node.trust_anchor_verified_at.trim()
+          : null;
+      node.trust_anchor_dnssec_validated = node.trust_anchor_dnssec_validated === true;
+      node.trust_anchor_dnssec_source =
+        typeof node.trust_anchor_dnssec_source === "string" && node.trust_anchor_dnssec_source.trim().length > 0
+          ? node.trust_anchor_dnssec_source.trim()
+          : null;
+      node.trust_anchor_transparency_log_id =
+        typeof node.trust_anchor_transparency_log_id === "string" &&
+        node.trust_anchor_transparency_log_id.trim().length > 0
+          ? node.trust_anchor_transparency_log_id.trim()
+          : null;
+      node.trust_anchor_transparency_mode =
+        typeof node.trust_anchor_transparency_mode === "string" &&
+        node.trust_anchor_transparency_mode.trim().length > 0
+          ? node.trust_anchor_transparency_mode.trim().toLowerCase()
+          : this.federationTrustTransparencyMode;
+      node.trust_anchor_transparency_checkpoint =
+        typeof node.trust_anchor_transparency_checkpoint === "string" &&
+        node.trust_anchor_transparency_checkpoint.trim().length > 0
+          ? node.trust_anchor_transparency_checkpoint.trim().toLowerCase()
+          : null;
+      node.trust_anchor_transparency_previous_checkpoint =
+        typeof node.trust_anchor_transparency_previous_checkpoint === "string" &&
+        node.trust_anchor_transparency_previous_checkpoint.trim().length > 0
+          ? node.trust_anchor_transparency_previous_checkpoint.trim().toLowerCase()
+          : null;
+      const transparencyEventIndex = parseNonNegativeInteger(node.trust_anchor_transparency_event_index, -1);
+      node.trust_anchor_transparency_event_index = transparencyEventIndex >= 0 ? transparencyEventIndex : null;
+      node.trust_anchor_transparency_verified_at =
+        typeof node.trust_anchor_transparency_verified_at === "string" &&
+        node.trust_anchor_transparency_verified_at.trim().length > 0
+          ? node.trust_anchor_transparency_verified_at.trim()
+          : null;
+      node.trust_anchor_keyset_hash = normalizeHexDigest(node.trust_anchor_keyset_hash) || null;
+      node.trust_anchor_keyset_version = Math.max(
+        0,
+        parseNonNegativeInteger(node.trust_anchor_keyset_version, 0)
+      );
+      node.trust_anchor_epoch = Math.max(0, parseNonNegativeInteger(node.trust_anchor_epoch, 0));
 
       node.allow_insecure_http = node.allow_insecure_http === true;
       node.allow_private_network = node.allow_private_network === true;
@@ -1626,6 +3057,39 @@ export class LoomStore {
       } catch {
         node.identity_resolve_url = null;
       }
+      try {
+        node.node_document_url = normalizeFederationNodeDocumentUrl(node.node_document_url, {
+          allowInsecureHttp: node.allow_insecure_http,
+          allowPrivateNetwork: node.allow_private_network
+        });
+      } catch {
+        node.node_document_url = null;
+      }
+      try {
+        node.protocol_capabilities_url = normalizeFederationProtocolCapabilitiesUrl(node.protocol_capabilities_url, {
+          allowInsecureHttp: node.allow_insecure_http,
+          allowPrivateNetwork: node.allow_private_network
+        });
+      } catch {
+        node.protocol_capabilities_url = null;
+      }
+      node.protocol_capabilities = normalizeProtocolCapabilitiesDocument(node.protocol_capabilities);
+      node.protocol_capabilities_fetched_at =
+        typeof node.protocol_capabilities_fetched_at === "string" && node.protocol_capabilities_fetched_at.trim()
+          ? node.protocol_capabilities_fetched_at.trim()
+          : null;
+      node.protocol_capabilities_fetch_error =
+        typeof node.protocol_capabilities_fetch_error === "string" && node.protocol_capabilities_fetch_error.trim()
+          ? node.protocol_capabilities_fetch_error.trim()
+          : null;
+      node.negotiated_e2ee_profiles = normalizeProtocolCapabilityE2eeProfiles(node.negotiated_e2ee_profiles);
+      node.protocol_negotiated_trust_anchor_mode =
+        typeof node.protocol_negotiated_trust_anchor_mode === "string" &&
+        node.protocol_negotiated_trust_anchor_mode.trim()
+          ? normalizeFederationTrustMode(node.protocol_negotiated_trust_anchor_mode.trim(), {
+              hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+            })
+          : null;
 
       node.reputation_score = Math.max(0, Number(node.reputation_score || 0));
       node.challenge_required_until = node.challenge_required_until || null;
@@ -1780,6 +3244,82 @@ export class LoomStore {
     this.auditHeadHash = expectedPrevHash;
   }
 
+  decodeStatePayloadFromDisk(raw) {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return parsed;
+    }
+
+    if (parsed.type !== STATE_ENCRYPTION_WRAPPER_TYPE) {
+      if (this.requireStateEncryptionAtRest && this.stateEncryptionKey) {
+        throw new Error("State file must be encrypted at rest but plaintext JSON was found");
+      }
+      return parsed;
+    }
+
+    if (!this.stateEncryptionKey) {
+      throw new Error("State file is encrypted but no stateEncryptionKey is configured");
+    }
+
+    const algorithm = String(parsed.algorithm || "").trim().toLowerCase();
+    if (algorithm !== STATE_ENCRYPTION_ALGORITHM) {
+      throw new Error(`Unsupported state encryption algorithm: ${parsed.algorithm}`);
+    }
+
+    const nonce = fromBase64Url(String(parsed.nonce || "").trim());
+    const tag = fromBase64Url(String(parsed.tag || "").trim());
+    const ciphertext = fromBase64Url(String(parsed.ciphertext || "").trim());
+    if (nonce.length !== STATE_ENCRYPTION_NONCE_BYTES) {
+      throw new Error("Encrypted state nonce is invalid");
+    }
+    if (tag.length !== STATE_ENCRYPTION_TAG_BYTES) {
+      throw new Error("Encrypted state authentication tag is invalid");
+    }
+    if (ciphertext.length === 0) {
+      throw new Error("Encrypted state ciphertext is empty");
+    }
+
+    const decipher = createDecipheriv(
+      STATE_ENCRYPTION_ALGORITHM,
+      this.stateEncryptionKey,
+      nonce
+    );
+    decipher.setAuthTag(tag);
+
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    const decoded = JSON.parse(plaintext.toString("utf-8"));
+    if (!decoded || typeof decoded !== "object") {
+      throw new Error("Decrypted state payload must be a JSON object");
+    }
+    return decoded;
+  }
+
+  encodeStatePayloadForDisk(state) {
+    if (!this.stateEncryptionKey) {
+      return JSON.stringify(state, null, 2);
+    }
+
+    const nonce = randomBytes(STATE_ENCRYPTION_NONCE_BYTES);
+    const cipher = createCipheriv(
+      STATE_ENCRYPTION_ALGORITHM,
+      this.stateEncryptionKey,
+      nonce
+    );
+    const plaintext = Buffer.from(JSON.stringify(state), "utf-8");
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const tag = cipher.getAuthTag();
+
+    const wrapper = {
+      type: STATE_ENCRYPTION_WRAPPER_TYPE,
+      algorithm: STATE_ENCRYPTION_ALGORITHM,
+      nonce: toBase64Url(nonce),
+      tag: toBase64Url(tag),
+      ciphertext: toBase64Url(ciphertext),
+      generated_at: nowIso()
+    };
+    return JSON.stringify(wrapper, null, 2);
+  }
+
   loadStateFromDisk() {
     if (!this.stateFile || !existsSync(this.stateFile)) {
       return;
@@ -1790,7 +3330,7 @@ export class LoomStore {
       return;
     }
 
-    const state = JSON.parse(raw);
+    const state = this.decodeStatePayloadFromDisk(raw);
     this.loadStateFromObject(state);
   }
 
@@ -1809,10 +3349,50 @@ export class LoomStore {
 
   toSerializableState() {
     this.cleanupFederationNonces();
+    this.ensureInboundContentFilterStatsShape();
     return {
       loom_version: "1.1",
       node_id: this.nodeId,
       updated_at: nowIso(),
+      federation_trust: {
+        mode: this.federationTrustMode,
+        fail_closed: this.federationTrustFailClosed,
+        max_clock_skew_ms: this.federationTrustMaxClockSkewMs,
+        keyset_max_age_ms: this.federationTrustKeysetMaxAgeMs,
+        keyset_publish_ttl_ms: this.federationTrustKeysetPublishTtlMs,
+        dns_txt_label: this.federationTrustDnsTxtLabel,
+        require_dnssec: this.federationTrustRequireDnssec,
+        transparency_mode: this.federationTrustTransparencyMode,
+        require_transparency: this.federationTrustRequireTransparency,
+        local_epoch: this.federationTrustLocalEpoch,
+        keyset_version: this.federationTrustKeysetVersion,
+        revoked_key_ids: this.federationTrustRevokedKeyIds
+      },
+      inbound_content_filter: {
+        version: Math.max(1, parsePositiveInteger(this.inboundContentFilterConfigVersion, 1)),
+        updated_at: this.inboundContentFilterConfigUpdatedAt || null,
+        updated_by: this.inboundContentFilterConfigUpdatedBy || null,
+        config: this.getInboundContentFilterActiveConfig(),
+        stats: {
+          ...this.inboundContentFilterStats,
+          decision_counts_by_profile: {
+            strict: {
+              ...createInboundContentFilterProfileDecisionStats(),
+              ...(this.inboundContentFilterStats?.decision_counts_by_profile?.strict || {})
+            },
+            balanced: {
+              ...createInboundContentFilterProfileDecisionStats(),
+              ...(this.inboundContentFilterStats?.decision_counts_by_profile?.balanced || {})
+            },
+            agent: {
+              ...createInboundContentFilterProfileDecisionStats(),
+              ...(this.inboundContentFilterStats?.decision_counts_by_profile?.agent || {})
+            }
+          }
+        },
+        canary: cloneInboundContentFilterCanaryState(this.inboundContentFilterConfigCanary),
+        rollback: cloneInboundContentFilterRollbackState(this.inboundContentFilterConfigRollback)
+      },
       identities: Array.from(this.identities.values()),
       remote_identities: Array.from(this.remoteIdentities.values()),
       public_keys: Array.from(this.publicKeysById.entries()),
@@ -1840,7 +3420,7 @@ export class LoomStore {
     }
 
     const tmpFile = `${this.stateFile}.tmp`;
-    writeFileSync(tmpFile, JSON.stringify(this.toSerializableState(), null, 2));
+    writeFileSync(tmpFile, this.encodeStatePayloadForDisk(this.toSerializableState()));
     const fd = openSync(tmpFile, "r");
     try {
       fsyncSync(fd);
@@ -2858,9 +4438,18 @@ export class LoomStore {
 
     const existing = this.knownNodesById.get(nodeId);
     const existingSigningKeys = getFederationNodeSigningKeys(existing);
-    const signingKeys = replaceSigningKeys
+    const hasRevokedKeyIds = Object.prototype.hasOwnProperty.call(payload, "revoked_key_ids");
+    const revokedKeyIds = hasRevokedKeyIds
+      ? normalizeRevokedKeyIds(payload.revoked_key_ids)
+      : normalizeRevokedKeyIds(existing?.revoked_key_ids);
+    const mergedSigningKeys = replaceSigningKeys
       ? payloadSigningKeys
       : mergeFederationSigningKeys(existingSigningKeys, payloadSigningKeys);
+    const signingKeys = applyRevokedKeyIdsToFederationSigningKeys(
+      mergedSigningKeys,
+      revokedKeyIds,
+      payload.trust_anchor_verified_at || existing?.trust_anchor_verified_at || nowIso()
+    );
     const hasAllowInsecureHttp = Object.prototype.hasOwnProperty.call(payload, "allow_insecure_http");
     const hasAllowPrivateNetwork = Object.prototype.hasOwnProperty.call(payload, "allow_private_network");
     const allowInsecureHttp = hasAllowInsecureHttp
@@ -2878,13 +4467,179 @@ export class LoomStore {
 
     let activeKey = resolveFederationNodeSigningKey({ signing_keys: signingKeys }, activeKeyIdInput || existing?.key_id);
     if (!activeKey) {
-      activeKey = signingKeys[0];
+      activeKey = signingKeys.find((key) => isSigningKeyUsableAt(key)) || signingKeys[0];
     }
 
     const hasExplicitPolicy = Object.prototype.hasOwnProperty.call(payload, "policy");
     const configuredPolicy = hasExplicitPolicy
       ? String(payload.policy || "trusted")
       : existing?.configured_policy || existing?.policy || "trusted";
+    const hasTrustAnchorMode = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_mode");
+    const trustAnchorMode = normalizeFederationTrustMode(
+      hasTrustAnchorMode ? payload.trust_anchor_mode : existing?.trust_anchor_mode || this.federationTrustMode,
+      { hasTrustAnchors: this.federationTrustAnchorBindings.size > 0 }
+    );
+    const hasTrustAnchorEpoch = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_epoch");
+    const trustAnchorEpoch = Math.max(
+      0,
+      parseNonNegativeInteger(
+        hasTrustAnchorEpoch ? payload.trust_anchor_epoch : existing?.trust_anchor_epoch,
+        0
+      )
+    );
+    const hasTrustAnchorKeysetVersion = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_keyset_version");
+    const trustAnchorKeysetVersion = Math.max(
+      0,
+      parseNonNegativeInteger(
+        hasTrustAnchorKeysetVersion ? payload.trust_anchor_keyset_version : existing?.trust_anchor_keyset_version,
+        0
+      )
+    );
+    const hasTrustAnchorKeysetHash = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_keyset_hash");
+    const trustAnchorKeysetHash =
+      normalizeHexDigest(
+        hasTrustAnchorKeysetHash ? payload.trust_anchor_keyset_hash : existing?.trust_anchor_keyset_hash
+      ) || null;
+    const hasTrustAnchorDnsName = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_dns_name");
+    const trustAnchorDnsName = (() => {
+      const value = hasTrustAnchorDnsName ? payload.trust_anchor_dns_name : existing?.trust_anchor_dns_name;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasTrustAnchorDnsRecord = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_dns_record");
+    const trustAnchorDnsRecord = (() => {
+      const value = hasTrustAnchorDnsRecord ? payload.trust_anchor_dns_record : existing?.trust_anchor_dns_record;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasTrustAnchorKeysetUrl = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_keyset_url");
+    const trustAnchorKeysetUrl = (() => {
+      const value = hasTrustAnchorKeysetUrl ? payload.trust_anchor_keyset_url : existing?.trust_anchor_keyset_url;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasTrustAnchorRevocationsUrl = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_revocations_url");
+    const trustAnchorRevocationsUrl = (() => {
+      const value = hasTrustAnchorRevocationsUrl
+        ? payload.trust_anchor_revocations_url
+        : existing?.trust_anchor_revocations_url;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasTrustAnchorVerifiedAt = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_verified_at");
+    const trustAnchorVerifiedAt = (() => {
+      const value = hasTrustAnchorVerifiedAt ? payload.trust_anchor_verified_at : existing?.trust_anchor_verified_at;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasTrustAnchorDnssecValidated = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_dnssec_validated");
+    const trustAnchorDnssecValidated = hasTrustAnchorDnssecValidated
+      ? payload.trust_anchor_dnssec_validated === true
+      : existing?.trust_anchor_dnssec_validated === true;
+    const hasTrustAnchorDnssecSource = Object.prototype.hasOwnProperty.call(payload, "trust_anchor_dnssec_source");
+    const trustAnchorDnssecSource = (() => {
+      const value = hasTrustAnchorDnssecSource ? payload.trust_anchor_dnssec_source : existing?.trust_anchor_dnssec_source;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasTrustAnchorTransparencyLogId = Object.prototype.hasOwnProperty.call(
+      payload,
+      "trust_anchor_transparency_log_id"
+    );
+    const trustAnchorTransparencyLogId = (() => {
+      const value = hasTrustAnchorTransparencyLogId
+        ? payload.trust_anchor_transparency_log_id
+        : existing?.trust_anchor_transparency_log_id;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasTrustAnchorTransparencyMode = Object.prototype.hasOwnProperty.call(
+      payload,
+      "trust_anchor_transparency_mode"
+    );
+    const trustAnchorTransparencyMode = (() => {
+      const value = hasTrustAnchorTransparencyMode
+        ? payload.trust_anchor_transparency_mode
+        : existing?.trust_anchor_transparency_mode || this.federationTrustTransparencyMode;
+      const normalized = String(value || "")
+        .trim()
+        .toLowerCase();
+      return normalized || this.federationTrustTransparencyMode;
+    })();
+    const hasTrustAnchorTransparencyCheckpoint = Object.prototype.hasOwnProperty.call(
+      payload,
+      "trust_anchor_transparency_checkpoint"
+    );
+    const trustAnchorTransparencyCheckpoint = (() => {
+      const value = hasTrustAnchorTransparencyCheckpoint
+        ? payload.trust_anchor_transparency_checkpoint
+        : existing?.trust_anchor_transparency_checkpoint;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim().toLowerCase();
+      return normalized || null;
+    })();
+    const hasTrustAnchorTransparencyPreviousCheckpoint = Object.prototype.hasOwnProperty.call(
+      payload,
+      "trust_anchor_transparency_previous_checkpoint"
+    );
+    const trustAnchorTransparencyPreviousCheckpoint = (() => {
+      const value = hasTrustAnchorTransparencyPreviousCheckpoint
+        ? payload.trust_anchor_transparency_previous_checkpoint
+        : existing?.trust_anchor_transparency_previous_checkpoint;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim().toLowerCase();
+      return normalized || null;
+    })();
+    const hasTrustAnchorTransparencyEventIndex = Object.prototype.hasOwnProperty.call(
+      payload,
+      "trust_anchor_transparency_event_index"
+    );
+    const trustAnchorTransparencyEventIndex = (() => {
+      const value = hasTrustAnchorTransparencyEventIndex
+        ? payload.trust_anchor_transparency_event_index
+        : existing?.trust_anchor_transparency_event_index;
+      const parsed = parseNonNegativeInteger(value, -1);
+      return parsed >= 0 ? parsed : null;
+    })();
+    const hasTrustAnchorTransparencyVerifiedAt = Object.prototype.hasOwnProperty.call(
+      payload,
+      "trust_anchor_transparency_verified_at"
+    );
+    const trustAnchorTransparencyVerifiedAt = (() => {
+      const value = hasTrustAnchorTransparencyVerifiedAt
+        ? payload.trust_anchor_transparency_verified_at
+        : existing?.trust_anchor_transparency_verified_at;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
     const deliverUrl = normalizeFederationDeliverUrl(payload.deliver_url || existing?.deliver_url || null, {
       allowInsecureHttp,
       allowPrivateNetwork
@@ -2897,6 +4652,79 @@ export class LoomStore {
         allowPrivateNetwork
       }
     );
+    const hasNodeDocumentUrl = Object.prototype.hasOwnProperty.call(payload, "node_document_url");
+    const nodeDocumentUrl = normalizeFederationNodeDocumentUrl(
+      hasNodeDocumentUrl ? payload.node_document_url : existing?.node_document_url || null,
+      {
+        allowInsecureHttp,
+        allowPrivateNetwork
+      }
+    );
+    const hasProtocolCapabilitiesUrl = Object.prototype.hasOwnProperty.call(payload, "protocol_capabilities_url");
+    const protocolCapabilitiesUrl = normalizeFederationProtocolCapabilitiesUrl(
+      hasProtocolCapabilitiesUrl ? payload.protocol_capabilities_url : existing?.protocol_capabilities_url || null,
+      {
+        allowInsecureHttp,
+        allowPrivateNetwork
+      }
+    );
+    const hasProtocolCapabilities = Object.prototype.hasOwnProperty.call(payload, "protocol_capabilities");
+    const protocolCapabilities = hasProtocolCapabilities
+      ? normalizeProtocolCapabilitiesDocument(payload.protocol_capabilities)
+      : normalizeProtocolCapabilitiesDocument(existing?.protocol_capabilities);
+    const hasProtocolCapabilitiesFetchedAt = Object.prototype.hasOwnProperty.call(
+      payload,
+      "protocol_capabilities_fetched_at"
+    );
+    const protocolCapabilitiesFetchedAt = (() => {
+      const value = hasProtocolCapabilitiesFetchedAt
+        ? payload.protocol_capabilities_fetched_at
+        : existing?.protocol_capabilities_fetched_at;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const hasProtocolCapabilitiesFetchError = Object.prototype.hasOwnProperty.call(
+      payload,
+      "protocol_capabilities_fetch_error"
+    );
+    const protocolCapabilitiesFetchError = (() => {
+      const value = hasProtocolCapabilitiesFetchError
+        ? payload.protocol_capabilities_fetch_error
+        : existing?.protocol_capabilities_fetch_error;
+      if (value == null) {
+        return null;
+      }
+      const normalized = String(value).trim();
+      return normalized || null;
+    })();
+    const derivedProtocolNegotiation = protocolCapabilities
+      ? this.deriveFederationProtocolNegotiationState(protocolCapabilities)
+      : null;
+    const hasNegotiatedE2eeProfiles = Object.prototype.hasOwnProperty.call(payload, "negotiated_e2ee_profiles");
+    const negotiatedE2eeProfiles = hasNegotiatedE2eeProfiles
+      ? normalizeProtocolCapabilityE2eeProfiles(payload.negotiated_e2ee_profiles)
+      : normalizeProtocolCapabilityE2eeProfiles(
+          existing?.negotiated_e2ee_profiles || derivedProtocolNegotiation?.negotiated_e2ee_profiles
+        );
+    const hasProtocolNegotiatedTrustAnchorMode = Object.prototype.hasOwnProperty.call(
+      payload,
+      "protocol_negotiated_trust_anchor_mode"
+    );
+    const protocolNegotiatedTrustAnchorMode = (() => {
+      const rawValue = hasProtocolNegotiatedTrustAnchorMode
+        ? payload.protocol_negotiated_trust_anchor_mode
+        : existing?.protocol_negotiated_trust_anchor_mode || derivedProtocolNegotiation?.negotiated_trust_anchor_mode;
+      const normalized = String(rawValue || "").trim();
+      if (!normalized) {
+        return null;
+      }
+      return normalizeFederationTrustMode(normalized, {
+        hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+      });
+    })();
 
     const node = {
       node_id: nodeId,
@@ -2905,10 +4733,35 @@ export class LoomStore {
       signing_keys: signingKeys,
       deliver_url: deliverUrl,
       identity_resolve_url: identityResolveUrl,
+      node_document_url: nodeDocumentUrl,
+      protocol_capabilities_url: protocolCapabilitiesUrl,
+      protocol_capabilities: protocolCapabilities,
+      protocol_capabilities_fetched_at: protocolCapabilitiesFetchedAt,
+      protocol_capabilities_fetch_error: protocolCapabilitiesFetchError,
+      negotiated_e2ee_profiles: negotiatedE2eeProfiles,
+      protocol_negotiated_trust_anchor_mode: protocolNegotiatedTrustAnchorMode,
       allow_insecure_http: allowInsecureHttp,
       allow_private_network: allowPrivateNetwork,
       configured_policy: configuredPolicy,
       policy: configuredPolicy,
+      trust_anchor_mode: trustAnchorMode,
+      trust_anchor_dns_name: trustAnchorDnsName,
+      trust_anchor_dns_record: trustAnchorDnsRecord,
+      trust_anchor_keyset_url: trustAnchorKeysetUrl,
+      trust_anchor_keyset_hash: trustAnchorKeysetHash,
+      trust_anchor_keyset_version: trustAnchorKeysetVersion,
+      trust_anchor_epoch: trustAnchorEpoch,
+      trust_anchor_verified_at: trustAnchorVerifiedAt,
+      trust_anchor_revocations_url: trustAnchorRevocationsUrl,
+      trust_anchor_dnssec_validated: trustAnchorDnssecValidated,
+      trust_anchor_dnssec_source: trustAnchorDnssecSource,
+      trust_anchor_transparency_log_id: trustAnchorTransparencyLogId,
+      trust_anchor_transparency_mode: trustAnchorTransparencyMode,
+      trust_anchor_transparency_checkpoint: trustAnchorTransparencyCheckpoint,
+      trust_anchor_transparency_previous_checkpoint: trustAnchorTransparencyPreviousCheckpoint,
+      trust_anchor_transparency_event_index: trustAnchorTransparencyEventIndex,
+      trust_anchor_transparency_verified_at: trustAnchorTransparencyVerifiedAt,
+      revoked_key_ids: revokedKeyIds,
       auto_policy: hasExplicitPolicy ? null : existing?.auto_policy || null,
       auto_policy_until: hasExplicitPolicy ? null : existing?.auto_policy_until || null,
       auto_policy_reason: hasExplicitPolicy ? null : existing?.auto_policy_reason || null,
@@ -2947,6 +4800,191 @@ export class LoomStore {
     return Array.from(this.knownNodesById.values()).sort((a, b) => a.node_id.localeCompare(b.node_id));
   }
 
+  buildFederationNodeRevalidationPayload(node, overrides = {}) {
+    const existingNode = node && typeof node === "object" ? node : null;
+    if (!existingNode?.node_id) {
+      throw new LoomError("ENVELOPE_INVALID", "Known federation node is required for trust revalidation", 400, {
+        field: "node"
+      });
+    }
+
+    const requestedNodeDocumentUrl = String(
+      overrides.node_document_url || existingNode.node_document_url || ""
+    ).trim();
+    const fallbackNodeDocumentUrl = `https://${existingNode.node_id}/.well-known/loom.json`;
+    const deliverUrlHost = (() => {
+      try {
+        return new URL(String(existingNode.deliver_url || "")).hostname;
+      } catch {
+        return null;
+      }
+    })();
+    const allowCrossHostDeliverUrl = Boolean(
+      deliverUrlHost && String(deliverUrlHost).trim().toLowerCase() !== String(existingNode.node_id).trim().toLowerCase()
+    );
+
+    return {
+      node_document_url: requestedNodeDocumentUrl || fallbackNodeDocumentUrl,
+      allow_insecure_http: existingNode.allow_insecure_http === true,
+      allow_private_network: existingNode.allow_private_network === true,
+      allow_cross_host_deliver_url: allowCrossHostDeliverUrl,
+      deliver_url: existingNode.deliver_url || undefined,
+      identity_resolve_url: existingNode.identity_resolve_url || undefined,
+      protocol_capabilities_url: existingNode.protocol_capabilities_url || undefined,
+      policy: existingNode.configured_policy || existingNode.policy || "trusted",
+      trust_anchor_mode: existingNode.trust_anchor_mode || this.federationTrustMode,
+      trust_anchor_keyset_url: existingNode.trust_anchor_keyset_url || undefined,
+      trust_anchor_revocations_url: existingNode.trust_anchor_revocations_url || undefined,
+      active_key_id: existingNode.key_id || undefined,
+      replace_signing_keys:
+        String(existingNode.trust_anchor_mode || "").trim().toLowerCase() === "public_dns_webpki",
+      timeout_ms: overrides.timeout_ms || undefined,
+      max_response_bytes: overrides.max_response_bytes || undefined
+    };
+  }
+
+  async revalidateFederationNodeTrust(nodeId, actorIdentity, options = {}) {
+    const normalizedNodeId = String(nodeId || "").trim();
+    if (!normalizedNodeId) {
+      throw new LoomError("ENVELOPE_INVALID", "node_id is required for federation node revalidation", 400, {
+        field: "node_id"
+      });
+    }
+
+    const node = this.knownNodesById.get(normalizedNodeId);
+    if (!node) {
+      throw new LoomError("ENVELOPE_INVALID", `Unknown federation node: ${normalizedNodeId}`, 400, {
+        node_id: normalizedNodeId
+      });
+    }
+
+    const mode = String(node.trust_anchor_mode || "").trim().toLowerCase();
+    const includeNonPublic = options.include_non_public_modes === true;
+    if (mode !== "public_dns_webpki" && !includeNonPublic) {
+      return {
+        node_id: normalizedNodeId,
+        status: "skipped",
+        reason: "trust_mode_not_public_dns_webpki",
+        trust_anchor_mode: node.trust_anchor_mode || null
+      };
+    }
+
+    const payload = this.buildFederationNodeRevalidationPayload(node, options);
+    const previousTrustEpoch = Math.max(0, parseNonNegativeInteger(node.trust_anchor_epoch, 0));
+    const previousKeysetVersion = Math.max(0, parseNonNegativeInteger(node.trust_anchor_keyset_version, 0));
+    const previousKeysetHash = normalizeHexDigest(node.trust_anchor_keyset_hash) || null;
+
+    const result = await this.bootstrapFederationNode(payload, actorIdentity);
+    const updatedNode = result?.node || this.knownNodesById.get(normalizedNodeId);
+    const nextTrustEpoch = Math.max(0, parseNonNegativeInteger(updatedNode?.trust_anchor_epoch, 0));
+    const nextKeysetVersion = Math.max(0, parseNonNegativeInteger(updatedNode?.trust_anchor_keyset_version, 0));
+    const nextKeysetHash = normalizeHexDigest(updatedNode?.trust_anchor_keyset_hash) || null;
+
+    this.persistAndAudit("federation.node.revalidate", {
+      node_id: normalizedNodeId,
+      trust_anchor_mode: updatedNode?.trust_anchor_mode || null,
+      previous_trust_epoch: previousTrustEpoch,
+      next_trust_epoch: nextTrustEpoch,
+      previous_keyset_version: previousKeysetVersion,
+      next_keyset_version: nextKeysetVersion,
+      previous_keyset_hash: previousKeysetHash,
+      next_keyset_hash: nextKeysetHash,
+      actor: actorIdentity
+    });
+
+    return {
+      node_id: normalizedNodeId,
+      status: "revalidated",
+      node: updatedNode,
+      previous: {
+        trust_epoch: previousTrustEpoch,
+        keyset_version: previousKeysetVersion,
+        keyset_hash: previousKeysetHash
+      },
+      next: {
+        trust_epoch: nextTrustEpoch,
+        keyset_version: nextKeysetVersion,
+        keyset_hash: nextKeysetHash
+      },
+      discovery: result?.discovery || null
+    };
+  }
+
+  async revalidateFederationNodesTrust(payload, actorIdentity) {
+    const options = payload && typeof payload === "object" ? payload : {};
+    const includeNonPublic = options.include_non_public_modes === true;
+    const continueOnError = options.continue_on_error !== false;
+    const requestedNodeIds = Array.isArray(options.node_ids)
+      ? Array.from(
+          new Set(
+            options.node_ids
+              .map((entry) => String(entry || "").trim())
+              .filter(Boolean)
+          )
+        )
+      : [];
+    const targetNodeIds =
+      requestedNodeIds.length > 0
+        ? requestedNodeIds
+        : Array.from(this.knownNodesById.keys()).sort((left, right) => left.localeCompare(right));
+    const limit = Math.max(1, Math.min(parsePositiveInteger(options.limit, targetNodeIds.length || 1), 1000));
+
+    const processed = [];
+    const skipped = [];
+    const failed = [];
+
+    for (const nodeId of targetNodeIds.slice(0, limit)) {
+      try {
+        const result = await this.revalidateFederationNodeTrust(nodeId, actorIdentity, {
+          include_non_public_modes: includeNonPublic,
+          timeout_ms: options.timeout_ms,
+          max_response_bytes: options.max_response_bytes,
+          node_document_url:
+            options.node_document_urls && typeof options.node_document_urls === "object"
+              ? options.node_document_urls[nodeId]
+              : null
+        });
+        if (result?.status === "skipped") {
+          skipped.push(result);
+        } else {
+          processed.push(result);
+        }
+      } catch (error) {
+        const failure = {
+          node_id: nodeId,
+          status: "failed",
+          error_code: error?.code || "UNKNOWN",
+          error: error?.message || String(error)
+        };
+        failed.push(failure);
+        if (!continueOnError) {
+          const summaryError = new LoomError("NODE_UNREACHABLE", "Federation node revalidation failed", 502, {
+            node_id: nodeId,
+            error_code: failure.error_code,
+            reason: failure.error
+          });
+          summaryError.details = {
+            processed,
+            skipped,
+            failed
+          };
+          throw summaryError;
+        }
+      }
+    }
+
+    return {
+      requested_count: targetNodeIds.length,
+      attempted_count: Math.min(limit, targetNodeIds.length),
+      revalidated_count: processed.length,
+      skipped_count: skipped.length,
+      failed_count: failed.length,
+      processed,
+      skipped,
+      failed
+    };
+  }
+
   resolveFederationBootstrapNodeDocumentUrl(payload) {
     const explicitUrl = String(payload?.node_document_url || payload?.well_known_url || "").trim();
     if (explicitUrl) {
@@ -2961,6 +4999,1004 @@ export class LoomStore {
     }
 
     return `https://${targetDomain}/.well-known/loom.json`;
+  }
+
+  resolveFederationBootstrapTrustMode(payload) {
+    const hasOverride = payload && Object.prototype.hasOwnProperty.call(payload, "trust_anchor_mode");
+    return normalizeFederationTrustMode(hasOverride ? payload?.trust_anchor_mode : this.federationTrustMode, {
+      hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+    });
+  }
+
+  resolveFederationTrustDnsName(nodeId) {
+    const rawAuthority = String(nodeId || "")
+      .trim()
+      .toLowerCase()
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//, "")
+      .split("/")[0];
+    let hostOnly = rawAuthority;
+    if (rawAuthority.startsWith("[") && rawAuthority.includes("]")) {
+      hostOnly = rawAuthority.slice(1, rawAuthority.indexOf("]"));
+    } else if (rawAuthority.includes(":")) {
+      hostOnly = rawAuthority.split(":")[0];
+    }
+    const normalizedNodeAuthority = normalizeHostname(hostOnly);
+    if (!normalizedNodeAuthority) {
+      throw new LoomError("ENVELOPE_INVALID", "Federation node_id is required for trust-anchor DNS lookup", 400, {
+        field: "node_id"
+      });
+    }
+    const label = String(this.federationTrustDnsTxtLabel || "_loomfed")
+      .trim()
+      .replace(/\.+$/, "");
+    const normalizedLabel = label.length > 0 ? label : "_loomfed";
+    return `${normalizedLabel}.${normalizedNodeAuthority}`;
+  }
+
+  async resolveFederationTrustDnsProof(nodeId) {
+    const dnsName = this.resolveFederationTrustDnsName(nodeId);
+    let resolverResult;
+    try {
+      resolverResult = normalizeFederationTrustDnsResolverResult(await this.federationTrustDnsTxtResolver(dnsName));
+    } catch (error) {
+      if (this.federationTrustFailClosed) {
+        throw new LoomError("NODE_UNREACHABLE", "Failed to resolve federation trust-anchor DNS TXT record", 502, {
+          node_id: nodeId,
+          dns_name: dnsName,
+          reason: error?.message || String(error)
+        });
+      }
+      return {
+        dns_name: dnsName,
+        record: null,
+        fields: {},
+        all_records: [],
+        dnssec_validated: false,
+        dnssec_source: null
+      };
+    }
+
+    if (this.federationTrustRequireDnssec && resolverResult.dnssec_validated !== true) {
+      throw new LoomError(
+        "SIGNATURE_INVALID",
+        "Federation trust-anchor DNS TXT lookup did not provide DNSSEC-validated proof",
+        401,
+        {
+          node_id: nodeId,
+          dns_name: dnsName,
+          dnssec_validated: resolverResult.dnssec_validated === true,
+          dnssec_source: resolverResult.dnssec_source || null
+        }
+      );
+    }
+
+    const records = resolverResult.records;
+    const candidates = records
+      .map((record) => ({
+        record,
+        fields: parseFederationTrustDnsTxtRecord(record)
+      }))
+      .filter((candidate) => Object.keys(candidate.fields).length > 0)
+      .filter((candidate) => {
+        const version = String(candidate.fields.v || candidate.fields.version || "")
+          .trim()
+          .toLowerCase();
+        if (!version) {
+          return true;
+        }
+        return version === "loomfed1" || version === "loom1" || version === "loom-federation-1";
+      });
+
+    const preferred =
+      candidates.find((candidate) => {
+        const hasKeysetUrl = Boolean(candidate.fields.keyset || candidate.fields.ks || candidate.fields.k);
+        const hasDigest = Boolean(candidate.fields.digest || candidate.fields.sha256 || candidate.fields.hash || candidate.fields.h);
+        return hasKeysetUrl && hasDigest;
+      }) ||
+      candidates[0] ||
+      null;
+
+    if (!preferred && this.federationTrustFailClosed) {
+      throw new LoomError("SIGNATURE_INVALID", "Federation trust-anchor DNS TXT record is missing or invalid", 401, {
+        node_id: nodeId,
+        dns_name: dnsName
+      });
+    }
+
+    return {
+      dns_name: dnsName,
+      record: preferred?.record || null,
+      fields: preferred?.fields || {},
+      all_records: records,
+      dnssec_validated: resolverResult.dnssec_validated === true,
+      dnssec_source: resolverResult.dnssec_source || null
+    };
+  }
+
+  deriveFederationTrustTransparencyState(nodeId, trustEpoch, keysetVersion, keysetHash, previousNode = null) {
+    const normalizedNodeId = String(nodeId || "").trim();
+    const normalizedHash = normalizeHexDigest(keysetHash);
+    const normalizedEpoch = Math.max(0, parseNonNegativeInteger(trustEpoch, 0));
+    const normalizedVersion = Math.max(0, parseNonNegativeInteger(keysetVersion, 0));
+    if (!normalizedNodeId || !normalizedHash) {
+      throw new LoomError("ENVELOPE_INVALID", "Transparency state requires node_id and keyset hash", 400, {
+        node_id: normalizedNodeId || null
+      });
+    }
+
+    const previous = previousNode && typeof previousNode === "object" ? previousNode : this.knownNodesById.get(normalizedNodeId) || null;
+    const previousCheckpoint = String(previous?.trust_anchor_transparency_checkpoint || "")
+      .trim()
+      .toLowerCase() || null;
+    const previousEventIndex = parseNonNegativeInteger(previous?.trust_anchor_transparency_event_index, -1);
+    const previousEpoch = Math.max(0, parseNonNegativeInteger(previous?.trust_anchor_epoch, 0));
+    const previousVersion = Math.max(0, parseNonNegativeInteger(previous?.trust_anchor_keyset_version, 0));
+    const previousHash = normalizeHexDigest(previous?.trust_anchor_keyset_hash);
+
+    if (
+      previous &&
+      previousHash === normalizedHash &&
+      previousEpoch === normalizedEpoch &&
+      previousVersion === normalizedVersion &&
+      previousCheckpoint &&
+      previousEventIndex >= 0
+    ) {
+      return {
+        log_id: String(previous?.trust_anchor_transparency_log_id || `loom-local-trust-log:${this.nodeId}`).trim(),
+        mode: String(previous?.trust_anchor_transparency_mode || this.federationTrustTransparencyMode).trim().toLowerCase(),
+        checkpoint: previousCheckpoint,
+        previous_checkpoint: String(previous?.trust_anchor_transparency_previous_checkpoint || "")
+          .trim()
+          .toLowerCase() || null,
+        event_index: previousEventIndex,
+        verified_at: String(previous?.trust_anchor_transparency_verified_at || "")
+          .trim() || nowIso(),
+        appended: false
+      };
+    }
+
+    const eventIndex = Math.max(0, previousEventIndex + 1);
+    const payload = {
+      type: "loom.federation.transparency.event@v1",
+      node_id: normalizedNodeId,
+      trust_epoch: normalizedEpoch,
+      keyset_version: normalizedVersion,
+      keyset_hash: normalizedHash,
+      previous_checkpoint: previousCheckpoint,
+      event_index: eventIndex
+    };
+    const checkpoint = createHash("sha256").update(canonicalizeJson(payload), "utf-8").digest("hex");
+    return {
+      log_id: `loom-local-trust-log:${this.nodeId}`,
+      mode: this.federationTrustTransparencyMode,
+      checkpoint,
+      previous_checkpoint: previousCheckpoint,
+      event_index: eventIndex,
+      verified_at: nowIso(),
+      appended: true
+    };
+  }
+
+  async fetchFederationJsonDocument(url, options = {}) {
+    const allowInsecureHttp = options.allowInsecureHttp === true;
+    const allowPrivateNetwork = options.allowPrivateNetwork === true;
+    const timeoutMs = Math.max(500, parsePositiveInteger(options.timeoutMs, 5000));
+    const maxResponseBytes = Math.max(1024, parsePositiveInteger(options.maxResponseBytes, 256 * 1024));
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(String(url || ""));
+    } catch {
+      throw new LoomError("ENVELOPE_INVALID", "Federation document URL must be a valid absolute URL", 400, {
+        field: options.field || "url"
+      });
+    }
+
+    if (parsedUrl.username || parsedUrl.password) {
+      throw new LoomError("ENVELOPE_INVALID", "Federation document URL must not include credentials", 400, {
+        field: options.field || "url"
+      });
+    }
+
+    if (parsedUrl.protocol !== "https:" && !(allowInsecureHttp && parsedUrl.protocol === "http:")) {
+      throw new LoomError("ENVELOPE_INVALID", "Federation document URL must use https unless allow_insecure_http=true", 400, {
+        field: options.field || "url",
+        protocol: parsedUrl.protocol
+      });
+    }
+
+    const hostPolicy = await assertOutboundUrlHostAllowed(parsedUrl, {
+      allowPrivateNetwork,
+      allowedHosts: options.allowedHosts || this.federationBootstrapHostAllowlist,
+      denyMetadataHosts: this.denyMetadataHosts
+    });
+
+    let response;
+    try {
+      response = await performPinnedOutboundHttpRequest(parsedUrl, {
+        method: "GET",
+        headers: {
+          accept: "application/json"
+        },
+        timeoutMs,
+        maxResponseBytes,
+        responseSizeContext: {
+          url: parsedUrl.toString(),
+          field: options.field || "url"
+        },
+        resolvedAddresses: hostPolicy.resolvedAddresses,
+        rejectRedirects: true
+      });
+    } catch (error) {
+      if (error instanceof LoomError) {
+        throw error;
+      }
+      if (error?.name === "AbortError") {
+        throw new LoomError("DELIVERY_TIMEOUT", "Federation document fetch timed out", 504, {
+          url: parsedUrl.toString(),
+          timeout_ms: timeoutMs
+        });
+      }
+      throw new LoomError("NODE_UNREACHABLE", "Federation document fetch failed", 502, {
+        url: parsedUrl.toString(),
+        reason: error?.message || String(error)
+      });
+    }
+
+    if (!response.ok) {
+      throw new LoomError("NODE_UNREACHABLE", `Federation document fetch returned ${response.status}`, 502, {
+        url: parsedUrl.toString(),
+        status: response.status
+      });
+    }
+
+    try {
+      return {
+        url: parsedUrl.toString(),
+        payload: JSON.parse(response.bodyText)
+      };
+    } catch {
+      throw new LoomError("ENVELOPE_INVALID", "Federation document response must be valid JSON", 400, {
+        field: options.field || "url",
+        url: parsedUrl.toString()
+      });
+    }
+  }
+
+  deriveFederationProtocolNegotiationState(protocolCapabilities) {
+    const normalizedCapabilities = normalizeProtocolCapabilitiesDocument(protocolCapabilities);
+    if (!normalizedCapabilities) {
+      return null;
+    }
+
+    const localTrustAnchorMode = this.getFederationTrustAnchorMode();
+    const localE2eeProfiles = listSupportedE2eeProfiles();
+    const remoteE2eeProfiles = normalizeProtocolCapabilityE2eeProfiles(
+      normalizedCapabilities?.federation_negotiation?.e2ee_profiles
+    );
+    const negotiatedE2eeProfiles = intersectStrings(localE2eeProfiles, remoteE2eeProfiles);
+    const remoteTrustAnchorModes = normalizeProtocolCapabilityTrustModes(
+      normalizedCapabilities?.federation_negotiation?.trust_anchor_modes_supported
+    );
+    const remoteTrustAnchorMode = normalizeFederationTrustMode(
+      normalizedCapabilities?.federation_negotiation?.trust_anchor_mode,
+      {
+        hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+      }
+    );
+    const remoteTrustAnchorModesSupported =
+      remoteTrustAnchorModes.length > 0
+        ? remoteTrustAnchorModes
+        : Array.from(new Set([remoteTrustAnchorMode].filter(Boolean)));
+    const trustModeParity = remoteTrustAnchorModesSupported.includes(localTrustAnchorMode);
+
+    return {
+      protocol_capabilities: normalizedCapabilities,
+      local_e2ee_profiles: localE2eeProfiles,
+      remote_e2ee_profiles: remoteE2eeProfiles,
+      negotiated_e2ee_profiles: negotiatedE2eeProfiles,
+      local_trust_anchor_mode: localTrustAnchorMode,
+      remote_trust_anchor_modes_supported: remoteTrustAnchorModesSupported,
+      negotiated_trust_anchor_mode: trustModeParity ? localTrustAnchorMode : null,
+      trust_mode_parity: trustModeParity
+    };
+  }
+
+  assertFederationProtocolNegotiationRequirements(negotiationState, context = {}) {
+    const nodeId = String(context.node_id || "").trim() || null;
+    const state = negotiationState && typeof negotiationState === "object" ? negotiationState : null;
+    const hasProtocolCapabilities = Boolean(state?.protocol_capabilities);
+
+    if (this.federationRequireProtocolCapabilities && !hasProtocolCapabilities) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Federation node must publish protocol capabilities for negotiation",
+        403,
+        {
+          node_id: nodeId,
+          requirement: "protocol_capabilities"
+        }
+      );
+    }
+
+    if (this.federationRequireTrustModeParity) {
+      const parity = state?.trust_mode_parity === true;
+      if (!parity) {
+        throw new LoomError(
+          "CAPABILITY_DENIED",
+          "Federation trust-anchor mode parity negotiation failed",
+          403,
+          {
+            node_id: nodeId,
+            local_trust_anchor_mode: state?.local_trust_anchor_mode || this.getFederationTrustAnchorMode(),
+            remote_trust_anchor_modes_supported: state?.remote_trust_anchor_modes_supported || []
+          }
+        );
+      }
+    }
+
+    if (this.federationRequireE2eeProfileOverlap) {
+      const overlap = normalizeProtocolCapabilityE2eeProfiles(state?.negotiated_e2ee_profiles);
+      if (overlap.length === 0) {
+        throw new LoomError("CAPABILITY_DENIED", "Federation E2EE profile negotiation overlap is required", 403, {
+          node_id: nodeId,
+          local_e2ee_profiles: state?.local_e2ee_profiles || listSupportedE2eeProfiles(),
+          remote_e2ee_profiles: state?.remote_e2ee_profiles || []
+        });
+      }
+    }
+  }
+
+  resolveFederationProtocolCapabilitiesDiscoveryUrl({
+    payload,
+    nodeDocument,
+    nodeDocumentUrl,
+    allowInsecureHttp,
+    allowPrivateNetwork
+  }) {
+    const overrideUrl = String(payload?.protocol_capabilities_url || "").trim();
+    const discoveredUrl = String(
+      nodeDocument?.protocol_capabilities_url || nodeDocument?.federation?.protocol_capabilities_url || ""
+    ).trim();
+    const fallbackUrl = new URL("/v1/protocol/capabilities", nodeDocumentUrl).toString();
+    const candidate = overrideUrl || discoveredUrl || fallbackUrl;
+    if (!candidate) {
+      return null;
+    }
+
+    return normalizeFederationProtocolCapabilitiesUrl(candidate, {
+      allowInsecureHttp,
+      allowPrivateNetwork
+    });
+  }
+
+  async fetchFederationProtocolCapabilitiesState({
+    payload,
+    nodeId,
+    nodeDocument,
+    nodeDocumentUrl,
+    allowInsecureHttp,
+    allowPrivateNetwork,
+    timeoutMs,
+    maxResponseBytes,
+    failOnMissing = false,
+    failOnFetchError = false
+  }) {
+    const protocolCapabilitiesUrl = this.resolveFederationProtocolCapabilitiesDiscoveryUrl({
+      payload,
+      nodeDocument,
+      nodeDocumentUrl,
+      allowInsecureHttp,
+      allowPrivateNetwork
+    });
+    if (!protocolCapabilitiesUrl) {
+      if (failOnMissing) {
+        throw new LoomError("CAPABILITY_DENIED", "Federation node is missing protocol_capabilities_url", 403, {
+          node_id: nodeId
+        });
+      }
+      return {
+        protocol_capabilities_url: null,
+        protocol_capabilities: null,
+        protocol_capabilities_fetched_at: null,
+        protocol_capabilities_fetch_error: null,
+        negotiated_e2ee_profiles: [],
+        protocol_negotiated_trust_anchor_mode: null
+      };
+    }
+
+    try {
+      const document = await this.fetchFederationJsonDocument(protocolCapabilitiesUrl, {
+        allowInsecureHttp,
+        allowPrivateNetwork,
+        timeoutMs,
+        maxResponseBytes,
+        field: "protocol_capabilities_url",
+        allowedHosts:
+          this.federationBootstrapHostAllowlist.length > 0
+            ? this.federationBootstrapHostAllowlist
+            : this.federationOutboundHostAllowlist
+      });
+      const normalizedCapabilities = normalizeProtocolCapabilitiesDocument(document.payload);
+      if (!normalizedCapabilities) {
+        throw new LoomError(
+          "ENVELOPE_INVALID",
+          "Federation protocol capabilities document is malformed",
+          400,
+          {
+            node_id: nodeId,
+            url: document.url
+          }
+        );
+      }
+
+      const capabilityNodeId = String(normalizedCapabilities.node_id || "").trim();
+      if (capabilityNodeId && capabilityNodeId !== nodeId) {
+        throw new LoomError("ENVELOPE_INVALID", "Federation protocol capabilities node_id mismatch", 400, {
+          expected_node_id: nodeId,
+          capability_node_id: capabilityNodeId
+        });
+      }
+
+      const negotiation = this.deriveFederationProtocolNegotiationState(normalizedCapabilities);
+      const result = {
+        protocol_capabilities_url: document.url,
+        protocol_capabilities: normalizedCapabilities,
+        protocol_capabilities_fetched_at: nowIso(),
+        protocol_capabilities_fetch_error: null,
+        negotiated_e2ee_profiles: normalizeProtocolCapabilityE2eeProfiles(negotiation?.negotiated_e2ee_profiles),
+        protocol_negotiated_trust_anchor_mode: negotiation?.negotiated_trust_anchor_mode || null
+      };
+      this.assertFederationProtocolNegotiationRequirements(
+        {
+          ...negotiation,
+          protocol_capabilities: normalizedCapabilities
+        },
+        {
+          node_id: nodeId
+        }
+      );
+      return result;
+    } catch (error) {
+      if (failOnFetchError) {
+        throw error;
+      }
+      return {
+        protocol_capabilities_url: protocolCapabilitiesUrl,
+        protocol_capabilities: null,
+        protocol_capabilities_fetched_at: nowIso(),
+        protocol_capabilities_fetch_error: error?.message || String(error),
+        negotiated_e2ee_profiles: [],
+        protocol_negotiated_trust_anchor_mode: null
+      };
+    }
+  }
+
+  async ensureFederationNodeProtocolCapabilities(node, actorIdentity = "system", options = {}) {
+    const existingNode = node && typeof node === "object" ? node : null;
+    if (!existingNode?.node_id) {
+      return existingNode;
+    }
+
+    const forceRefresh = options.forceRefresh === true;
+    const hasCapabilities = Boolean(existingNode.protocol_capabilities);
+    const hasFetchError = Boolean(String(existingNode.protocol_capabilities_fetch_error || "").trim());
+    if (!forceRefresh && hasCapabilities && !hasFetchError) {
+      const negotiation = this.deriveFederationProtocolNegotiationState(existingNode.protocol_capabilities);
+      this.assertFederationProtocolNegotiationRequirements(
+        {
+          ...negotiation,
+          protocol_capabilities: existingNode.protocol_capabilities
+        },
+        {
+          node_id: existingNode.node_id
+        }
+      );
+      if (
+        Array.isArray(existingNode.negotiated_e2ee_profiles) &&
+        existingNode.negotiated_e2ee_profiles.length > 0 &&
+        existingNode.protocol_negotiated_trust_anchor_mode
+      ) {
+        return existingNode;
+      }
+    }
+
+    const nodeDocumentUrlRaw = String(existingNode.node_document_url || "").trim();
+    let nodeDocumentUrl;
+    try {
+      nodeDocumentUrl = nodeDocumentUrlRaw ? new URL(nodeDocumentUrlRaw) : new URL(`https://${existingNode.node_id}/.well-known/loom.json`);
+    } catch {
+      nodeDocumentUrl = new URL(`https://${existingNode.node_id}/.well-known/loom.json`);
+    }
+
+    const capabilityState = await this.fetchFederationProtocolCapabilitiesState({
+      payload: {
+        protocol_capabilities_url: existingNode.protocol_capabilities_url || null
+      },
+      nodeId: existingNode.node_id,
+      nodeDocument: {
+        node_id: existingNode.node_id,
+        protocol_capabilities_url: existingNode.protocol_capabilities_url
+      },
+      nodeDocumentUrl,
+      allowInsecureHttp: existingNode.allow_insecure_http === true,
+      allowPrivateNetwork: existingNode.allow_private_network === true,
+      timeoutMs: this.federationDeliverTimeoutMs,
+      maxResponseBytes: this.federationDeliverMaxResponseBytes,
+      failOnMissing: options.failOnMissing === true,
+      failOnFetchError: options.failOnFetchError === true
+    });
+
+    const nextNode = {
+      ...existingNode,
+      protocol_capabilities_url: capabilityState.protocol_capabilities_url,
+      protocol_capabilities: capabilityState.protocol_capabilities,
+      protocol_capabilities_fetched_at: capabilityState.protocol_capabilities_fetched_at,
+      protocol_capabilities_fetch_error: capabilityState.protocol_capabilities_fetch_error,
+      negotiated_e2ee_profiles: normalizeProtocolCapabilityE2eeProfiles(capabilityState.negotiated_e2ee_profiles),
+      protocol_negotiated_trust_anchor_mode: capabilityState.protocol_negotiated_trust_anchor_mode || null
+    };
+
+    const previousSnapshot = canonicalizeJson({
+      protocol_capabilities_url: existingNode.protocol_capabilities_url || null,
+      protocol_capabilities: normalizeProtocolCapabilitiesDocument(existingNode.protocol_capabilities),
+      protocol_capabilities_fetched_at: existingNode.protocol_capabilities_fetched_at || null,
+      protocol_capabilities_fetch_error: existingNode.protocol_capabilities_fetch_error || null,
+      negotiated_e2ee_profiles: normalizeProtocolCapabilityE2eeProfiles(existingNode.negotiated_e2ee_profiles),
+      protocol_negotiated_trust_anchor_mode: existingNode.protocol_negotiated_trust_anchor_mode || null
+    });
+    const nextSnapshot = canonicalizeJson({
+      protocol_capabilities_url: nextNode.protocol_capabilities_url || null,
+      protocol_capabilities: normalizeProtocolCapabilitiesDocument(nextNode.protocol_capabilities),
+      protocol_capabilities_fetched_at: nextNode.protocol_capabilities_fetched_at || null,
+      protocol_capabilities_fetch_error: nextNode.protocol_capabilities_fetch_error || null,
+      negotiated_e2ee_profiles: normalizeProtocolCapabilityE2eeProfiles(nextNode.negotiated_e2ee_profiles),
+      protocol_negotiated_trust_anchor_mode: nextNode.protocol_negotiated_trust_anchor_mode || null
+    });
+    if (previousSnapshot !== nextSnapshot) {
+      nextNode.updated_at = nowIso();
+      this.knownNodesById.set(nextNode.node_id, nextNode);
+      if (options.persist !== false) {
+        this.persistAndAudit("federation.node.protocol_capabilities.update", {
+          node_id: nextNode.node_id,
+          protocol_capabilities_url: nextNode.protocol_capabilities_url,
+          protocol_capabilities_fetched_at: nextNode.protocol_capabilities_fetched_at,
+          protocol_capabilities_fetch_error: nextNode.protocol_capabilities_fetch_error,
+          negotiated_e2ee_profiles: nextNode.negotiated_e2ee_profiles,
+          protocol_negotiated_trust_anchor_mode: nextNode.protocol_negotiated_trust_anchor_mode,
+          actor: actorIdentity
+        });
+      }
+    } else {
+      this.knownNodesById.set(nextNode.node_id, nextNode);
+    }
+
+    return nextNode;
+  }
+
+  assertFederationOutboxNodeCompatibility(node, envelopes = []) {
+    const normalizedNode = node && typeof node === "object" ? node : null;
+    if (!normalizedNode?.node_id) {
+      throw new LoomError("ENVELOPE_INVALID", "Known federation node is required for outbox compatibility checks", 400, {
+        field: "recipient_node"
+      });
+    }
+
+    const derivedNegotiation = normalizedNode.protocol_capabilities
+      ? this.deriveFederationProtocolNegotiationState(normalizedNode.protocol_capabilities)
+      : null;
+    const negotiationState = {
+      ...(derivedNegotiation || {}),
+      protocol_capabilities: normalizeProtocolCapabilitiesDocument(normalizedNode.protocol_capabilities)
+    };
+    this.assertFederationProtocolNegotiationRequirements(negotiationState, {
+      node_id: normalizedNode.node_id
+    });
+
+    const localTrustMode = this.getFederationTrustAnchorMode();
+    const negotiatedTrustMode = String(
+      normalizedNode.protocol_negotiated_trust_anchor_mode || derivedNegotiation?.negotiated_trust_anchor_mode || ""
+    ).trim();
+    if (this.federationRequireTrustModeParity && negotiatedTrustMode !== localTrustMode) {
+      throw new LoomError("CAPABILITY_DENIED", "Federation trust-anchor mode parity mismatch for recipient node", 403, {
+        node_id: normalizedNode.node_id,
+        local_trust_anchor_mode: localTrustMode,
+        negotiated_trust_anchor_mode: negotiatedTrustMode || null
+      });
+    }
+
+    const encryptedEnvelopeProfiles = Array.from(
+      new Set(
+        (Array.isArray(envelopes) ? envelopes : [])
+          .filter((envelope) => envelope?.content?.encrypted === true)
+          .map((envelope) => {
+            const profileValue = String(envelope?.content?.profile || "").trim();
+            const resolved = resolveE2eeProfile(profileValue);
+            return resolved?.id || profileValue;
+          })
+          .filter(Boolean)
+      )
+    );
+    if (encryptedEnvelopeProfiles.length === 0) {
+      return;
+    }
+
+    const negotiatedProfiles = normalizeProtocolCapabilityE2eeProfiles(
+      normalizedNode.negotiated_e2ee_profiles?.length > 0
+        ? normalizedNode.negotiated_e2ee_profiles
+        : derivedNegotiation?.negotiated_e2ee_profiles
+    );
+    const remoteAdvertisedProfiles = normalizeProtocolCapabilityE2eeProfiles(
+      normalizedNode.protocol_capabilities?.federation_negotiation?.e2ee_profiles
+    );
+
+    if (negotiatedProfiles.length === 0) {
+      if (this.federationRequireE2eeProfileOverlap || this.federationRequireProtocolCapabilities) {
+        throw new LoomError(
+          "CAPABILITY_DENIED",
+          "Federation E2EE profile overlap is unavailable for encrypted envelope delivery",
+          403,
+          {
+            node_id: normalizedNode.node_id,
+            encrypted_profiles: encryptedEnvelopeProfiles,
+            local_profiles: listSupportedE2eeProfiles(),
+            remote_profiles: remoteAdvertisedProfiles
+          }
+        );
+      }
+    }
+
+    const allowedProfiles = negotiatedProfiles.length > 0 ? negotiatedProfiles : remoteAdvertisedProfiles;
+    if (allowedProfiles.length === 0) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Recipient federation node does not advertise encrypted profile support",
+        403,
+        {
+          node_id: normalizedNode.node_id,
+          encrypted_profiles: encryptedEnvelopeProfiles
+        }
+      );
+    }
+
+    const unsupportedProfiles = encryptedEnvelopeProfiles.filter((profileId) => !allowedProfiles.includes(profileId));
+    if (unsupportedProfiles.length > 0) {
+      throw new LoomError(
+        "CAPABILITY_DENIED",
+        "Encrypted envelope profile is not supported by recipient federation node",
+        403,
+        {
+          node_id: normalizedNode.node_id,
+          envelope_profiles: encryptedEnvelopeProfiles,
+          allowed_profiles: allowedProfiles,
+          unsupported_profiles: unsupportedProfiles
+        }
+      );
+    }
+  }
+
+  verifySignedFederationDocument(document, signingKeys, context = {}) {
+    const signature = document?.signature;
+    if (!signature || typeof signature !== "object") {
+      throw new LoomError("SIGNATURE_INVALID", "Signed federation document is missing signature", 401, {
+        field: context.field || "signature",
+        context: context.name || null
+      });
+    }
+
+    const algorithm = String(signature.algorithm || "").trim();
+    const keyId = String(signature.key_id || "").trim();
+    const value = String(signature.value || "").trim();
+    if (algorithm !== "Ed25519" || !keyId || !value) {
+      throw new LoomError("SIGNATURE_INVALID", "Signed federation document signature metadata is invalid", 401, {
+        field: context.field || "signature",
+        context: context.name || null
+      });
+    }
+
+    const key = resolveFederationNodeSigningKey(
+      {
+        signing_keys: signingKeys
+      },
+      keyId
+    );
+    if (!key) {
+      throw new LoomError("SIGNATURE_INVALID", "Signed federation document signature key is not trusted", 401, {
+        field: `${context.field || "signature"}.key_id`,
+        context: context.name || null,
+        key_id: keyId
+      });
+    }
+
+    const canonicalPayload = canonicalizeSignedDocumentPayload(document);
+    const valid = verifyUtf8MessageSignature(key.public_key_pem, canonicalPayload, value);
+    if (!valid) {
+      throw new LoomError("SIGNATURE_INVALID", "Signed federation document signature verification failed", 401, {
+        field: context.field || "signature",
+        context: context.name || null,
+        key_id: keyId
+      });
+    }
+
+    return {
+      key_id: keyId,
+      canonical_hash: createHash("sha256").update(canonicalPayload, "utf-8").digest("hex")
+    };
+  }
+
+  verifyFederationKeysetDocumentFreshness(document, context = {}) {
+    const generatedAt = String(document?.generated_at || document?.issued_at || "").trim();
+    const generatedAtMs = generatedAt ? parseTime(generatedAt) : null;
+    if (generatedAtMs == null) {
+      if (this.federationTrustFailClosed) {
+        throw new LoomError("SIGNATURE_INVALID", "Signed federation keyset must include a valid generated_at timestamp", 401, {
+          context: context.name || "keyset"
+        });
+      }
+      return;
+    }
+
+    const now = nowMs();
+    if (generatedAtMs > now + this.federationTrustMaxClockSkewMs) {
+      throw new LoomError("SIGNATURE_INVALID", "Signed federation keyset timestamp exceeds allowed future skew", 401, {
+        context: context.name || "keyset",
+        generated_at: generatedAt
+      });
+    }
+
+    if (now - generatedAtMs > this.federationTrustKeysetMaxAgeMs) {
+      throw new LoomError("SIGNATURE_INVALID", "Signed federation keyset is too old", 401, {
+        context: context.name || "keyset",
+        generated_at: generatedAt,
+        max_age_ms: this.federationTrustKeysetMaxAgeMs
+      });
+    }
+
+    const validUntil = String(document?.valid_until || document?.expires_at || "").trim();
+    if (validUntil) {
+      const validUntilMs = parseTime(validUntil);
+      if (validUntilMs == null || validUntilMs <= now) {
+        throw new LoomError("SIGNATURE_INVALID", "Signed federation keyset has expired", 401, {
+          context: context.name || "keyset",
+          valid_until: validUntil
+        });
+      }
+    }
+  }
+
+  async resolveFederationPublicTrustMaterial({
+    payload,
+    nodeId,
+    nodeDocument,
+    nodeDocumentUrl,
+    allowInsecureHttp,
+    allowPrivateNetwork,
+    timeoutMs,
+    maxResponseBytes
+  }) {
+    const dnsProof = await this.resolveFederationTrustDnsProof(nodeId);
+    const dnsFields = dnsProof?.fields || {};
+    const dnsKeysetUrl = String(dnsFields.keyset || dnsFields.ks || dnsFields.k || "").trim();
+    const overrideKeysetUrl = String(payload?.trust_anchor_keyset_url || payload?.keyset_url || "").trim();
+    const fallbackKeysetUrl = String(
+      nodeDocument?.federation?.keyset_url || nodeDocument?.federation?.trust_keyset_url || nodeDocument?.keyset_url || ""
+    ).trim();
+    const defaultKeysetUrl = new URL("/.well-known/loom-keyset.json", nodeDocumentUrl).toString();
+    const keysetUrl = overrideKeysetUrl || dnsKeysetUrl || fallbackKeysetUrl || defaultKeysetUrl;
+    if (!keysetUrl) {
+      throw new LoomError("SIGNATURE_INVALID", "Unable to resolve federation keyset URL for trust bootstrap", 401, {
+        node_id: nodeId
+      });
+    }
+
+    if (!dnsKeysetUrl && !overrideKeysetUrl && this.federationTrustFailClosed) {
+      throw new LoomError("SIGNATURE_INVALID", "DNS trust-anchor record must publish a keyset URL", 401, {
+        node_id: nodeId,
+        dns_name: dnsProof?.dns_name || null
+      });
+    }
+
+    const keysetResponse = await this.fetchFederationJsonDocument(keysetUrl, {
+      allowInsecureHttp,
+      allowPrivateNetwork,
+      timeoutMs,
+      maxResponseBytes,
+      field: "federation.keyset_url"
+    });
+    const keysetDocument = keysetResponse.payload;
+    const keysetNodeId = String(keysetDocument?.node_id || "").trim();
+    if (keysetNodeId && keysetNodeId !== nodeId) {
+      throw new LoomError("SIGNATURE_INVALID", "Federation keyset node_id does not match discovered node", 401, {
+        expected_node_id: nodeId,
+        keyset_node_id: keysetNodeId
+      });
+    }
+
+    const keysetSigningKeys = normalizeKeysetSigningKeys(keysetDocument);
+    if (keysetSigningKeys.length === 0) {
+      throw new LoomError("SIGNATURE_INVALID", "Federation keyset document must include signing keys", 401, {
+        field: "signing_keys",
+        node_id: nodeId
+      });
+    }
+
+    this.verifySignedFederationDocument(keysetDocument, keysetSigningKeys, {
+      name: "federation_keyset",
+      field: "signature"
+    });
+    this.verifyFederationKeysetDocumentFreshness(keysetDocument, {
+      name: "federation_keyset"
+    });
+
+    const keysetHash = hashCanonicalSignedDocumentPayload(keysetDocument);
+    const expectedDigest = normalizeSha256Digest(
+      dnsFields.digest || dnsFields.sha256 || dnsFields.hash || dnsFields.h || ""
+    );
+    if (expectedDigest) {
+      if (expectedDigest !== keysetHash) {
+        throw new LoomError("SIGNATURE_INVALID", "Federation keyset hash does not match DNS trust anchor digest", 401, {
+          node_id: nodeId,
+          expected_digest: expectedDigest,
+          actual_digest: keysetHash,
+          dns_name: dnsProof?.dns_name || null
+        });
+      }
+    } else if (this.federationTrustFailClosed) {
+      throw new LoomError("SIGNATURE_INVALID", "DNS trust-anchor record must include keyset SHA-256 digest", 401, {
+        node_id: nodeId,
+        dns_name: dnsProof?.dns_name || null
+      });
+    }
+
+    const keysetEpoch =
+      parseOptionalNonNegativeInteger(keysetDocument?.trust_epoch) ??
+      parseOptionalNonNegativeInteger(keysetDocument?.epoch) ??
+      0;
+    const keysetVersion = parseOptionalNonNegativeInteger(keysetDocument?.version) ?? 0;
+    const dnsEpoch = parseOptionalNonNegativeInteger(dnsFields.trust_epoch || dnsFields.epoch) ?? null;
+    const dnsVersion = parseOptionalNonNegativeInteger(dnsFields.version) ?? null;
+    const trustEpoch = Math.max(keysetEpoch, dnsEpoch ?? 0);
+    const trustKeysetVersion = Math.max(keysetVersion, dnsVersion ?? 0);
+
+    const dnsRevocationsUrl = String(dnsFields.revocations || dnsFields.revocation || "").trim();
+    const overrideRevocationsUrl = String(payload?.trust_anchor_revocations_url || payload?.revocations_url || "").trim();
+    const fallbackRevocationsUrl = String(
+      keysetDocument?.revocations_url || nodeDocument?.federation?.revocations_url || nodeDocument?.revocations_url || ""
+    ).trim();
+    const revocationsUrl = overrideRevocationsUrl || dnsRevocationsUrl || fallbackRevocationsUrl || null;
+    let revokedKeyIds = [];
+    let revocationEpoch = 0;
+    if (revocationsUrl) {
+      const revocationsResponse = await this.fetchFederationJsonDocument(revocationsUrl, {
+        allowInsecureHttp,
+        allowPrivateNetwork,
+        timeoutMs,
+        maxResponseBytes,
+        field: "federation.revocations_url"
+      });
+      const revocationsDocument = revocationsResponse.payload;
+      const revocationsNodeId = String(revocationsDocument?.node_id || "").trim();
+      if (revocationsNodeId && revocationsNodeId !== nodeId) {
+        throw new LoomError("SIGNATURE_INVALID", "Federation revocations node_id does not match discovered node", 401, {
+          expected_node_id: nodeId,
+          revocations_node_id: revocationsNodeId
+        });
+      }
+      this.verifySignedFederationDocument(revocationsDocument, keysetSigningKeys, {
+        name: "federation_revocations",
+        field: "signature"
+      });
+      this.verifyFederationKeysetDocumentFreshness(revocationsDocument, {
+        name: "federation_revocations"
+      });
+      const revocationEntries = Array.isArray(revocationsDocument?.revoked_key_ids)
+        ? revocationsDocument.revoked_key_ids
+        : Array.isArray(revocationsDocument?.revoked_keys)
+          ? revocationsDocument.revoked_keys.map((entry) => (typeof entry === "object" ? entry?.key_id : entry))
+          : [];
+      revokedKeyIds = normalizeRevokedKeyIds(revocationEntries);
+      revocationEpoch =
+        parseOptionalNonNegativeInteger(revocationsDocument?.trust_epoch) ??
+        parseOptionalNonNegativeInteger(revocationsDocument?.epoch) ??
+        0;
+    }
+
+    const effectiveTrustEpoch = Math.max(trustEpoch, revocationEpoch);
+    const existing = this.knownNodesById.get(nodeId);
+    if (existing) {
+      const previousEpoch = Math.max(0, parseNonNegativeInteger(existing.trust_anchor_epoch, 0));
+      const previousVersion = Math.max(0, parseNonNegativeInteger(existing.trust_anchor_keyset_version, 0));
+      const previousHash = normalizeHexDigest(existing.trust_anchor_keyset_hash);
+      if (effectiveTrustEpoch < previousEpoch) {
+        throw new LoomError("SIGNATURE_INVALID", "Federation trust-anchor epoch rollback detected", 401, {
+          node_id: nodeId,
+          previous_epoch: previousEpoch,
+          next_epoch: effectiveTrustEpoch
+        });
+      }
+      if (effectiveTrustEpoch === previousEpoch && trustKeysetVersion < previousVersion) {
+        throw new LoomError("SIGNATURE_INVALID", "Federation trust-anchor keyset version rollback detected", 401, {
+          node_id: nodeId,
+          previous_version: previousVersion,
+          next_version: trustKeysetVersion
+        });
+      }
+      if (
+        effectiveTrustEpoch === previousEpoch &&
+        trustKeysetVersion === previousVersion &&
+        previousHash &&
+        previousHash !== keysetHash
+      ) {
+        throw new LoomError("SIGNATURE_INVALID", "Federation trust-anchor keyset hash changed without epoch/version increment", 401, {
+          node_id: nodeId,
+          previous_hash: previousHash,
+          next_hash: keysetHash
+        });
+      }
+      if (effectiveTrustEpoch <= previousEpoch) {
+        const previousRevoked = new Set(normalizeRevokedKeyIds(existing.revoked_key_ids));
+        const nextRevoked = new Set(revokedKeyIds);
+        for (const revokedKeyId of previousRevoked) {
+          if (!nextRevoked.has(revokedKeyId)) {
+            throw new LoomError("SIGNATURE_INVALID", "Federation trust-anchor revocation rollback detected", 401, {
+              node_id: nodeId,
+              key_id: revokedKeyId
+            });
+          }
+        }
+      }
+    }
+
+    const transparencyState = this.deriveFederationTrustTransparencyState(
+      nodeId,
+      effectiveTrustEpoch,
+      trustKeysetVersion,
+      keysetHash,
+      existing
+    );
+    if (this.federationTrustRequireTransparency && !transparencyState?.checkpoint) {
+      throw new LoomError("SIGNATURE_INVALID", "Federation trust transparency checkpoint generation failed", 401, {
+        node_id: nodeId
+      });
+    }
+
+    const verifiedAt = nowIso();
+    const signingKeys = applyRevokedKeyIdsToFederationSigningKeys(
+      keysetSigningKeys,
+      revokedKeyIds,
+      verifiedAt
+    );
+    const activeKeyId = String(keysetDocument?.active_key_id || keysetDocument?.signing_key_id || "").trim();
+    const activeKey =
+      resolveFederationNodeSigningKey({ signing_keys: signingKeys }, activeKeyId) ||
+      signingKeys.find((candidate) => isSigningKeyUsableAt(candidate)) ||
+      null;
+    if (!activeKey) {
+      throw new LoomError("SIGNATURE_INVALID", "Federation keyset does not contain any active signing key", 401, {
+        node_id: nodeId
+      });
+    }
+
+    return {
+      key_id: activeKey.key_id,
+      signing_keys: signingKeys,
+      revoked_key_ids: revokedKeyIds,
+      trust_anchor_dns_name: dnsProof?.dns_name || null,
+      trust_anchor_dns_record: dnsProof?.record || null,
+      trust_anchor_dnssec_validated: dnsProof?.dnssec_validated === true,
+      trust_anchor_dnssec_source: dnsProof?.dnssec_source || null,
+      trust_anchor_keyset_url: keysetResponse.url,
+      trust_anchor_keyset_hash: keysetHash,
+      trust_anchor_keyset_version: trustKeysetVersion,
+      trust_anchor_epoch: effectiveTrustEpoch,
+      trust_anchor_revocations_url: revocationsUrl || null,
+      trust_anchor_verified_at: verifiedAt,
+      trust_anchor_transparency_log_id: transparencyState.log_id,
+      trust_anchor_transparency_mode: transparencyState.mode,
+      trust_anchor_transparency_checkpoint: transparencyState.checkpoint,
+      trust_anchor_transparency_previous_checkpoint: transparencyState.previous_checkpoint,
+      trust_anchor_transparency_event_index: transparencyState.event_index,
+      trust_anchor_transparency_verified_at: transparencyState.verified_at
+    };
   }
 
   async bootstrapFederationNode(payload, actorIdentity) {
@@ -3062,17 +6098,36 @@ export class LoomStore {
       });
     }
 
-    const signingKeys = extractFederationSigningKeysFromNodeDocument(nodeDocument);
+    const bootstrapTrustMode = this.resolveFederationBootstrapTrustMode(payload);
+    let signingKeys = extractFederationSigningKeysFromNodeDocument(nodeDocument);
     if (signingKeys.length === 0) {
       throw new LoomError("ENVELOPE_INVALID", "Federation node document is missing federation signing keys", 400, {
         field: "node_document.federation.signing_keys"
       });
     }
 
-    const documentActiveKeyId = String(nodeDocument?.federation?.signing_key_id || "").trim();
+    let trustMaterial = null;
+    if (bootstrapTrustMode === "public_dns_webpki") {
+      trustMaterial = await this.resolveFederationPublicTrustMaterial({
+        payload,
+        nodeId: discoveredNodeId,
+        nodeDocument,
+        nodeDocumentUrl,
+        allowInsecureHttp,
+        allowPrivateNetwork,
+        timeoutMs,
+        maxResponseBytes
+      });
+      signingKeys = trustMaterial.signing_keys;
+    }
+
+    const documentActiveKeyId = String(
+      trustMaterial?.key_id || nodeDocument?.federation?.signing_key_id || ""
+    ).trim();
     const requestedActiveKeyId = String(payload.active_key_id || "").trim();
     const activeKey =
       resolveFederationNodeSigningKey({ signing_keys: signingKeys }, requestedActiveKeyId || documentActiveKeyId) ||
+      signingKeys.find((key) => isSigningKeyUsableAt(key)) ||
       signingKeys[0];
 
     let discoveredDeliverUrl = String(
@@ -3153,6 +6208,41 @@ export class LoomStore {
       });
     }
 
+    const protocolCapabilityPolicyRequired =
+      this.federationRequireProtocolCapabilities ||
+      this.federationRequireE2eeProfileOverlap ||
+      this.federationRequireTrustModeParity;
+    const protocolCapabilitiesState = await this.fetchFederationProtocolCapabilitiesState({
+      payload,
+      nodeId: discoveredNodeId,
+      nodeDocument,
+      nodeDocumentUrl,
+      allowInsecureHttp,
+      allowPrivateNetwork,
+      timeoutMs,
+      maxResponseBytes,
+      failOnMissing: protocolCapabilityPolicyRequired,
+      failOnFetchError: protocolCapabilityPolicyRequired
+    });
+
+    const trustAnchorRegistrationPayload =
+      bootstrapTrustMode === "public_dns_webpki" && trustMaterial
+        ? {
+            trust_anchor_mode: "public_dns_webpki",
+            trust_anchor_dns_name: trustMaterial.trust_anchor_dns_name,
+            trust_anchor_dns_record: trustMaterial.trust_anchor_dns_record,
+            trust_anchor_keyset_url: trustMaterial.trust_anchor_keyset_url,
+            trust_anchor_keyset_hash: trustMaterial.trust_anchor_keyset_hash,
+            trust_anchor_keyset_version: trustMaterial.trust_anchor_keyset_version,
+            trust_anchor_epoch: trustMaterial.trust_anchor_epoch,
+            trust_anchor_revocations_url: trustMaterial.trust_anchor_revocations_url,
+            trust_anchor_verified_at: trustMaterial.trust_anchor_verified_at,
+            revoked_key_ids: trustMaterial.revoked_key_ids
+          }
+        : {
+            trust_anchor_mode: bootstrapTrustMode
+          };
+
     const node = this.registerFederationNode(
       {
         node_id: discoveredNodeId,
@@ -3160,12 +6250,21 @@ export class LoomStore {
         public_key_pem: activeKey.public_key_pem,
         signing_keys: signingKeys,
         active_key_id: activeKey.key_id,
-        replace_signing_keys: payload.replace_signing_keys === true,
+        replace_signing_keys:
+          bootstrapTrustMode === "public_dns_webpki" || payload.replace_signing_keys === true,
+        node_document_url: nodeDocumentUrl.toString(),
         deliver_url: deliverUrl.toString(),
         identity_resolve_url: identityResolveUrl,
+        protocol_capabilities_url: protocolCapabilitiesState.protocol_capabilities_url,
+        protocol_capabilities: protocolCapabilitiesState.protocol_capabilities,
+        protocol_capabilities_fetched_at: protocolCapabilitiesState.protocol_capabilities_fetched_at,
+        protocol_capabilities_fetch_error: protocolCapabilitiesState.protocol_capabilities_fetch_error,
+        negotiated_e2ee_profiles: protocolCapabilitiesState.negotiated_e2ee_profiles,
+        protocol_negotiated_trust_anchor_mode: protocolCapabilitiesState.protocol_negotiated_trust_anchor_mode,
         allow_insecure_http: allowInsecureHttp,
         allow_private_network: allowPrivateNetwork,
-        policy: Object.prototype.hasOwnProperty.call(payload, "policy") ? payload.policy : undefined
+        policy: Object.prototype.hasOwnProperty.call(payload, "policy") ? payload.policy : undefined,
+        ...trustAnchorRegistrationPayload
       },
       actorIdentity
     );
@@ -3174,8 +6273,13 @@ export class LoomStore {
       node_id: node.node_id,
       key_id: node.key_id,
       signing_key_count: node.signing_keys.length,
+      trust_anchor_mode: node.trust_anchor_mode,
+      trust_anchor_epoch: node.trust_anchor_epoch,
       node_document_url: nodeDocumentUrl.toString(),
       deliver_url: node.deliver_url,
+      protocol_capabilities_url: node.protocol_capabilities_url,
+      negotiated_e2ee_profiles: node.negotiated_e2ee_profiles || [],
+      protocol_negotiated_trust_anchor_mode: node.protocol_negotiated_trust_anchor_mode || null,
       actor: actorIdentity
     });
 
@@ -3183,6 +6287,7 @@ export class LoomStore {
       node,
       discovery: {
         node_document_url: nodeDocumentUrl.toString(),
+        protocol_capabilities_url: node.protocol_capabilities_url || null,
         fetched_at: nowIso()
       }
     };
@@ -3651,6 +6756,7 @@ export class LoomStore {
     this.cleanupFederationInboundAbuseState();
     this.cleanupFederationChallengeState();
     this.refreshAllFederationNodeAutoPolicies();
+    const inboundContentFilter = this.getInboundContentFilterStatus();
     let activeAutoPolicies = 0;
     let activeChallenges = 0;
     let highReputationNodes = 0;
@@ -3685,7 +6791,15 @@ export class LoomStore {
       active_challenges: activeChallenges,
       high_reputation_nodes: highReputationNodes,
       distributed_guards_enabled: this.federationDistributedGuardsEnabled,
-      require_signed_receipts: this.federationRequireSignedReceipts
+      require_signed_receipts: this.federationRequireSignedReceipts,
+      content_filter: inboundContentFilter,
+      content_filter_enabled: inboundContentFilter.enabled,
+      content_filter_reject_malware: inboundContentFilter.reject_malware,
+      content_filter_evaluated: inboundContentFilter.evaluated,
+      content_filter_rejected: inboundContentFilter.rejected,
+      content_filter_quarantined: inboundContentFilter.quarantined,
+      content_filter_spam_labeled: inboundContentFilter.spam_labeled,
+      content_filter_decision_counts_by_profile: inboundContentFilter.decision_counts_by_profile
     };
   }
 
@@ -3828,6 +6942,7 @@ export class LoomStore {
     const nonce = String(headers["x-loom-nonce"] || "").trim();
     const keyId = String(headers["x-loom-key-id"] || "").trim();
     const signature = String(headers["x-loom-signature"] || "").trim();
+    const trustEpochHeader = String(headers["x-loom-trust-epoch"] || "").trim();
 
     if (!nodeId || !timestamp || !nonce || !keyId || !signature) {
       throw new LoomError("SIGNATURE_INVALID", "Missing required federation signature headers", 401, {
@@ -3866,10 +6981,37 @@ export class LoomStore {
     await this.enforceFederationInboundRate(nodeId);
 
     const requestTimeMs = parseTime(timestamp);
-    if (requestTimeMs == null || Math.abs(nowMs() - requestTimeMs) > 5 * 60 * 1000) {
+    if (requestTimeMs == null || Math.abs(nowMs() - requestTimeMs) > this.federationTrustMaxClockSkewMs) {
       throw new LoomError("SIGNATURE_INVALID", "Federation request timestamp outside freshness window", 401, {
-        timestamp
+        timestamp,
+        max_skew_ms: this.federationTrustMaxClockSkewMs
       });
+    }
+
+    if (node.trust_anchor_mode === "public_dns_webpki") {
+      const expectedEpoch = Math.max(0, parseNonNegativeInteger(node.trust_anchor_epoch, 0));
+      const requestEpoch = parseOptionalNonNegativeInteger(trustEpochHeader);
+      if (expectedEpoch > 0 && requestEpoch == null) {
+        if (this.federationTrustFailClosed) {
+          throw new LoomError("SIGNATURE_INVALID", "Federation request is missing trust epoch header", 401, {
+            node_id: nodeId,
+            required_header: "x-loom-trust-epoch",
+            expected_epoch: expectedEpoch
+          });
+        }
+      } else if (requestEpoch != null && requestEpoch < expectedEpoch) {
+        throw new LoomError("SIGNATURE_INVALID", "Federation request trust epoch is stale", 401, {
+          node_id: nodeId,
+          expected_epoch: expectedEpoch,
+          request_epoch: requestEpoch
+        });
+      } else if (requestEpoch != null && requestEpoch > expectedEpoch && this.federationTrustFailClosed) {
+        throw new LoomError("SIGNATURE_INVALID", "Federation request trust epoch is newer than local trust anchor", 401, {
+          node_id: nodeId,
+          expected_epoch: expectedEpoch,
+          request_epoch: requestEpoch
+        });
+      }
     }
 
     this.cleanupFederationNonces();
@@ -3882,11 +7024,27 @@ export class LoomStore {
     }
 
     const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
-    const canonical = `${method.toUpperCase()}\n${path}\n${bodyHash}\n${timestamp}\n${nonce}`;
-    const valid = verifyUtf8MessageSignature(nodeSigningKey.public_key_pem, canonical, signature);
+    const canonicalV2 = canonicalizeFederationRequestSignatureInput({
+      method,
+      path,
+      bodyHash,
+      timestamp,
+      nonce,
+      trustEpoch: trustEpochHeader
+    });
+    const canonicalV1 = `${method.toUpperCase()}\n${path}\n${bodyHash}\n${timestamp}\n${nonce}`;
+    const validV2 = verifyUtf8MessageSignature(nodeSigningKey.public_key_pem, canonicalV2, signature);
+    const validV1 = validV2 ? false : verifyUtf8MessageSignature(nodeSigningKey.public_key_pem, canonicalV1, signature);
+    const valid = validV2 || validV1;
 
     if (!valid) {
       throw new LoomError("SIGNATURE_INVALID", "Federation request signature verification failed", 401, {
+        node_id: nodeId
+      });
+    }
+
+    if (node.trust_anchor_mode === "public_dns_webpki" && validV1 && this.federationTrustFailClosed) {
+      throw new LoomError("SIGNATURE_INVALID", "Federation request must sign trust epoch in canonical input", 401, {
         node_id: nodeId
       });
     }
@@ -3957,24 +7115,72 @@ export class LoomStore {
 
     const accepted = [];
     const rejected = [];
-    const quarantined = verifiedNode.policy === "quarantine";
+    const nodePolicyQuarantine = verifiedNode.policy === "quarantine";
+    let contentQuarantinedCount = 0;
+    let contentSpamLabeledCount = 0;
     for (const envelope of wrapper.envelopes) {
       try {
         await this.ensureFederatedSenderIdentity(envelope, verifiedNode);
 
-        const envelopeWithPolicyMeta = quarantined
-          ? {
-              ...envelope,
-              meta: {
-                ...(envelope.meta || {}),
-                federation: {
-                  ...(envelope.meta?.federation || {}),
-                  source_node: verifiedNode.node_id,
-                  policy: "quarantine"
-                }
+        const contentEvaluation = this.evaluateInboundContentPolicy(
+          {
+            subject: envelope?.content?.structured?.intent || envelope?.type || "",
+            text: envelope?.content?.encrypted ? "" : envelope?.content?.human?.text || "",
+            html: "",
+            attachments: Array.isArray(envelope?.attachments) ? envelope.attachments : []
+          },
+          {
+            source: "federation",
+            actor: envelope?.from?.identity || null,
+            node_id: verifiedNode.node_id
+          }
+        );
+        if (contentEvaluation.action === "reject") {
+          await this.recordFederationInboundFailure(
+            verifiedNode.node_id,
+            "CONTENT_FILTER_REJECT",
+            "system"
+          );
+          throw new LoomError("CAPABILITY_DENIED", "Federation content policy rejected envelope", 403, {
+            envelope_id: envelope?.id || null,
+            node_id: verifiedNode.node_id,
+            content_filter: {
+              action: contentEvaluation.action,
+              score: contentEvaluation.score,
+              categories: contentEvaluation.detected_categories
+            }
+          });
+        }
+
+        const quarantined = nodePolicyQuarantine || contentEvaluation.action === "quarantine";
+        const envelopeWithPolicyMeta = {
+          ...envelope,
+          meta: {
+            ...(envelope.meta || {}),
+            federation: {
+              ...(envelope.meta?.federation || {}),
+              source_node: verifiedNode.node_id,
+              policy: quarantined ? "quarantine" : verifiedNode.policy || "trusted",
+              content_filter_action: contentEvaluation.action
+            },
+            security: {
+              ...(envelope.meta?.security || {}),
+              content_filter: {
+                version: contentEvaluation.version,
+                source: contentEvaluation.source,
+                action: contentEvaluation.action,
+                labels: contentEvaluation.labels,
+                score: contentEvaluation.score,
+                spam_score: contentEvaluation.spam_score,
+                phish_score: contentEvaluation.phish_score,
+                malware_score: contentEvaluation.malware_score,
+                detected_categories: contentEvaluation.detected_categories,
+                signal_codes: contentEvaluation.signals.map((signal) => signal.code),
+                evaluated_at: nowIso()
               }
             }
-          : envelope;
+          }
+        };
 
         const stored = this.ingestEnvelope(envelopeWithPolicyMeta, {
           actorIdentity: envelopeWithPolicyMeta?.from?.identity,
@@ -3987,6 +7193,16 @@ export class LoomStore {
           if (thread && !thread.labels.includes("sys.quarantine")) {
             thread.labels = [...thread.labels, "sys.quarantine"];
             thread.updated_at = nowIso();
+            contentQuarantinedCount += 1;
+          }
+        }
+
+        if (contentEvaluation.labels.includes("sys.spam")) {
+          const thread = this.threadsById.get(stored.thread_id);
+          if (thread && !thread.labels.includes("sys.spam")) {
+            thread.labels = [...thread.labels, "sys.spam"];
+            thread.updated_at = nowIso();
+            contentSpamLabeledCount += 1;
           }
         }
 
@@ -4017,7 +7233,9 @@ export class LoomStore {
       sender_node: verifiedNode.node_id,
       accepted_count: accepted.length,
       rejected_count: rejected.length,
-      policy: verifiedNode.policy
+      policy: verifiedNode.policy,
+      content_quarantined_count: contentQuarantinedCount,
+      content_spam_labeled_count: contentSpamLabeledCount
     });
 
     const deliveryId = String(wrapper.delivery_id || "").trim() || null;
@@ -4035,6 +7253,8 @@ export class LoomStore {
       rejected_count: rejected.length,
       rejected: rejected.length > 0 ? rejected.map(({ envelope_id, error }) => ({ envelope_id, error })) : undefined,
       accepted_envelope_ids: accepted,
+      content_quarantined_count: contentQuarantinedCount,
+      content_spam_labeled_count: contentSpamLabeledCount,
       receipt
     };
   }
@@ -4072,6 +7292,7 @@ export class LoomStore {
 
     const envelopeIds = Array.from(new Set(payload.envelope_ids.map((id) => String(id || "").trim()).filter(Boolean)));
     const envelopeSummaries = [];
+    const envelopes = [];
 
     for (const envelopeId of envelopeIds) {
       const envelope = this.envelopesById.get(envelopeId);
@@ -4095,7 +7316,10 @@ export class LoomStore {
         envelope_id: envelope.id,
         thread_id: envelope.thread_id
       });
+      envelopes.push(envelope);
     }
+
+    this.assertFederationOutboxNodeCompatibility(node, envelopes);
 
     const traceContext = this.getCurrentTraceContext();
     const sourceRequestId = traceContext?.request_id || null;
@@ -4343,7 +7567,7 @@ export class LoomStore {
     }
 
     try {
-      const node = this.knownNodesById.get(item.recipient_node);
+      let node = this.knownNodesById.get(item.recipient_node);
       if (!node) {
         this.markOutboxFailure(item, `Unknown recipient node: ${item.recipient_node}`);
         this.persistAndAudit("federation.outbox.process.failed", {
@@ -4368,6 +7592,31 @@ export class LoomStore {
         return item;
       }
 
+      const encryptedEnvelopeQueued = envelopes.some((envelope) => envelope?.content?.encrypted === true);
+      const protocolNegotiationRequired =
+        this.federationRequireProtocolCapabilities ||
+        this.federationRequireE2eeProfileOverlap ||
+        this.federationRequireTrustModeParity ||
+        encryptedEnvelopeQueued;
+      try {
+        node = await this.ensureFederationNodeProtocolCapabilities(node, actorIdentity || "system", {
+          forceRefresh: !node.protocol_capabilities || Boolean(node.protocol_capabilities_fetch_error),
+          failOnMissing: protocolNegotiationRequired,
+          failOnFetchError: protocolNegotiationRequired,
+          persist: true
+        });
+        this.assertFederationOutboxNodeCompatibility(node, envelopes);
+      } catch (error) {
+        this.markOutboxFailure(item, error?.message || "Federation protocol capability negotiation failed");
+        this.persistAndAudit("federation.outbox.process.failed", {
+          outbox_id: item.id,
+          recipient_node: item.recipient_node,
+          reason: item.last_error,
+          actor: actorIdentity
+        });
+        return item;
+      }
+
       const wrapper = {
         loom: "1.1",
         sender_node: this.nodeId,
@@ -4380,6 +7629,7 @@ export class LoomStore {
       const bodyHash = createHash("sha256").update(rawBody, "utf-8").digest("hex");
       const timestamp = nowIso();
       const nonce = `nonce_${generateUlid()}`;
+      const trustEpoch = Math.max(0, parseNonNegativeInteger(this.federationTrustLocalEpoch, 0));
 
       const deliverUrl = item.deliver_url || this.resolveFederationDeliverUrl(node);
       let parsedUrl;
@@ -4437,7 +7687,17 @@ export class LoomStore {
         return item;
       }
 
-      const canonical = `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
+      const canonical =
+        node.trust_anchor_mode === "public_dns_webpki"
+          ? canonicalizeFederationRequestSignatureInput({
+              method: "POST",
+              path: parsedUrl.pathname,
+              bodyHash,
+              timestamp,
+              nonce,
+              trustEpoch
+            })
+          : `POST\n${parsedUrl.pathname}\n${bodyHash}\n${timestamp}\n${nonce}`;
       const signature = signUtf8Message(this.federationSigningPrivateKeyPem, canonical);
 
       try {
@@ -4449,7 +7709,8 @@ export class LoomStore {
             "x-loom-timestamp": timestamp,
             "x-loom-nonce": nonce,
             "x-loom-key-id": this.federationSigningKeyId,
-            "x-loom-signature": signature
+            "x-loom-signature": signature,
+            "x-loom-trust-epoch": String(trustEpoch)
           },
           body: rawBody,
           timeoutMs: this.federationDeliverTimeoutMs,
@@ -4581,288 +7842,60 @@ export class LoomStore {
   }
 
   normalizeEmailAddress(value) {
-    if (typeof value !== "string") {
-      return null;
-    }
-
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-    if (containsHeaderUnsafeChars(trimmed)) {
-      return null;
-    }
-
-    const angleMatch = trimmed.match(/<([^>]+)>/);
-    const candidate = angleMatch ? angleMatch[1].trim() : trimmed.replace(/^<|>$/g, "").trim();
-
-    if (!candidate.includes("@")) {
-      return null;
-    }
-    if (containsHeaderUnsafeChars(candidate)) {
-      return null;
-    }
-
-    return candidate.toLowerCase();
+    return normalizeEmailAddressAdapter(value);
   }
 
   splitAddressList(value) {
-    if (Array.isArray(value)) {
-      const flattened = [];
-      for (const entry of value) {
-        flattened.push(...this.splitAddressList(String(entry || "")));
-      }
-      return flattened;
-    }
-
-    if (typeof value !== "string") {
-      return [];
-    }
-
-    const input = value.trim();
-    if (!input) {
-      return [];
-    }
-
-    const items = [];
-    let current = "";
-    let inQuote = false;
-    let angleDepth = 0;
-    let escapeNext = false;
-
-    for (const char of input) {
-      if (escapeNext) {
-        current += char;
-        escapeNext = false;
-        continue;
-      }
-
-      if (char === "\\" && inQuote) {
-        current += char;
-        escapeNext = true;
-        continue;
-      }
-
-      if (char === '"') {
-        inQuote = !inQuote;
-        current += char;
-        continue;
-      }
-
-      if (!inQuote) {
-        if (char === "<") {
-          angleDepth += 1;
-        } else if (char === ">" && angleDepth > 0) {
-          angleDepth -= 1;
-        }
-
-        if ((char === "," || char === ";") && angleDepth === 0) {
-          if (current.trim()) {
-            items.push(current.trim());
-          }
-          current = "";
-          continue;
-        }
-      }
-
-      current += char;
-    }
-
-    if (current.trim()) {
-      items.push(current.trim());
-    }
-
-    return items;
+    return splitAddressListAdapter(value);
   }
 
   normalizeEmailAddressList(value) {
-    return this.splitAddressList(value)
-      .map((entry) => this.normalizeEmailAddress(String(entry || "")))
-      .filter(Boolean);
+    return normalizeEmailAddressListAdapter(value);
   }
 
   resolveHeaderValue(headers, headerName) {
-    if (!headers || typeof headers !== "object") {
-      return null;
-    }
-
-    const target = String(headerName || "").trim().toLowerCase();
-    if (!target) {
-      return null;
-    }
-
-    for (const [key, value] of Object.entries(headers)) {
-      if (String(key || "").trim().toLowerCase() === target) {
-        return value;
-      }
-    }
-
-    return null;
+    return resolveHeaderValueAdapter(headers, headerName);
   }
 
   parseMessageId(value) {
-    if (typeof value !== "string") {
-      return null;
-    }
-
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    const bracketMatch = trimmed.match(/<([^>]+)>/);
-    if (bracketMatch?.[1]) {
-      return bracketMatch[1].trim();
-    }
-
-    const token = trimmed.split(/[\s,]+/).find(Boolean);
-    if (!token) {
-      return null;
-    }
-
-    return token.replace(/^<|>$/g, "").trim() || null;
+    return parseMessageIdAdapter(value);
   }
 
   parseMessageIdList(value) {
-    if (Array.isArray(value)) {
-      const combined = [];
-      for (const entry of value) {
-        combined.push(...this.parseMessageIdList(entry));
-      }
-      return Array.from(new Set(combined));
-    }
-
-    if (typeof value !== "string") {
-      return [];
-    }
-
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return [];
-    }
-
-    const bracketMatches = trimmed.match(/<[^>]+>/g);
-    const tokens = bracketMatches?.length ? bracketMatches : trimmed.split(/[\s,]+/);
-
-    return Array.from(
-      new Set(
-        tokens
-          .map((token) => this.parseMessageId(token))
-          .filter(Boolean)
-      )
-    );
+    return parseMessageIdListAdapter(value);
   }
 
   parseReferences(value) {
-    return this.parseMessageIdList(value);
+    return parseReferencesAdapter(value);
   }
 
   resolveIdentitiesFromAddressInput(value) {
-    return this.splitAddressList(value)
-      .map((address) => this.inferIdentityFromAddress(String(address || "")))
-      .filter(Boolean);
+    return resolveIdentitiesFromAddressInputAdapter(value);
   }
 
   buildRecipientList({ primary = [], cc = [], bcc = [] } = {}) {
-    const recipients = [];
-    const byIdentity = new Map();
-    const precedence = {
-      primary: 3,
-      cc: 2,
-      bcc: 1
-    };
-
-    const addRecipient = (identity, role) => {
-      if (!identity) {
-        return;
-      }
-
-      const existingIndex = byIdentity.get(identity);
-      if (existingIndex == null) {
-        byIdentity.set(identity, recipients.length);
-        recipients.push({
-          identity,
-          role
-        });
-        return;
-      }
-
-      const existing = recipients[existingIndex];
-      if (precedence[role] > precedence[existing.role]) {
-        existing.role = role;
-      }
-    };
-
-    for (const identity of primary) {
-      addRecipient(identity, "primary");
-    }
-    for (const identity of cc) {
-      addRecipient(identity, "cc");
-    }
-    for (const identity of bcc) {
-      addRecipient(identity, "bcc");
-    }
-
-    if (!recipients.some((recipient) => recipient.role === "primary") && recipients.length > 0) {
-      recipients[0].role = "primary";
-    }
-
-    return recipients;
+    return buildRecipientListAdapter({ primary, cc, bcc });
   }
 
   inferIdentityFromAddress(value) {
-    if (typeof value !== "string") {
-      return null;
-    }
-
-    const trimmed = value.trim();
-    if (trimmed.startsWith("loom://") || trimmed.startsWith("bridge://")) {
-      return trimmed;
-    }
-
-    const email = this.normalizeEmailAddress(trimmed);
-    if (!email) {
-      return null;
-    }
-
-    return `loom://${email}`;
+    return inferIdentityFromAddressAdapter(value);
   }
 
   inferEmailFromIdentity(identity) {
-    if (typeof identity !== "string") {
-      return null;
-    }
-
-    if (identity.startsWith("bridge://")) {
-      return identity.slice("bridge://".length);
-    }
-
-    if (identity.startsWith("loom://")) {
-      return identity.slice("loom://".length);
-    }
-
-    return null;
+    return inferEmailFromIdentityAdapter(identity);
   }
 
   htmlToText(html) {
-    if (typeof html !== "string") {
-      return "";
-    }
-
-    return html
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&nbsp;/gi, " ")
-      .replace(/&amp;/gi, "&")
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">")
-      .replace(/\s+/g, " ")
-      .trim();
+    return htmlToTextAdapter(html);
   }
 
-  resolveThreadFromEmailHeaders(payload) {
-    const headers = payload?.headers && typeof payload.headers === "object" ? payload.headers : {};
+  resolveThreadFromEmailHeaders(payload, options = {}) {
+    const headers =
+      options?.headers && typeof options.headers === "object"
+        ? options.headers
+        : payload?.headers && typeof payload.headers === "object"
+          ? payload.headers
+          : {};
     const inReplyToHeader = this.resolveHeaderValue(headers, "in-reply-to");
     const referencesHeader = this.resolveHeaderValue(headers, "references");
     const inReplyTo = this.parseMessageIdList(payload?.in_reply_to || inReplyToHeader);
@@ -4928,6 +7961,751 @@ export class LoomStore {
     return false;
   }
 
+  getInboundContentFilterActiveConfig() {
+    return cloneInboundContentFilterConfig({
+      enabled: this.inboundContentFilterEnabled,
+      reject_malware: this.inboundContentFilterRejectMalware,
+      spam_threshold: this.inboundContentFilterSpamThreshold,
+      phish_threshold: this.inboundContentFilterPhishThreshold,
+      quarantine_threshold: this.inboundContentFilterQuarantineThreshold,
+      reject_threshold: this.inboundContentFilterRejectThreshold,
+      profile_default: this.inboundContentFilterProfileDefault,
+      profile_bridge_email: this.inboundContentFilterProfileBridge,
+      profile_federation: this.inboundContentFilterProfileFederation
+    });
+  }
+
+  applyInboundContentFilterActiveConfig(config = {}) {
+    const normalized = cloneInboundContentFilterConfig(config);
+    this.inboundContentFilterEnabled = normalized.enabled === true;
+    this.inboundContentFilterRejectMalware = normalized.reject_malware === true;
+    this.inboundContentFilterSpamThreshold = Math.max(1, Math.floor(normalized.spam_threshold));
+    this.inboundContentFilterPhishThreshold = Math.max(1, Math.floor(normalized.phish_threshold));
+    this.inboundContentFilterQuarantineThreshold = Math.max(1, Math.floor(normalized.quarantine_threshold));
+    this.inboundContentFilterRejectThreshold = Math.max(
+      this.inboundContentFilterQuarantineThreshold + 1,
+      Math.floor(normalized.reject_threshold)
+    );
+    this.inboundContentFilterProfileDefault = normalizeInboundContentFilterProfile(
+      normalized.profile_default,
+      "balanced"
+    );
+    this.inboundContentFilterProfileBridge = normalizeInboundContentFilterProfile(
+      normalized.profile_bridge_email,
+      this.inboundContentFilterProfileDefault
+    );
+    this.inboundContentFilterProfileFederation = normalizeInboundContentFilterProfile(
+      normalized.profile_federation,
+      "agent"
+    );
+  }
+
+  extractInboundContentFilterConfigPatch(payload = {}) {
+    if (!payload || typeof payload !== "object") {
+      return {};
+    }
+    const source =
+      payload.config && typeof payload.config === "object" && !Array.isArray(payload.config)
+        ? payload.config
+        : payload;
+    const patch = {};
+    for (const field of INBOUND_CONTENT_FILTER_CONFIG_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(source, field)) {
+        patch[field] = source[field];
+      }
+    }
+    return patch;
+  }
+
+  buildInboundContentFilterConfigUpdate(patch = {}, baseConfig = null) {
+    const sourcePatch = patch && typeof patch === "object" && !Array.isArray(patch) ? patch : {};
+    const current = baseConfig ? cloneInboundContentFilterConfig(baseConfig) : this.getInboundContentFilterActiveConfig();
+    const next = { ...current };
+
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "enabled")) {
+      next.enabled = parseInboundContentFilterBooleanField(sourcePatch.enabled, "enabled", next.enabled);
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "reject_malware")) {
+      next.reject_malware = parseInboundContentFilterBooleanField(
+        sourcePatch.reject_malware,
+        "reject_malware",
+        next.reject_malware
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "spam_threshold")) {
+      next.spam_threshold = parseInboundContentFilterThresholdField(
+        sourcePatch.spam_threshold,
+        "spam_threshold",
+        next.spam_threshold
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "phish_threshold")) {
+      next.phish_threshold = parseInboundContentFilterThresholdField(
+        sourcePatch.phish_threshold,
+        "phish_threshold",
+        next.phish_threshold
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "quarantine_threshold")) {
+      next.quarantine_threshold = parseInboundContentFilterThresholdField(
+        sourcePatch.quarantine_threshold,
+        "quarantine_threshold",
+        next.quarantine_threshold
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "reject_threshold")) {
+      next.reject_threshold = parseInboundContentFilterThresholdField(
+        sourcePatch.reject_threshold,
+        "reject_threshold",
+        next.reject_threshold
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "profile_default")) {
+      next.profile_default = parseInboundContentFilterProfileField(
+        sourcePatch.profile_default,
+        "profile_default",
+        next.profile_default
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "profile_bridge_email")) {
+      next.profile_bridge_email = parseInboundContentFilterProfileField(
+        sourcePatch.profile_bridge_email,
+        "profile_bridge_email",
+        next.profile_bridge_email
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sourcePatch, "profile_federation")) {
+      next.profile_federation = parseInboundContentFilterProfileField(
+        sourcePatch.profile_federation,
+        "profile_federation",
+        next.profile_federation
+      );
+    }
+
+    if (next.reject_threshold <= next.quarantine_threshold) {
+      throw new LoomError("ENVELOPE_INVALID", "reject_threshold must be greater than quarantine_threshold", 400, {
+        field: "reject_threshold",
+        reject_threshold: next.reject_threshold,
+        quarantine_threshold: next.quarantine_threshold
+      });
+    }
+
+    const normalized = cloneInboundContentFilterConfig(next);
+    return {
+      config: normalized,
+      changed: !areInboundContentFilterConfigsEqual(current, normalized)
+    };
+  }
+
+  normalizeInboundContentFilterCanaryState(value) {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    const configSource = value.config && typeof value.config === "object" ? value.config : value;
+    let normalizedConfig;
+    try {
+      normalizedConfig = this.buildInboundContentFilterConfigUpdate(configSource, this.getInboundContentFilterActiveConfig()).config;
+    } catch {
+      return null;
+    }
+    return cloneInboundContentFilterCanaryState({
+      ...value,
+      config: normalizedConfig
+    });
+  }
+
+  normalizeInboundContentFilterRollbackState(value) {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    const configSource = value.config && typeof value.config === "object" ? value.config : value;
+    let normalizedConfig;
+    try {
+      normalizedConfig = this.buildInboundContentFilterConfigUpdate(configSource, this.getInboundContentFilterActiveConfig()).config;
+    } catch {
+      return null;
+    }
+    return cloneInboundContentFilterRollbackState({
+      ...value,
+      config: normalizedConfig
+    });
+  }
+
+  getInboundContentFilterConfigStatus() {
+    return {
+      version: Math.max(1, parsePositiveInteger(this.inboundContentFilterConfigVersion, 1)),
+      updated_at: this.inboundContentFilterConfigUpdatedAt || null,
+      updated_by: this.inboundContentFilterConfigUpdatedBy || null,
+      active: this.getInboundContentFilterActiveConfig(),
+      canary: cloneInboundContentFilterCanaryState(this.inboundContentFilterConfigCanary),
+      rollback: cloneInboundContentFilterRollbackState(this.inboundContentFilterConfigRollback)
+    };
+  }
+
+  updateInboundContentFilterConfig(payload, actorIdentity = "system") {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new LoomError("ENVELOPE_INVALID", "Inbound content filter config payload must be an object", 400, {
+        field: "payload"
+      });
+    }
+
+    const mode = normalizeInboundContentFilterConfigMode(payload.mode);
+    if (!mode) {
+      throw new LoomError("ENVELOPE_INVALID", "mode must be one of canary, apply, rollback", 400, {
+        field: "mode"
+      });
+    }
+
+    const activeConfig = this.getInboundContentFilterActiveConfig();
+    const now = nowIso();
+    const normalizedActor = String(actorIdentity || "system").trim() || "system";
+
+    if (mode === "canary") {
+      const patch = this.extractInboundContentFilterConfigPatch(payload);
+      if (Object.keys(patch).length === 0) {
+        throw new LoomError("ENVELOPE_INVALID", "canary mode requires at least one config field", 400, {
+          field: "config"
+        });
+      }
+      const update = this.buildInboundContentFilterConfigUpdate(patch, activeConfig);
+      const note =
+        typeof payload.note === "string" && payload.note.trim().length > 0
+          ? payload.note.trim().slice(0, 240)
+          : null;
+      this.inboundContentFilterConfigCanary = cloneInboundContentFilterCanaryState({
+        canary_id: `cfcan_${generateUlid()}`,
+        mode: "canary",
+        created_at: now,
+        updated_at: now,
+        actor: normalizedActor,
+        note,
+        config: update.config
+      });
+      this.persistAndAudit("content.filter.config.canary", {
+        actor: normalizedActor,
+        mode,
+        canary_id: this.inboundContentFilterConfigCanary?.canary_id || null,
+        changed: update.changed,
+        config: this.inboundContentFilterConfigCanary?.config || null
+      });
+      return this.getInboundContentFilterConfigStatus();
+    }
+
+    if (mode === "apply") {
+      const patch = this.extractInboundContentFilterConfigPatch(payload);
+      const hasPatch = Object.keys(patch).length > 0;
+      const source = hasPatch ? "payload" : "canary";
+      const previousVersion = Math.max(1, parsePositiveInteger(this.inboundContentFilterConfigVersion, 1));
+      const appliedFromCanaryId = source === "canary" ? this.inboundContentFilterConfigCanary?.canary_id || null : null;
+      let nextConfig = null;
+      let changed = false;
+
+      if (hasPatch) {
+        const update = this.buildInboundContentFilterConfigUpdate(patch, activeConfig);
+        nextConfig = update.config;
+        changed = update.changed;
+      } else if (this.inboundContentFilterConfigCanary?.config) {
+        nextConfig = cloneInboundContentFilterConfig(this.inboundContentFilterConfigCanary.config);
+        changed = !areInboundContentFilterConfigsEqual(activeConfig, nextConfig);
+      } else {
+        throw new LoomError("STATE_TRANSITION_INVALID", "No staged canary config to apply", 409, {
+          field: "mode"
+        });
+      }
+
+      this.inboundContentFilterConfigRollback = cloneInboundContentFilterRollbackState({
+        rollback_id: `cfroll_${generateUlid()}`,
+        from_version: previousVersion,
+        source,
+        stored_at: now,
+        actor: normalizedActor,
+        config: activeConfig
+      });
+
+      this.applyInboundContentFilterActiveConfig(nextConfig);
+      this.inboundContentFilterConfigVersion = previousVersion + 1;
+      this.inboundContentFilterConfigUpdatedAt = now;
+      this.inboundContentFilterConfigUpdatedBy = normalizedActor;
+      if (payload.keep_canary !== true) {
+        this.inboundContentFilterConfigCanary = null;
+      }
+
+      this.persistAndAudit("content.filter.config.apply", {
+        actor: normalizedActor,
+        mode,
+        source,
+        changed,
+        from_version: previousVersion,
+        to_version: this.inboundContentFilterConfigVersion,
+        applied_from_canary_id: appliedFromCanaryId,
+        config: this.getInboundContentFilterActiveConfig()
+      });
+      return this.getInboundContentFilterConfigStatus();
+    }
+
+    const rollback = this.inboundContentFilterConfigRollback?.config
+      ? cloneInboundContentFilterRollbackState(this.inboundContentFilterConfigRollback)
+      : null;
+    if (!rollback?.config) {
+      throw new LoomError("STATE_TRANSITION_INVALID", "No rollback snapshot is available", 409, {
+        field: "mode"
+      });
+    }
+
+    const previousActive = this.getInboundContentFilterActiveConfig();
+    const previousVersion = Math.max(1, parsePositiveInteger(this.inboundContentFilterConfigVersion, 1));
+    this.applyInboundContentFilterActiveConfig(rollback.config);
+    this.inboundContentFilterConfigVersion = previousVersion + 1;
+    this.inboundContentFilterConfigUpdatedAt = now;
+    this.inboundContentFilterConfigUpdatedBy = normalizedActor;
+    this.inboundContentFilterConfigCanary = null;
+    this.inboundContentFilterConfigRollback = cloneInboundContentFilterRollbackState({
+      rollback_id: `cfroll_${generateUlid()}`,
+      from_version: previousVersion,
+      source: "rollback",
+      stored_at: now,
+      actor: normalizedActor,
+      config: previousActive
+    });
+
+    this.persistAndAudit("content.filter.config.rollback", {
+      actor: normalizedActor,
+      mode,
+      from_version: rollback.from_version,
+      to_version: this.inboundContentFilterConfigVersion,
+      restored_from_rollback_id: rollback.rollback_id || null,
+      config: this.getInboundContentFilterActiveConfig()
+    });
+    return this.getInboundContentFilterConfigStatus();
+  }
+
+  resolveInboundContentFilterProfile(context = {}) {
+    const explicitProfile = String(context?.profile || "")
+      .trim()
+      .toLowerCase();
+    if (INBOUND_CONTENT_FILTER_PROFILES.has(explicitProfile)) {
+      return explicitProfile;
+    }
+
+    const source = String(context?.source || "")
+      .trim()
+      .toLowerCase();
+    if (source === "bridge_email") {
+      return this.inboundContentFilterProfileBridge;
+    }
+    if (source === "federation") {
+      return this.inboundContentFilterProfileFederation;
+    }
+    return this.inboundContentFilterProfileDefault;
+  }
+
+  resolveInboundContentFilterProfileConfig(profile) {
+    const normalizedProfile = normalizeInboundContentFilterProfile(profile, this.inboundContentFilterProfileDefault);
+    return INBOUND_CONTENT_FILTER_PROFILE_CONFIG[normalizedProfile] || INBOUND_CONTENT_FILTER_PROFILE_CONFIG.balanced;
+  }
+
+  resolveInboundContentFilterThresholds(profileConfig) {
+    const deltas = profileConfig?.threshold_deltas && typeof profileConfig.threshold_deltas === "object"
+      ? profileConfig.threshold_deltas
+      : {};
+    const delta = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? Math.trunc(parsed) : 0;
+    };
+    const spamThreshold = Math.max(1, this.inboundContentFilterSpamThreshold + delta(deltas.spam));
+    const phishThreshold = Math.max(1, this.inboundContentFilterPhishThreshold + delta(deltas.phish));
+    const quarantineThreshold = Math.max(
+      1,
+      this.inboundContentFilterQuarantineThreshold + delta(deltas.quarantine)
+    );
+    const rejectThreshold = Math.max(
+      quarantineThreshold + 1,
+      this.inboundContentFilterRejectThreshold + delta(deltas.reject)
+    );
+    return {
+      spam: spamThreshold,
+      phish: phishThreshold,
+      quarantine: quarantineThreshold,
+      reject: rejectThreshold
+    };
+  }
+
+  ensureInboundContentFilterStatsShape() {
+    if (!this.inboundContentFilterStats || typeof this.inboundContentFilterStats !== "object") {
+      this.inboundContentFilterStats = createInboundContentFilterStats();
+      return;
+    }
+
+    const normalizeCount = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
+    };
+
+    this.inboundContentFilterStats.evaluated = normalizeCount(this.inboundContentFilterStats.evaluated);
+    this.inboundContentFilterStats.rejected = normalizeCount(this.inboundContentFilterStats.rejected);
+    this.inboundContentFilterStats.quarantined = normalizeCount(this.inboundContentFilterStats.quarantined);
+    this.inboundContentFilterStats.spam_labeled = normalizeCount(this.inboundContentFilterStats.spam_labeled);
+    this.inboundContentFilterStats.last_evaluated_at =
+      typeof this.inboundContentFilterStats.last_evaluated_at === "string" &&
+      this.inboundContentFilterStats.last_evaluated_at.trim().length > 0
+        ? this.inboundContentFilterStats.last_evaluated_at.trim()
+        : null;
+
+    const existingByProfile =
+      this.inboundContentFilterStats.decision_counts_by_profile &&
+      typeof this.inboundContentFilterStats.decision_counts_by_profile === "object"
+        ? this.inboundContentFilterStats.decision_counts_by_profile
+        : {};
+    const normalizedByProfile = createInboundContentFilterDecisionStatsByProfile();
+    for (const profile of Object.keys(normalizedByProfile)) {
+      const current = existingByProfile?.[profile] && typeof existingByProfile[profile] === "object"
+        ? existingByProfile[profile]
+        : {};
+      normalizedByProfile[profile] = {
+        evaluated: normalizeCount(current.evaluated),
+        allow: normalizeCount(current.allow),
+        quarantine: normalizeCount(current.quarantine),
+        reject: normalizeCount(current.reject),
+        spam_labeled: normalizeCount(current.spam_labeled)
+      };
+    }
+    this.inboundContentFilterStats.decision_counts_by_profile = normalizedByProfile;
+  }
+
+  appendInboundContentFilterDecisionTelemetry(payload = {}, context = {}, result = {}) {
+    if (!this.inboundContentFilterDecisionLogEnabled || !this.inboundContentFilterDecisionLogFile) {
+      return;
+    }
+
+    const subject = String(payload?.subject || "");
+    const text = String(payload?.text || "");
+    const html = String(payload?.html || "");
+    const urls = extractContentUrls([subject, text, html].join("\n"));
+    const attachments = Array.isArray(payload?.attachments) ? payload.attachments : [];
+    const authResults = payload?.auth_results && typeof payload.auth_results === "object" ? payload.auth_results : {};
+    const signalCodes = Array.isArray(result?.signals)
+      ? result.signals.map((signal) => String(signal?.code || "").trim()).filter(Boolean)
+      : [];
+
+    const entry = {
+      timestamp: nowIso(),
+      source: String(result?.source || context?.source || "unknown").trim() || "unknown",
+      profile: String(result?.profile || "").trim() || null,
+      action: String(result?.action || "").trim() || "allow",
+      score: Number(result?.score || 0),
+      spam_score: Number(result?.spam_score || 0),
+      phish_score: Number(result?.phish_score || 0),
+      malware_score: Number(result?.malware_score || 0),
+      labels: Array.isArray(result?.labels) ? result.labels : [],
+      signal_codes: signalCodes,
+      signal_count: signalCodes.length,
+      url_count: urls.length,
+      attachment_count: attachments.length,
+      subject_length: subject.length,
+      text_length: text.length,
+      auth_results: {
+        spf: String(authResults?.spf || "").trim().toLowerCase() || "none",
+        dkim: String(authResults?.dkim || "").trim().toLowerCase() || "none",
+        dmarc: String(authResults?.dmarc || "").trim().toLowerCase() || "none"
+      },
+      actor_hash: hashInboundContentTelemetryValue(context?.actor || "", this.inboundContentFilterDecisionLogSalt),
+      node_hash: hashInboundContentTelemetryValue(context?.node_id || "", this.inboundContentFilterDecisionLogSalt),
+      subject_hash: hashInboundContentTelemetryValue(subject, this.inboundContentFilterDecisionLogSalt),
+      text_hash: hashInboundContentTelemetryValue(text, this.inboundContentFilterDecisionLogSalt)
+    };
+
+    try {
+      appendFileSync(this.inboundContentFilterDecisionLogFile, `${JSON.stringify(entry)}\n`, "utf-8");
+    } catch {}
+  }
+
+  getInboundContentFilterStatus() {
+    this.ensureInboundContentFilterStatsShape();
+    const strictThresholds = this.resolveInboundContentFilterThresholds(
+      this.resolveInboundContentFilterProfileConfig("strict")
+    );
+    const balancedThresholds = this.resolveInboundContentFilterThresholds(
+      this.resolveInboundContentFilterProfileConfig("balanced")
+    );
+    const agentThresholds = this.resolveInboundContentFilterThresholds(
+      this.resolveInboundContentFilterProfileConfig("agent")
+    );
+    return {
+      enabled: this.inboundContentFilterEnabled,
+      reject_malware: this.inboundContentFilterRejectMalware,
+      spam_threshold: this.inboundContentFilterSpamThreshold,
+      phish_threshold: this.inboundContentFilterPhishThreshold,
+      quarantine_threshold: this.inboundContentFilterQuarantineThreshold,
+      reject_threshold: this.inboundContentFilterRejectThreshold,
+      profile_default: this.inboundContentFilterProfileDefault,
+      profile_bridge_email: this.inboundContentFilterProfileBridge,
+      profile_federation: this.inboundContentFilterProfileFederation,
+      profile_thresholds: {
+        strict: strictThresholds,
+        balanced: balancedThresholds,
+        agent: agentThresholds
+      },
+      config_version: Math.max(1, parsePositiveInteger(this.inboundContentFilterConfigVersion, 1)),
+      config_updated_at: this.inboundContentFilterConfigUpdatedAt || null,
+      canary_staged: Boolean(this.inboundContentFilterConfigCanary?.config),
+      rollback_available: Boolean(this.inboundContentFilterConfigRollback?.config),
+      decision_log_enabled: this.inboundContentFilterDecisionLogEnabled,
+      decision_log_sink_configured: Boolean(this.inboundContentFilterDecisionLogFile),
+      decision_counts_by_profile: this.inboundContentFilterStats.decision_counts_by_profile,
+      evaluated: Number(this.inboundContentFilterStats?.evaluated || 0),
+      rejected: Number(this.inboundContentFilterStats?.rejected || 0),
+      quarantined: Number(this.inboundContentFilterStats?.quarantined || 0),
+      spam_labeled: Number(this.inboundContentFilterStats?.spam_labeled || 0),
+      last_evaluated_at: this.inboundContentFilterStats?.last_evaluated_at || null
+    };
+  }
+
+  evaluateInboundContentPolicy(payload = {}, context = {}) {
+    const source = String(context?.source || "unknown").trim() || "unknown";
+    const profile = this.resolveInboundContentFilterProfile({
+      ...context,
+      source
+    });
+    const profileConfig = this.resolveInboundContentFilterProfileConfig(profile);
+    const profileWeights = profileConfig?.weights && typeof profileConfig.weights === "object" ? profileConfig.weights : {};
+    const profileClusters = profileConfig?.clusters && typeof profileConfig.clusters === "object" ? profileConfig.clusters : {};
+    const thresholds = this.resolveInboundContentFilterThresholds(profileConfig);
+    const result = {
+      enabled: this.inboundContentFilterEnabled === true,
+      version: "content-filter@v1",
+      source,
+      profile,
+      thresholds,
+      action: "allow",
+      labels: [],
+      detected_categories: [],
+      score: 0,
+      spam_score: 0,
+      phish_score: 0,
+      malware_score: 0,
+      signals: []
+    };
+
+    if (!result.enabled) {
+      return result;
+    }
+
+    this.ensureInboundContentFilterStatsShape();
+
+    const addSignal = (category, code, weight, detail = null) => {
+      const normalizedCategory = String(category || "")
+        .trim()
+        .toLowerCase();
+      const normalizedCode = String(code || "").trim();
+      const parsedWeight = Number(weight);
+      if (!normalizedCategory || !normalizedCode || !Number.isFinite(parsedWeight) || parsedWeight <= 0) {
+        return;
+      }
+      const normalizedWeight = Math.round(parsedWeight * 100) / 100;
+      if (normalizedCategory === "spam") {
+        result.spam_score += normalizedWeight;
+      } else if (normalizedCategory === "phish") {
+        result.phish_score += normalizedWeight;
+      } else if (normalizedCategory === "malware") {
+        result.malware_score += normalizedWeight;
+      }
+      result.signals.push({
+        category: normalizedCategory,
+        code: normalizedCode,
+        weight: normalizedWeight,
+        ...(detail ? { detail: String(detail).slice(0, 180) } : {})
+      });
+    };
+
+    const subject = String(payload?.subject || "").trim();
+    const text = String(payload?.text || "").trim();
+    const html = String(payload?.html || "").trim();
+    const extractedHtmlText = html ? this.htmlToText(html) : "";
+    const combinedText = [subject, text, extractedHtmlText].filter(Boolean).join("\n");
+    const combinedLower = combinedText.toLowerCase();
+    const spamKeywordMatches = new Set();
+    const phishKeywordMatches = new Set();
+
+    for (const keyword of CONTENT_FILTER_SPAM_KEYWORDS) {
+      if (combinedLower.includes(keyword)) {
+        spamKeywordMatches.add(keyword);
+        addSignal("spam", "keyword.spam", profileWeights.keyword_spam, keyword);
+      }
+    }
+    for (const keyword of CONTENT_FILTER_PHISH_KEYWORDS) {
+      if (combinedLower.includes(keyword)) {
+        phishKeywordMatches.add(keyword);
+        addSignal("phish", "keyword.phish", profileWeights.keyword_phish, keyword);
+      }
+    }
+    const spamKeywordClusterMin = Math.max(1, Number(profileClusters.spam_keyword_min || 0));
+    const phishKeywordClusterMin = Math.max(1, Number(profileClusters.phish_keyword_min || 0));
+    if (spamKeywordMatches.size >= spamKeywordClusterMin) {
+      addSignal(
+        "spam",
+        "keyword.spam_cluster",
+        profileClusters.spam_keyword_weight,
+        `count=${spamKeywordMatches.size}`
+      );
+    }
+    if (phishKeywordMatches.size >= phishKeywordClusterMin) {
+      addSignal(
+        "phish",
+        "keyword.phish_cluster",
+        profileClusters.phish_keyword_weight,
+        `count=${phishKeywordMatches.size}`
+      );
+    }
+
+    const subjectLetters = subject.replace(/[^A-Za-z]/g, "");
+    if (subjectLetters.length >= 10) {
+      const upper = subjectLetters.replace(/[^A-Z]/g, "").length;
+      if (upper / subjectLetters.length >= 0.8) {
+        addSignal("spam", "subject.all_caps", profileWeights.subject_all_caps, subject.slice(0, 80));
+      }
+    }
+
+    const urls = extractContentUrls([subject, text, html].join("\n"));
+    if (urls.length >= 6) {
+      addSignal("spam", "url.volume_high", profileWeights.url_volume, `count=${urls.length}`);
+    }
+    for (const url of urls) {
+      const host = normalizeUrlHost(url);
+      if (!host) {
+        continue;
+      }
+      if (CONTENT_FILTER_SHORTENER_HOSTS.has(host)) {
+        addSignal("phish", "url.shortener", profileWeights.url_shortener, host);
+      }
+      if (host.startsWith("xn--") || host.includes(".xn--")) {
+        addSignal("phish", "url.punycode", profileWeights.url_punycode, host);
+      }
+      if (isIpv4Host(host)) {
+        addSignal("phish", "url.ip_literal", profileWeights.url_ip_literal, host);
+      }
+    }
+
+    const attachments = Array.isArray(payload?.attachments) ? payload.attachments : [];
+    for (const attachment of attachments.slice(0, 24)) {
+      const filename = String(attachment?.filename || attachment?.name || "").trim();
+      const extension = normalizeAttachmentExtension(filename);
+      const mimeType = String(attachment?.mime_type || attachment?.mimeType || attachment?.contentType || "")
+        .trim()
+        .toLowerCase();
+      if (extension && CONTENT_FILTER_MALWARE_EXTENSIONS.has(extension)) {
+        addSignal("malware", "attachment.risky_extension", 5, filename || extension);
+      }
+      if (extension && CONTENT_FILTER_ARCHIVE_EXTENSIONS.has(extension)) {
+        const suspiciousArchiveContext =
+          combinedLower.includes("invoice") ||
+          combinedLower.includes("payment") ||
+          combinedLower.includes("statement");
+        if (suspiciousArchiveContext) {
+          addSignal("phish", "attachment.archive_lure", profileWeights.attachment_archive_lure, filename || extension);
+        }
+      }
+      const dotSegments = filename
+        .toLowerCase()
+        .split(".")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+      if (dotSegments.length >= 3 && CONTENT_FILTER_MALWARE_EXTENSIONS.has(dotSegments[dotSegments.length - 1])) {
+        addSignal("malware", "attachment.double_extension", 4, filename);
+      }
+      if (mimeType && CONTENT_FILTER_MALWARE_MIME_SNIPPETS.some((snippet) => mimeType.includes(snippet))) {
+        addSignal("malware", "attachment.risky_mime", 4, mimeType);
+      }
+    }
+
+    const authResults = payload?.auth_results && typeof payload.auth_results === "object" ? payload.auth_results : null;
+    if (authResults) {
+      const dmarc = String(authResults.dmarc || "").trim().toLowerCase();
+      const dkim = String(authResults.dkim || "").trim().toLowerCase();
+      const spf = String(authResults.spf || "").trim().toLowerCase();
+      const hardFailureStatuses = new Set(["fail", "softfail", "temperror", "permerror", "policy"]);
+      if (hardFailureStatuses.has(dmarc)) {
+        addSignal("phish", "auth.dmarc_not_pass", profileWeights.auth_dmarc_not_pass, dmarc);
+      }
+      if (hardFailureStatuses.has(dkim)) {
+        addSignal("phish", "auth.dkim_not_pass", profileWeights.auth_dkim_not_pass, dkim);
+      }
+      if (hardFailureStatuses.has(spf)) {
+        addSignal("phish", "auth.spf_not_pass", profileWeights.auth_spf_not_pass, spf);
+      }
+    }
+
+    result.score = result.spam_score + result.phish_score + result.malware_score;
+    if (result.spam_score >= thresholds.spam) {
+      result.labels.push("sys.spam");
+    }
+
+    if (this.inboundContentFilterRejectMalware && result.malware_score > 0) {
+      result.action = "reject";
+    } else if (
+      result.score >= thresholds.reject ||
+      result.phish_score >= thresholds.phish + 2
+    ) {
+      result.action = "reject";
+    } else if (
+      result.malware_score > 0 ||
+      result.phish_score >= thresholds.phish ||
+      result.score >= thresholds.quarantine
+    ) {
+      result.action = "quarantine";
+    }
+
+    if (result.action === "quarantine" && !result.labels.includes("sys.quarantine")) {
+      result.labels.push("sys.quarantine");
+    }
+
+    result.detected_categories = Array.from(
+      new Set(result.signals.map((signal) => signal.category).filter(Boolean))
+    );
+
+    this.inboundContentFilterStats.evaluated += 1;
+    this.inboundContentFilterStats.last_evaluated_at = nowIso();
+    if (result.action === "reject") {
+      this.inboundContentFilterStats.rejected += 1;
+    }
+    if (result.action === "quarantine") {
+      this.inboundContentFilterStats.quarantined += 1;
+    }
+    if (result.labels.includes("sys.spam")) {
+      this.inboundContentFilterStats.spam_labeled += 1;
+    }
+    const profileDecisionStats =
+      this.inboundContentFilterStats.decision_counts_by_profile?.[result.profile] ||
+      createInboundContentFilterProfileDecisionStats();
+    profileDecisionStats.evaluated += 1;
+    if (INBOUND_CONTENT_FILTER_DECISION_ACTIONS.includes(result.action)) {
+      profileDecisionStats[result.action] += 1;
+    }
+    if (result.labels.includes("sys.spam")) {
+      profileDecisionStats.spam_labeled += 1;
+    }
+    this.inboundContentFilterStats.decision_counts_by_profile[result.profile] = profileDecisionStats;
+    this.appendInboundContentFilterDecisionTelemetry(payload, context, result);
+
+    if (result.action !== "allow" || result.labels.includes("sys.spam")) {
+      this.persistAndAudit("content.filter.flagged", {
+        source,
+        action: result.action,
+        score: result.score,
+        spam_score: result.spam_score,
+        phish_score: result.phish_score,
+        malware_score: result.malware_score,
+        profile: result.profile,
+        thresholds: result.thresholds,
+        labels: result.labels,
+        signal_count: result.signals.length,
+        actor: context?.actor || null,
+        node_id: context?.node_id || null
+      });
+    }
+
+    return result;
+  }
+
   normalizeBridgeAuthStatus(value, fallback = "none") {
     const normalized = String(value || "")
       .trim()
@@ -4971,9 +8749,10 @@ export class LoomStore {
     };
   }
 
-  resolveBridgeInboundAuthResults(payload, headers) {
+  resolveBridgeInboundAuthResults(payload, headers, options = {}) {
+    const allowPayloadAuthResults = options.allowPayloadAuthResults !== false;
     const fromPayload = payload?.auth_results;
-    if (fromPayload && typeof fromPayload === "object") {
+    if (allowPayloadAuthResults && fromPayload && typeof fromPayload === "object") {
       return {
         spf: this.normalizeBridgeAuthStatus(fromPayload.spf, "none"),
         dkim: this.normalizeBridgeAuthStatus(fromPayload.dkim, "none"),
@@ -5073,8 +8852,14 @@ export class LoomStore {
       });
     }
 
-    const threading = this.resolveThreadFromEmailHeaders(payload);
-    const headers = payload?.headers && typeof payload.headers === "object" ? payload.headers : {};
+    const inboundHeaderAllowlist = normalizeBridgeInboundHeaderAllowlist(
+      options.headerAllowlist == null ? this.bridgeInboundHeaderAllowlist : options.headerAllowlist
+    );
+    const rawHeaders = payload?.headers && typeof payload.headers === "object" ? payload.headers : {};
+    const headers = sanitizeBridgeInboundHeaders(rawHeaders, inboundHeaderAllowlist);
+    const threading = this.resolveThreadFromEmailHeaders(payload, {
+      headers
+    });
     const dateHeader = this.resolveHeaderValue(headers, "date");
     const createdAtInput = payload.date || dateHeader;
     const createdAt = parseTime(createdAtInput) != null ? new Date(parseTime(createdAtInput)).toISOString() : nowIso();
@@ -5094,9 +8879,15 @@ export class LoomStore {
       quarantineOnAuthFailure:
         options.quarantineOnAuthFailure == null
           ? this.bridgeInboundQuarantineOnAuthFailure
-          : options.quarantineOnAuthFailure !== false
+          : options.quarantineOnAuthFailure !== false,
+      allowPayloadAuthResults:
+        options.allowPayloadAuthResults == null
+          ? this.bridgeInboundAllowPayloadAuthResults
+          : options.allowPayloadAuthResults !== false
     };
-    const authResults = this.resolveBridgeInboundAuthResults(payload, headers);
+    const authResults = this.resolveBridgeInboundAuthResults(payload, headers, {
+      allowPayloadAuthResults: inboundAuthPolicy.allowPayloadAuthResults
+    });
     const authEvaluation = this.evaluateBridgeInboundAuthPolicy(authResults, inboundAuthPolicy);
     if (authEvaluation.reject) {
       throw new LoomError("CAPABILITY_DENIED", "Inbound email authentication policy rejected message", 403, {
@@ -5110,6 +8901,29 @@ export class LoomStore {
       typeof payload.text === "string" && payload.text.trim().length > 0
         ? payload.text
         : this.htmlToText(payload.html || "");
+    const contentEvaluation = this.evaluateInboundContentPolicy(
+      {
+        subject: payload.subject || this.resolveHeaderValue(headers, "subject") || "",
+        text: humanText,
+        html: payload.html || "",
+        attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
+        auth_results: authEvaluation.normalized
+      },
+      {
+        source: "bridge_email",
+        actor: actorIdentity
+      }
+    );
+    if (contentEvaluation.action === "reject") {
+      throw new LoomError("CAPABILITY_DENIED", "Inbound email content policy rejected message", 403, {
+        field: "content",
+        content_filter: {
+          action: contentEvaluation.action,
+          score: contentEvaluation.score,
+          categories: contentEvaluation.detected_categories
+        }
+      });
+    }
 
     const unsignedEnvelope = {
       loom: "1.1",
@@ -5168,10 +8982,26 @@ export class LoomStore {
             require_dmarc_pass: inboundAuthPolicy.requireDmarcPass,
             reject_on_auth_failure: inboundAuthPolicy.rejectOnAuthFailure,
             quarantine_on_auth_failure: inboundAuthPolicy.quarantineOnAuthFailure,
+            allow_payload_auth_results: inboundAuthPolicy.allowPayloadAuthResults,
             reason: authEvaluation.reason
           },
           extraction_confidence:
             typeof payload.extraction_confidence === "number" ? payload.extraction_confidence : 0.25
+        },
+        security: {
+          content_filter: {
+            version: contentEvaluation.version,
+            source: contentEvaluation.source,
+            action: contentEvaluation.action,
+            labels: contentEvaluation.labels,
+            score: contentEvaluation.score,
+            spam_score: contentEvaluation.spam_score,
+            phish_score: contentEvaluation.phish_score,
+            malware_score: contentEvaluation.malware_score,
+            detected_categories: contentEvaluation.detected_categories,
+            signal_codes: contentEvaluation.signals.map((signal) => signal.code),
+            evaluated_at: nowIso()
+          }
         }
       }
     };
@@ -5189,11 +9019,14 @@ export class LoomStore {
     this.recordEmailMessageIndex(canonicalMessageId, stored.id, stored.thread_id);
     this.recordEmailMessageIndex(`${stored.id}@${this.nodeId}`, stored.id, stored.thread_id);
 
-    const shouldQuarantine = payload.quarantine === true || authEvaluation.quarantine;
+    const shouldQuarantine =
+      payload.quarantine === true || authEvaluation.quarantine || contentEvaluation.action === "quarantine";
     let quarantined = false;
+    const spamLabeled =
+      contentEvaluation.labels.includes("sys.spam") && this.ensureThreadLabel(stored.thread_id, "sys.spam");
     if (shouldQuarantine) {
       quarantined = this.ensureThreadLabel(stored.thread_id, "sys.quarantine");
-    } else {
+    } else if (!spamLabeled) {
       this.ensureThreadLabel(stored.thread_id, "sys.inbox");
     }
 
@@ -5203,6 +9036,10 @@ export class LoomStore {
       message_id: canonicalMessageId,
       actor: actorIdentity,
       auth_results: authEvaluation.normalized,
+      content_filter_action: contentEvaluation.action,
+      content_filter_score: contentEvaluation.score,
+      content_filter_categories: contentEvaluation.detected_categories,
+      spam_labeled: spamLabeled,
       quarantined,
       quarantine_reason: authEvaluation.reason
     });
@@ -5211,7 +9048,8 @@ export class LoomStore {
       envelope_id: stored.id,
       thread_id: stored.thread_id,
       message_id: canonicalMessageId,
-      quarantined
+      quarantined,
+      spam_labeled: spamLabeled
     };
   }
 
@@ -6741,6 +10579,39 @@ export class LoomStore {
     return signingKey?.public_key_pem || null;
   }
 
+  resolveIdentityEncryptionKey(identityUri, keyId, options = {}) {
+    const normalizedIdentity = this.normalizeIdentityReference(identityUri);
+    const normalizedKeyId = String(keyId || "").trim();
+    if (!normalizedIdentity || !normalizedKeyId) {
+      return null;
+    }
+
+    const owner = this.encryptionKeyOwnerById.get(normalizedKeyId);
+    if (owner && owner !== normalizedIdentity) {
+      return null;
+    }
+
+    const identity = this.resolveIdentity(normalizedIdentity);
+    if (!identity) {
+      return null;
+    }
+
+    const encryptionKeys = Array.isArray(identity.encryption_keys) ? identity.encryption_keys : [];
+    const key = encryptionKeys.find((candidate) => String(candidate?.key_id || "").trim() === normalizedKeyId) || null;
+    if (!key) {
+      return null;
+    }
+
+    if (options.requireUsable !== false && !isSigningKeyUsableAt(key)) {
+      return null;
+    }
+
+    return {
+      ...key,
+      algorithm: normalizeIdentityEncryptionKeyAlgorithm(key.algorithm) || String(key.algorithm || "").trim()
+    };
+  }
+
   cleanupIdentityRegistrationChallenges(now = nowMs()) {
     for (const [challengeId, challenge] of this.identityRegistrationChallenges.entries()) {
       if (challenge?.used || isExpiredIso(challenge?.expires_at)) {
@@ -6815,7 +10686,13 @@ export class LoomStore {
     };
   }
 
-  consumeIdentityRegistrationProof(identityDoc, normalizedIdentity, normalizedSigningKeys, options = {}) {
+  consumeIdentityRegistrationProof(
+    identityDoc,
+    normalizedIdentity,
+    normalizedSigningKeys,
+    normalizedEncryptionKeys = [],
+    options = {}
+  ) {
     const requireProofOfKey =
       options.requireProofOfKey === true ||
       (options.requireProofOfKey !== false && this.identityRegistrationProofRequired);
@@ -6875,7 +10752,8 @@ export class LoomStore {
       identity: normalizedIdentity,
       type: identityDoc.type || "human",
       displayName: identityDoc.display_name || normalizedIdentity,
-      signingKeys: normalizedSigningKeys
+      signingKeys: normalizedSigningKeys,
+      encryptionKeys: normalizedEncryptionKeys
     });
     const documentHash = hashIdentityRegistrationDocument(registrationDocument);
     const message = buildIdentityRegistrationProofMessage({
@@ -7013,10 +10891,90 @@ export class LoomStore {
 
     normalizedSigningKeys.sort((left, right) => left.key_id.localeCompare(right.key_id));
 
+    const encryptionKeys = resolveIdentityEncryptionKeysInput(identityDoc);
+    if (
+      (Object.prototype.hasOwnProperty.call(identityDoc, "encryption_keys") ||
+        Object.prototype.hasOwnProperty.call(identityDoc, "public_keys")) &&
+      !Array.isArray(encryptionKeys)
+    ) {
+      throw new LoomError("ENVELOPE_INVALID", "encryption_keys must be an array when provided", 400, {
+        field: "encryption_keys"
+      });
+    }
+
+    const normalizedEncryptionKeys = [];
+    const seenEncryptionKeyIds = new Set();
+    for (const key of encryptionKeys) {
+      const keyId = String(key?.key_id || "").trim();
+      const algorithm = normalizeIdentityEncryptionKeyAlgorithm(key?.algorithm);
+      const publicKey = String(key?.public_key || "").trim();
+      const publicKeyPem = String(key?.public_key_pem || "").trim();
+      if (!keyId || !algorithm || (!publicKey && !publicKeyPem)) {
+        throw new LoomError(
+          "ENVELOPE_INVALID",
+          "Encryption key entries require key_id, algorithm, and public_key or public_key_pem",
+          400,
+          {
+            field: "encryption_keys"
+          }
+        );
+      }
+
+      if (seenEncryptionKeyIds.has(keyId)) {
+        throw new LoomError("ENVELOPE_INVALID", `Duplicate encryption key id in identity payload: ${keyId}`, 400, {
+          field: "encryption_keys.key_id",
+          key_id: keyId
+        });
+      }
+      seenEncryptionKeyIds.add(keyId);
+
+      const existingOwner = this.encryptionKeyOwnerById.get(keyId);
+      if (existingOwner && existingOwner !== normalizedIdentity) {
+        throw new LoomError(
+          "ENVELOPE_INVALID",
+          `Encryption key id is already assigned to another identity: ${keyId}`,
+          400,
+          {
+            field: "encryption_keys.key_id",
+            key_id: keyId
+          }
+        );
+      }
+
+      const existing = this.encryptionKeysById.get(keyId);
+      if (existing) {
+        if (
+          existing.algorithm !== algorithm ||
+          (existing.public_key || null) !== (publicKey || null) ||
+          (existing.public_key_pem || null) !== (publicKeyPem || null)
+        ) {
+          throw new LoomError("ENVELOPE_INVALID", `Encryption key id already exists with different key material: ${keyId}`, 400, {
+            field: "encryption_keys.key_id",
+            key_id: keyId
+          });
+        }
+      }
+
+      normalizedEncryptionKeys.push({
+        key_id: keyId,
+        algorithm,
+        public_key: publicKey || null,
+        public_key_pem: publicKeyPem || null,
+        status: String(key?.status || "active")
+          .trim()
+          .toLowerCase() || "active",
+        not_before: key?.not_before ? String(key.not_before).trim() : null,
+        not_after: key?.not_after ? String(key.not_after).trim() : null,
+        revoked_at: key?.revoked_at ? String(key.revoked_at).trim() : null
+      });
+    }
+    normalizedEncryptionKeys.sort((left, right) => left.key_id.localeCompare(right.key_id));
+
     const registrationProof = this.consumeIdentityRegistrationProof(
       identityDoc,
       normalizedIdentity,
       normalizedSigningKeys,
+      normalizedEncryptionKeys,
       options
     );
 
@@ -7032,6 +10990,7 @@ export class LoomStore {
       type: identityDoc.type || "human",
       display_name: identityDoc.display_name || normalizedIdentity,
       signing_keys: normalizedSigningKeys,
+      encryption_keys: normalizedEncryptionKeys,
       created_at: existingIdentity?.created_at || identityDoc.created_at || nowIso(),
       updated_at: nowIso(),
       identity_source: options.importedRemote === true ? "remote" : "local",
@@ -7042,18 +11001,18 @@ export class LoomStore {
 
     if (existingIdentity) {
       this.removeIdentitySigningKeys(existingIdentity.id, existingIdentity.signing_keys);
+      this.removeIdentityEncryptionKeys(existingIdentity.id, existingIdentity.encryption_keys);
     }
-    for (const key of normalizedSigningKeys) {
-      this.publicKeysById.set(key.key_id, key.public_key_pem);
-      this.keyOwnerById.set(key.key_id, normalizedIdentity);
-    }
+    this.applyIdentitySigningKeys(normalizedIdentity, normalizedSigningKeys);
+    this.applyIdentityEncryptionKeys(normalizedIdentity, normalizedEncryptionKeys);
 
     targetMap.set(stored.id, stored);
     this.persistAndAudit("identity.register", {
       identity: stored.id,
       type: stored.type,
       imported_remote: options.importedRemote === true,
-      proof_of_key: Boolean(registrationProof)
+      proof_of_key: Boolean(registrationProof),
+      encryption_key_count: stored.encryption_keys.length
     });
     return stored;
   }
@@ -7175,10 +11134,94 @@ export class LoomStore {
       nextSigningKeys = normalizedSigningKeys;
     }
 
+    let nextEncryptionKeys = normalizeIdentityEncryptionKeys(identity.encryption_keys);
+    const hasEncryptionKeysUpdate =
+      Object.prototype.hasOwnProperty.call(payload, "encryption_keys") ||
+      Object.prototype.hasOwnProperty.call(payload, "public_keys");
+    if (hasEncryptionKeysUpdate) {
+      const encryptionKeys = resolveIdentityEncryptionKeysInput(payload);
+      if (!Array.isArray(encryptionKeys)) {
+        throw new LoomError("ENVELOPE_INVALID", "encryption_keys must be an array when provided", 400, {
+          field: "encryption_keys"
+        });
+      }
+
+      const normalizedEncryptionKeys = [];
+      const seenKeyIds = new Set();
+      for (const key of encryptionKeys) {
+        const keyId = String(key?.key_id || "").trim();
+        const algorithm = normalizeIdentityEncryptionKeyAlgorithm(key?.algorithm);
+        const publicKey = String(key?.public_key || "").trim();
+        const publicKeyPem = String(key?.public_key_pem || "").trim();
+        if (!keyId || !algorithm || (!publicKey && !publicKeyPem)) {
+          throw new LoomError(
+            "ENVELOPE_INVALID",
+            "Encryption key entries require key_id, algorithm, and public_key or public_key_pem",
+            400,
+            {
+              field: "encryption_keys"
+            }
+          );
+        }
+
+        if (seenKeyIds.has(keyId)) {
+          throw new LoomError("ENVELOPE_INVALID", `Duplicate encryption key id in identity payload: ${keyId}`, 400, {
+            field: "encryption_keys.key_id",
+            key_id: keyId
+          });
+        }
+        seenKeyIds.add(keyId);
+
+        const existingOwner = this.encryptionKeyOwnerById.get(keyId);
+        if (existingOwner && existingOwner !== normalizedIdentity) {
+          throw new LoomError(
+            "ENVELOPE_INVALID",
+            `Encryption key id is already assigned to another identity: ${keyId}`,
+            400,
+            {
+              field: "encryption_keys.key_id",
+              key_id: keyId
+            }
+          );
+        }
+
+        const existing = this.encryptionKeysById.get(keyId);
+        if (existing) {
+          if (
+            existing.algorithm !== algorithm ||
+            (existing.public_key || null) !== (publicKey || null) ||
+            (existing.public_key_pem || null) !== (publicKeyPem || null)
+          ) {
+            throw new LoomError("ENVELOPE_INVALID", `Encryption key id already exists with different key material: ${keyId}`, 400, {
+              field: "encryption_keys.key_id",
+              key_id: keyId
+            });
+          }
+        }
+
+        normalizedEncryptionKeys.push({
+          key_id: keyId,
+          algorithm,
+          public_key: publicKey || null,
+          public_key_pem: publicKeyPem || null,
+          status: String(key?.status || "active")
+            .trim()
+            .toLowerCase() || "active",
+          not_before: key?.not_before ? String(key.not_before).trim() : null,
+          not_after: key?.not_after ? String(key.not_after).trim() : null,
+          revoked_at: key?.revoked_at ? String(key.revoked_at).trim() : null
+        });
+      }
+
+      normalizedEncryptionKeys.sort((left, right) => left.key_id.localeCompare(right.key_id));
+      nextEncryptionKeys = normalizedEncryptionKeys;
+    }
+
     const updated = {
       ...identity,
       display_name: nextDisplayName,
       signing_keys: nextSigningKeys,
+      encryption_keys: nextEncryptionKeys,
       updated_at: nowIso(),
       identity_source: "local",
       imported_remote: false,
@@ -7187,14 +11230,17 @@ export class LoomStore {
     };
 
     this.removeIdentitySigningKeys(identity.id, identity.signing_keys);
+    this.removeIdentityEncryptionKeys(identity.id, identity.encryption_keys);
     this.applyIdentitySigningKeys(updated.id, updated.signing_keys);
+    this.applyIdentityEncryptionKeys(updated.id, updated.encryption_keys);
     this.identities.set(updated.id, updated);
 
     this.persistAndAudit("identity.update", {
       identity: updated.id,
       actor: actorIdentity,
       key_id: actorKeyId,
-      signing_key_count: updated.signing_keys.length
+      signing_key_count: updated.signing_keys.length,
+      encryption_key_count: updated.encryption_keys.length
     });
 
     return updated;
@@ -7250,27 +11296,7 @@ export class LoomStore {
   }
 
   assertFederatedEnvelopeIdentityAuthority(envelope, verifiedNode) {
-    const fromIdentity = this.normalizeIdentityReference(envelope?.from?.identity);
-    const identityDomain = parseLoomIdentityDomain(fromIdentity);
-    if (!fromIdentity || !identityDomain) {
-      throw new LoomError("SIGNATURE_INVALID", "Federated envelope sender identity must include a valid domain", 401, {
-        field: "from.identity"
-      });
-    }
-
-    const authorityNodeId = String(verifiedNode?.node_id || "").trim().toLowerCase();
-    if (authorityNodeId && identityDomain.toLowerCase() !== authorityNodeId) {
-      throw new LoomError("SIGNATURE_INVALID", "Federated envelope sender identity domain does not match sender node", 401, {
-        field: "from.identity",
-        identity_domain: identityDomain,
-        sender_node: verifiedNode?.node_id || null
-      });
-    }
-
-    return {
-      fromIdentity,
-      identityDomain
-    };
+    return assertFederatedEnvelopeIdentityAuthorityPolicy.call(this, envelope, verifiedNode);
   }
 
   resolveFederationIdentityFetchUrl(node, identityUri) {
@@ -7428,7 +11454,8 @@ export class LoomStore {
       identity: identityDocument?.id,
       type: identityDocument?.type || "human",
       displayName: identityDocument?.display_name || identityDocument?.id,
-      signingKeys: Array.isArray(identityDocument?.signing_keys) ? identityDocument.signing_keys : []
+      signingKeys: Array.isArray(identityDocument?.signing_keys) ? identityDocument.signing_keys : [],
+      encryptionKeys: resolveIdentityEncryptionKeysInput(identityDocument)
     });
     const canonicalPayload = canonicalizeJson(canonicalIdentity);
     const valid = verifyUtf8MessageSignature(signingKey.public_key_pem, canonicalPayload, value);
@@ -7667,52 +11694,11 @@ export class LoomStore {
   }
 
   isIdentitySensitiveRoute(method, path) {
-    const normalizedMethod = String(method || "GET").toUpperCase();
-    if (normalizedMethod !== "GET") {
-      return true;
-    }
-
-    const normalizedPath = String(path || "").trim();
-    return normalizedPath === "/v1/audit" || normalizedPath === "/metrics";
+    return isIdentitySensitiveRoutePolicy(method, path);
   }
 
   enforceIdentityRateLimit({ identity, method = "GET", path = "/" } = {}) {
-    const normalizedIdentity = this.normalizeIdentityReference(identity);
-    if (!normalizedIdentity) {
-      return;
-    }
-
-    const windowMs = this.identityRateWindowMs;
-    const sensitive = this.isIdentitySensitiveRoute(method, path);
-    const max = sensitive ? this.identityRateSensitiveMax : this.identityRateDefaultMax;
-    if (!windowMs || !max) {
-      return;
-    }
-
-    const bucket = sensitive ? "sensitive" : "default";
-    const key = `${bucket}:${normalizedIdentity}`;
-    const now = nowMs();
-    const current = this.identityRateByBucket.get(key);
-    if (!current || now - current.window_started_at >= windowMs) {
-      this.identityRateByBucket.set(key, {
-        count: 1,
-        window_started_at: now
-      });
-      return;
-    }
-
-    if (current.count >= max) {
-      const retryAfterMs = Math.max(1, current.window_started_at + windowMs - now);
-      throw new LoomError("RATE_LIMIT_EXCEEDED", "Identity rate limit exceeded", 429, {
-        limit: max,
-        window_ms: windowMs,
-        retry_after_ms: retryAfterMs,
-        scope: `identity:${bucket}`,
-        identity: normalizedIdentity
-      });
-    }
-
-    current.count += 1;
+    return enforceIdentityRateLimitPolicy.call(this, { identity, method, path });
   }
 
   createDelegation(payload, actorIdentity) {
@@ -8129,6 +12115,77 @@ export class LoomStore {
     return thread.participants.some(
       (participant) => participant.identity === identityUri && participant.left_at == null
     );
+  }
+
+  getActiveParticipantIdentities(thread) {
+    if (!thread || !Array.isArray(thread.participants)) {
+      return [];
+    }
+    return thread.participants
+      .filter((participant) => participant?.left_at == null)
+      .map((participant) => String(participant.identity || "").trim())
+      .filter(Boolean);
+  }
+
+  getE2eeProfileSecurityRank(profileId) {
+    const resolved = resolveE2eeProfile(profileId);
+    const canonicalId = resolved?.id || String(profileId || "").trim();
+    if (!canonicalId) {
+      return null;
+    }
+    const rank = Number(E2EE_PROFILE_SECURITY_RANK.get(canonicalId));
+    return Number.isFinite(rank) ? rank : null;
+  }
+
+  assertE2eeProfileMigrationPolicy(fromProfileId, toProfileId, context = {}) {
+    const fromResolved = resolveE2eeProfile(fromProfileId);
+    const toResolved = resolveE2eeProfile(toProfileId);
+    const fromCanonical = fromResolved?.id || String(fromProfileId || "").trim();
+    const toCanonical = toResolved?.id || String(toProfileId || "").trim();
+
+    if (!fromCanonical || !toCanonical) {
+      throw new LoomError("STATE_TRANSITION_INVALID", "E2EE profile migration requires valid source and destination profiles", 409, {
+        thread_id: context.thread_id || null,
+        from_profile: fromCanonical || null,
+        to_profile: toCanonical || null
+      });
+    }
+
+    if (fromCanonical === toCanonical) {
+      return {
+        allowed: true,
+        reason: "same_profile"
+      };
+    }
+
+    const allowlistKey = `${fromCanonical.toLowerCase()}>${toCanonical.toLowerCase()}`;
+    if (this.e2eeProfileMigrationAllowlist.has(allowlistKey)) {
+      return {
+        allowed: true,
+        reason: "allowlist"
+      };
+    }
+
+    const fromRank = this.getE2eeProfileSecurityRank(fromCanonical);
+    const toRank = this.getE2eeProfileSecurityRank(toCanonical);
+    if (Number.isFinite(fromRank) && Number.isFinite(toRank) && toRank > fromRank) {
+      return {
+        allowed: true,
+        reason: "rank_upgrade",
+        from_rank: fromRank,
+        to_rank: toRank
+      };
+    }
+
+    throw new LoomError("STATE_TRANSITION_INVALID", "E2EE profile migration is not permitted by policy", 409, {
+      thread_id: context.thread_id || null,
+      envelope_id: context.envelope_id || null,
+      from_profile: fromCanonical,
+      to_profile: toCanonical,
+      from_rank: fromRank,
+      to_rank: toRank,
+      allowlist_entry_required: true
+    });
   }
 
   sanitizeCapabilityToken(token, options = {}) {
@@ -8755,590 +12812,27 @@ export class LoomStore {
   }
 
   resolvePendingParentsForThread(thread, parentEnvelopeId) {
-    if (!thread || !parentEnvelopeId) {
-      return 0;
-    }
+    return resolvePendingParentsForThreadCore.call(this, thread, parentEnvelopeId);
+  }
 
-    let resolved = 0;
-    for (const envelopeId of thread.envelope_ids || []) {
-      if (envelopeId === parentEnvelopeId) {
-        continue;
-      }
-
-      const envelope = this.envelopesById.get(envelopeId);
-      if (!envelope || envelope.parent_id !== parentEnvelopeId) {
-        continue;
-      }
-
-      if (!envelope.meta?.pending_parent) {
-        continue;
-      }
-
-      envelope.meta = {
-        ...envelope.meta,
-        pending_parent: false,
-        parent_resolved_at: nowIso()
-      };
-      resolved += 1;
-    }
-
-    if (resolved > 0) {
-      thread.pending_parent_count = Math.max(0, Number(thread.pending_parent_count || 0) - resolved);
-    }
-
-    return resolved;
+  enforceThreadEnvelopeEncryptionPolicy(thread, envelope, isNewThread) {
+    return enforceThreadEnvelopeEncryptionPolicyCore.call(this, thread, envelope, isNewThread);
   }
 
   prepareThreadOperation(thread, envelope, actorIdentity, context = {}) {
-    const intent = envelope.content?.structured?.intent;
-    const parameters = envelope.content?.structured?.parameters || {};
-
-    if (!intent || typeof intent !== "string") {
-      throw new LoomError("ENVELOPE_INVALID", "thread_op requires content.structured.intent", 400, {
-        field: "content.structured.intent"
-      });
-    }
-
-    const payloadCapabilityTokenRaw = parameters.capability_token;
-    const payloadPortableCapabilityToken =
-      payloadCapabilityTokenRaw &&
-      typeof payloadCapabilityTokenRaw === "object" &&
-      !Array.isArray(payloadCapabilityTokenRaw)
-        ? payloadCapabilityTokenRaw
-        : null;
-    const payloadCapabilityTokenValue =
-      typeof payloadCapabilityTokenRaw === "string" ? payloadCapabilityTokenRaw.trim() : "";
-    const headerCapabilityTokenValue = String(context?.capabilityPresentationToken || "").trim();
-    const capabilityTokenValue = headerCapabilityTokenValue || payloadCapabilityTokenValue;
-    const capabilityTokenId =
-      typeof parameters.capability_id === "string" && parameters.capability_id.trim()
-        ? parameters.capability_id.trim()
-        : null;
-
-    const validatedToken = this.validateCapabilityForThreadOperation({
-      thread,
-      intent,
-      actorIdentity,
-      capabilityTokenValue,
-      capabilityTokenId,
-      portableCapabilityToken: payloadPortableCapabilityToken,
-      context
-    });
-
-    if (
-      context?.requirePortableThreadOpCapability === true &&
-      !this.isThreadOwner(thread, actorIdentity) &&
-      validatedToken?.kind !== "portable"
-    ) {
-      throw new LoomError(
-        "CAPABILITY_DENIED",
-        "Portable signed capability_token payload is required for non-owner thread operations",
-        403,
-        {
-          intent,
-          actor: actorIdentity,
-          field: "content.structured.parameters.capability_token"
-        }
-      );
-    }
-
-    return () => {
-      switch (intent) {
-        case "thread.add_participant@v1": {
-          const participantIdentity = parameters.identity;
-          if (!isIdentity(participantIdentity)) {
-            throw new LoomError("ENVELOPE_INVALID", "thread.add_participant requires valid parameters.identity", 400, {
-              field: "content.structured.parameters.identity"
-            });
-          }
-
-          const existing = thread.participants.find(
-            (participant) => participant.identity === participantIdentity
-          );
-
-          if (!existing) {
-            thread.participants.push({
-              identity: participantIdentity,
-              role: parameters.role || "participant",
-              joined_at: envelope.created_at,
-              left_at: null
-            });
-          } else {
-            existing.left_at = null;
-            existing.role = parameters.role || existing.role;
-          }
-          break;
-        }
-
-        case "thread.remove_participant@v1": {
-          const participantIdentity = parameters.identity;
-          const existing = thread.participants.find(
-            (participant) => participant.identity === participantIdentity
-          );
-
-          if (!existing) {
-            throw new LoomError("ENVELOPE_INVALID", "Participant not found for removal", 400, {
-              participant: participantIdentity
-            });
-          }
-
-          if (existing.role === "owner") {
-            throw new LoomError("STATE_TRANSITION_INVALID", "Cannot remove thread owner directly", 409, {
-              participant: participantIdentity
-            });
-          }
-
-          existing.left_at = existing.left_at || envelope.created_at;
-          break;
-        }
-
-        case "thread.update@v1": {
-          if (typeof parameters.subject === "string") {
-            thread.subject = parameters.subject;
-          }
-
-          if (Array.isArray(parameters.labels)) {
-            thread.labels = Array.from(
-              new Set(parameters.labels.map((label) => String(label).trim()).filter(Boolean))
-            );
-          }
-          break;
-        }
-
-        case "thread.resolve@v1":
-          assertTransition(thread, ["active"], "resolved");
-          thread.state = "resolved";
-          break;
-
-        case "thread.archive@v1":
-          assertTransition(thread, ["resolved"], "archived");
-          thread.state = "archived";
-          break;
-
-        case "thread.lock@v1":
-          assertTransition(thread, ["active", "resolved"], "locked");
-          thread.state = "locked";
-          break;
-
-        case "thread.reopen@v1":
-          assertTransition(thread, ["resolved", "locked"], "active");
-          thread.state = "active";
-          break;
-
-        case "thread.delegate@v1": {
-          const delegateIdentity = parameters.identity;
-          if (!isIdentity(delegateIdentity)) {
-            throw new LoomError("ENVELOPE_INVALID", "thread.delegate requires valid parameters.identity", 400, {
-              field: "content.structured.parameters.identity"
-            });
-          }
-
-          for (const participant of thread.participants) {
-            if (participant.role === "owner" && participant.left_at == null) {
-              participant.role = "participant";
-            }
-          }
-
-          const existing = thread.participants.find(
-            (participant) => participant.identity === delegateIdentity
-          );
-
-          if (!existing) {
-            thread.participants.push({
-              identity: delegateIdentity,
-              role: "owner",
-              joined_at: envelope.created_at,
-              left_at: null
-            });
-          } else {
-            existing.left_at = null;
-            existing.role = "owner";
-          }
-
-          break;
-        }
-
-        case "capability.revoked@v1": {
-          const capabilityId = parameters.capability_id;
-          const target = this.capabilitiesById.get(capabilityId);
-          if (!target || target.thread_id !== thread.id) {
-            throw new LoomError("ENVELOPE_INVALID", "Capability token not found for revocation", 400, {
-              capability_id: capabilityId
-            });
-          }
-
-          if (!target.revoked) {
-            target.revoked = true;
-            target.revoked_at = envelope.created_at;
-            thread.cap_epoch += 1;
-          }
-          break;
-        }
-
-        case "capability.spent@v1": {
-          const capabilityId = parameters.capability_id;
-          const target = this.capabilitiesById.get(capabilityId);
-          if (!target || target.thread_id !== thread.id) {
-            throw new LoomError("ENVELOPE_INVALID", "Capability token not found for spend update", 400, {
-              capability_id: capabilityId
-            });
-          }
-
-          if (!target.spent) {
-            target.spent = true;
-            target.spent_at = envelope.created_at;
-          }
-          break;
-        }
-
-        case "thread.fork@v1":
-        case "thread.merge@v1":
-        case "thread.link@v1":
-          // MVP behavior: accept operation and preserve it in authoritative event-log.
-          break;
-
-        default:
-          throw new LoomError("ENVELOPE_INVALID", `Unsupported thread operation intent: ${intent}`, 400, {
-            intent
-          });
-      }
-
-      if (validatedToken?.kind === "local") {
-        const token = validatedToken.token;
-        if (token?.single_use && !token.spent) {
-          token.spent = true;
-          token.spent_at = envelope.created_at;
-        }
-      } else if (validatedToken?.kind === "portable" && validatedToken.single_use) {
-        const localToken = validatedToken.localToken;
-        if (localToken) {
-          if (!localToken.spent) {
-            localToken.spent = true;
-            localToken.spent_at = envelope.created_at;
-          }
-        } else {
-          this.consumedPortableCapabilityIds.add(validatedToken.id);
-        }
-      }
-    };
+    return prepareThreadOperationCore.call(this, thread, envelope, actorIdentity, context);
   }
 
   resolveEnvelopeSignaturePublicKey(envelope, signatureKeyId, context = {}) {
-    const normalizedSignatureKeyId = String(signatureKeyId || "").trim();
-    const normalizedFromKeyId = String(envelope?.from?.key_id || "").trim();
-    if (!normalizedFromKeyId || normalizedFromKeyId !== normalizedSignatureKeyId) {
-      throw new LoomError("SIGNATURE_INVALID", "from.key_id must match signature.key_id", 401, {
-        field: "from.key_id"
-      });
-    }
-
-    const fromIdentity = this.normalizeIdentityReference(envelope?.from?.identity);
-    if (!fromIdentity) {
-      throw new LoomError("SIGNATURE_INVALID", "Envelope sender identity is missing", 401, {
-        field: "from.identity"
-      });
-    }
-
-    if (fromIdentity.startsWith("bridge://")) {
-      if (normalizedSignatureKeyId !== this.systemSigningKeyId) {
-        throw new LoomError("SIGNATURE_INVALID", "Bridge identities must be signed by system signing key", 401, {
-          field: "signature.key_id",
-          identity: fromIdentity
-        });
-      }
-      const systemPublicKey = this.resolvePublicKey(this.systemSigningKeyId);
-      if (!systemPublicKey) {
-        throw new LoomError("SIGNATURE_INVALID", "System signing key is not available for verification", 401, {
-          field: "signature.key_id"
-        });
-      }
-      return systemPublicKey;
-    }
-
-    if (context.allowSystemSignatureOverride === true && normalizedSignatureKeyId === this.systemSigningKeyId) {
-      const systemPublicKey = this.resolvePublicKey(this.systemSigningKeyId);
-      if (!systemPublicKey) {
-        throw new LoomError("SIGNATURE_INVALID", "System signing key is not available for verification", 401, {
-          field: "signature.key_id"
-        });
-      }
-      return systemPublicKey;
-    }
-
-    const identityPublicKey = this.resolveIdentitySigningPublicKey(fromIdentity, normalizedSignatureKeyId);
-    if (!identityPublicKey) {
-      throw new LoomError(
-        "SIGNATURE_INVALID",
-        `Signing key is not registered for envelope sender identity: ${normalizedSignatureKeyId}`,
-        401,
-        {
-          field: "signature.key_id",
-          identity: fromIdentity
-        }
-      );
-    }
-
-    return identityPublicKey;
+    return resolveEnvelopeSignaturePublicKeyCore.call(this, envelope, signatureKeyId, context);
   }
 
   resolveAuthoritativeEnvelopeSenderType(envelope) {
-    const fromIdentity = this.normalizeIdentityReference(envelope?.from?.identity);
-    if (!fromIdentity) {
-      throw new LoomError("SIGNATURE_INVALID", "Envelope sender identity is missing", 401, {
-        field: "from.identity"
-      });
-    }
-
-    const claimedType = String(envelope?.from?.type || "").trim();
-    if (!claimedType) {
-      throw new LoomError("ENVELOPE_INVALID", "Envelope sender type is missing", 400, {
-        field: "from.type"
-      });
-    }
-
-    if (fromIdentity.startsWith("bridge://")) {
-      if (claimedType !== "bridge") {
-        throw new LoomError("DELEGATION_INVALID", "Bridge sender identities must use from.type=bridge", 403, {
-          field: "from.type",
-          identity: fromIdentity,
-          expected_type: "bridge",
-          actual_type: claimedType
-        });
-      }
-      return "bridge";
-    }
-
-    const senderIdentity = this.resolveIdentity(fromIdentity);
-    if (!senderIdentity) {
-      throw new LoomError("SIGNATURE_INVALID", "Envelope sender identity is not registered", 401, {
-        field: "from.identity",
-        identity: fromIdentity
-      });
-    }
-
-    const registeredType = String(senderIdentity.type || "human").trim() || "human";
-    if (registeredType !== claimedType) {
-      throw new LoomError(
-        "DELEGATION_INVALID",
-        "Envelope sender type does not match registered identity type",
-        403,
-        {
-          field: "from.type",
-          identity: fromIdentity,
-          expected_type: registeredType,
-          actual_type: claimedType
-        }
-      );
-    }
-
-    return registeredType;
+    return resolveAuthoritativeEnvelopeSenderTypeCore.call(this, envelope);
   }
 
   ingestEnvelope(envelope, context = {}) {
-    validateEnvelopeOrThrow(envelope);
-
-    const actorIdentity = this.normalizeIdentityReference(context.actorIdentity || envelope.from?.identity);
-    const fromIdentity = this.normalizeIdentityReference(envelope.from?.identity);
-    if (!fromIdentity || actorIdentity !== fromIdentity) {
-      throw new LoomError("CAPABILITY_DENIED", "Authenticated actor must match envelope.from.identity", 403, {
-        actor: actorIdentity,
-        from: fromIdentity || envelope.from?.identity || null
-      });
-    }
-
-    const authoritativeSenderType = this.resolveAuthoritativeEnvelopeSenderType(envelope);
-
-    this.enforceThreadRecipientFanout(envelope);
-
-    if (this.envelopesById.has(envelope.id)) {
-      throw new LoomError("ENVELOPE_DUPLICATE", `Envelope already exists: ${envelope.id}`, 409, {
-        envelope_id: envelope.id
-      });
-    }
-
-    // Verify signature before spending any rate-limit or quota budget so that
-    // unauthenticated envelopes cannot exhaust another identity's quotas.
-    verifyEnvelopeSignature(envelope, (keyId, signedEnvelope) =>
-      this.resolveEnvelopeSignaturePublicKey(signedEnvelope, keyId, context)
-    );
-
-    this.enforceEnvelopeDailyQuota(actorIdentity, envelope.created_at);
-
-    // Backpressure: reject new envelopes when outbox queues exceed the
-    // configured high-water mark so the node doesn't accumulate unbounded
-    // outbox state.
-    if (this.outboxBackpressureMax > 0) {
-      const outboxDepth =
-        this.federationOutboxById.size + this.emailOutboxById.size + this.webhookOutboxById.size;
-      if (outboxDepth >= this.outboxBackpressureMax) {
-        throw new LoomError("SERVICE_OVERLOADED", "Outbox backpressure limit reached — try again later", 503, {
-          outbox_depth: outboxDepth,
-          backpressure_max: this.outboxBackpressureMax
-        });
-      }
-    }
-
-    if (authoritativeSenderType === "agent") {
-      const contextRequiredActions = Array.isArray(context.requiredActions)
-        ? context.requiredActions
-        : context.requiredAction
-          ? [context.requiredAction]
-          : [];
-      const requiredActions =
-        contextRequiredActions.length > 0
-          ? Array.from(new Set(contextRequiredActions.map((value) => String(value || "").trim()).filter(Boolean)))
-          : this.resolveDelegationRequiredActions(envelope);
-      verifyDelegationChainOrThrow(envelope, {
-        resolveIdentity: (identity) => this.resolveIdentity(identity),
-        resolvePublicKey: (keyId) => this.resolvePublicKey(keyId),
-        isDelegationRevoked: (link) => this.isDelegationRevoked(link),
-        now: nowMs(),
-        requiredActions
-      });
-    }
-
-    const threadId = envelope.thread_id;
-    const existingThread = this.threadsById.get(threadId);
-
-    if (existingThread?.state === "locked" && envelope.type !== "thread_op") {
-      throw new LoomError("THREAD_LOCKED", `Thread is locked: ${threadId}`, 409, {
-        thread_id: threadId
-      });
-    }
-
-    if (existingThread && envelope.type !== "thread_op" && !this.isActiveParticipant(existingThread, actorIdentity)) {
-      throw new LoomError("CAPABILITY_DENIED", "Sender is not an active participant of the thread", 403, {
-        thread_id: threadId,
-        actor: actorIdentity
-      });
-    }
-
-    if (envelope.type === "thread_op" && !existingThread) {
-      throw new LoomError("THREAD_NOT_FOUND", `thread_op requires an existing thread: ${threadId}`, 404, {
-        thread_id: threadId
-      });
-    }
-
-    const isNewThread = !existingThread;
-    const thread =
-      existingThread ||
-      {
-        id: threadId,
-        root_envelope_id: envelope.parent_id ? null : envelope.id,
-        subject: null,
-        state: "active",
-        created_at: envelope.created_at,
-        updated_at: nowIso(),
-        participants: [],
-        mailbox_state: {},
-        labels: [],
-        cap_epoch: 0,
-        encryption: {
-          enabled: false,
-          profile: null,
-          key_epoch: 0
-        },
-        event_seq_counter: 0,
-        envelope_ids: [],
-        pending_parent_count: 0
-      };
-
-    const operationMutation =
-      envelope.type === "thread_op" ? this.prepareThreadOperation(thread, envelope, actorIdentity, context) : null;
-
-    const threadSnapshot = !isNewThread ? structuredClone(thread) : null;
-
-    const pendingParent = !!(envelope.parent_id && !this.envelopesById.has(envelope.parent_id));
-    if (pendingParent) {
-      thread.pending_parent_count = Number(thread.pending_parent_count || 0) + 1;
-    }
-    thread.event_seq_counter += 1;
-
-    const storedEnvelope = {
-      ...envelope,
-      meta: {
-        ...(envelope.meta || {}),
-        node_id: this.nodeId,
-        received_at: nowIso(),
-        event_seq: thread.event_seq_counter,
-        origin_event_seq: envelope.meta?.origin_event_seq ?? thread.event_seq_counter,
-        pending_parent: pendingParent
-      }
-    };
-
-    thread.envelope_ids.push(storedEnvelope.id);
-    thread.updated_at = nowIso();
-
-    if (!thread.root_envelope_id && !storedEnvelope.parent_id) {
-      thread.root_envelope_id = storedEnvelope.id;
-    }
-
-    if (isNewThread) {
-      const participantUris = new Set([
-        storedEnvelope.from.identity,
-        ...(storedEnvelope.to || []).map((recipient) => recipient.identity)
-      ]);
-
-      thread.participants = Array.from(participantUris).map((identityUri, index) => ({
-        identity: identityUri,
-        role: index === 0 ? "owner" : "participant",
-        joined_at: storedEnvelope.created_at,
-        left_at: null
-      }));
-      for (const participant of thread.participants) {
-        this.ensureMailboxState(thread, participant.identity);
-      }
-    }
-
-    this.envelopesById.set(storedEnvelope.id, storedEnvelope);
-    this.threadsById.set(thread.id, thread);
-
-    const rollback = () => {
-      this.envelopesById.delete(storedEnvelope.id);
-
-      if (isNewThread) {
-        this.threadsById.delete(thread.id);
-      } else if (threadSnapshot) {
-        this.threadsById.set(thread.id, threadSnapshot);
-      }
-    };
-
-    const threadEnvelopes = thread.envelope_ids.map((id) => this.envelopesById.get(id));
-    const dagResult = validateThreadDag(threadEnvelopes);
-
-    if (!dagResult.valid) {
-      rollback();
-      throw new LoomError("ENVELOPE_INVALID", "Thread DAG contains a cycle", 400, {
-        thread_id: thread.id,
-        envelope_id: storedEnvelope.id
-      });
-    }
-
-    try {
-      if (operationMutation) {
-        operationMutation();
-        thread.updated_at = nowIso();
-      }
-    } catch (error) {
-      rollback();
-      throw error;
-    }
-
-    const resolvedPendingParents = this.resolvePendingParentsForThread(thread, storedEnvelope.id);
-    const deliveryWrappers = this.ensureDeliveryWrappersForEnvelope(storedEnvelope);
-    this.trackEnvelopeDailyQuota(storedEnvelope.from?.identity, storedEnvelope.created_at);
-
-    this.persistAndAudit("envelope.ingest", {
-      envelope_id: storedEnvelope.id,
-      thread_id: storedEnvelope.thread_id,
-      type: storedEnvelope.type,
-      pending_parent: pendingParent,
-      resolved_pending_parents: resolvedPendingParents,
-      delivery_wrapper_count: deliveryWrappers.length,
-      actor: actorIdentity
-    });
-
-    return storedEnvelope;
+    return ingestEnvelopeCore.call(this, envelope, context);
   }
 
   getEnvelope(envelopeId) {
@@ -9387,13 +12881,7 @@ export class LoomStore {
   }
 
   getThreadEnvelopes(threadId) {
-    const thread = this.threadsById.get(threadId);
-    if (!thread) {
-      return null;
-    }
-
-    const envelopes = thread.envelope_ids.map((id) => this.envelopesById.get(id));
-    return canonicalThreadOrder(envelopes);
+    return getThreadEnvelopesCore.call(this, threadId);
   }
 
   searchEnvelopes(filters, actorIdentity) {
@@ -9407,65 +12895,80 @@ export class LoomStore {
     const limit = Math.max(1, Math.min(Number(filters?.limit || 50), 200));
 
     const matches = [];
-    for (const envelope of this.envelopesById.values()) {
-      const thread = this.threadsById.get(envelope.thread_id);
-      if (!thread || !this.isActiveParticipant(thread, actorIdentity)) {
+    const candidateThreads = threadFilter
+      ? [this.threadsById.get(threadFilter)].filter(Boolean)
+      : Array.from(this.threadsById.values()).filter((thread) => this.isActiveParticipant(thread, actorIdentity));
+    if (threadFilter && candidateThreads.length > 0 && !this.isActiveParticipant(candidateThreads[0], actorIdentity)) {
+      return {
+        total: 0,
+        results: []
+      };
+    }
+
+    for (const thread of candidateThreads) {
+      if (!thread || !Array.isArray(thread.envelope_ids)) {
+        continue;
+      }
+      if (!this.isActiveParticipant(thread, actorIdentity)) {
         continue;
       }
 
-      if (threadFilter && envelope.thread_id !== threadFilter) {
-        continue;
-      }
-
-      if (fromFilter && envelope.from?.identity !== fromFilter) {
-        continue;
-      }
-
-      if (typeFilter && envelope.type !== typeFilter) {
-        continue;
-      }
-
-      const intent = envelope.content?.structured?.intent || null;
-      if (intentFilter && intent !== intentFilter) {
-        continue;
-      }
-
-      const createdMs = parseTime(envelope.created_at);
-      if (afterMs != null && (createdMs == null || createdMs < afterMs)) {
-        continue;
-      }
-
-      if (beforeMs != null && (createdMs == null || createdMs > beforeMs)) {
-        continue;
-      }
-
-      if (query.length > 0) {
-        const haystack = [
-          envelope.content?.encrypted ? "" : envelope.content?.human?.text || "",
-          intent || "",
-          envelope.type || "",
-          envelope.from?.identity || "",
-          envelope.thread_id || ""
-        ]
-          .join(" ")
-          .toLowerCase();
-
-        if (!haystack.includes(query)) {
+      for (const envelopeId of thread.envelope_ids) {
+        const envelope = this.envelopesById.get(envelopeId);
+        if (!envelope) {
           continue;
         }
-      }
 
-      matches.push({
-        envelope_id: envelope.id,
-        thread_id: envelope.thread_id,
-        type: envelope.type,
-        from: envelope.from?.identity || null,
-        created_at: envelope.created_at,
-        intent,
-        excerpt: envelope.content?.encrypted
-          ? null
-          : (envelope.content?.human?.text || "").slice(0, 240)
-      });
+        if (fromFilter && envelope.from?.identity !== fromFilter) {
+          continue;
+        }
+
+        if (typeFilter && envelope.type !== typeFilter) {
+          continue;
+        }
+
+        const intent = envelope.content?.structured?.intent || null;
+        if (intentFilter && intent !== intentFilter) {
+          continue;
+        }
+
+        const createdMs = parseTime(envelope.created_at);
+        if (afterMs != null && (createdMs == null || createdMs < afterMs)) {
+          continue;
+        }
+
+        if (beforeMs != null && (createdMs == null || createdMs > beforeMs)) {
+          continue;
+        }
+
+        if (query.length > 0) {
+          const haystack = [
+            envelope.content?.encrypted ? "" : envelope.content?.human?.text || "",
+            intent || "",
+            envelope.type || "",
+            envelope.from?.identity || "",
+            envelope.thread_id || ""
+          ]
+            .join(" ")
+            .toLowerCase();
+
+          if (!haystack.includes(query)) {
+            continue;
+          }
+        }
+
+        matches.push({
+          envelope_id: envelope.id,
+          thread_id: envelope.thread_id,
+          type: envelope.type,
+          from: envelope.from?.identity || null,
+          created_at: envelope.created_at,
+          intent,
+          excerpt: envelope.content?.encrypted
+            ? null
+            : (envelope.content?.human?.text || "").slice(0, 240)
+        });
+      }
     }
 
     matches.sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -9475,7 +12978,7 @@ export class LoomStore {
     };
   }
 
-  getNodeDocument(domain) {
+  getLocalFederationSigningKeys() {
     let federationPublicKeyPem = null;
     if (this.federationSigningPrivateKeyPem) {
       try {
@@ -9485,7 +12988,7 @@ export class LoomStore {
       }
     }
 
-    const federationSigningKeys =
+    const signingKeys =
       federationPublicKeyPem && this.federationSigningKeyId
         ? [
             {
@@ -9495,31 +12998,522 @@ export class LoomStore {
           ]
         : [];
 
+    return applyRevokedKeyIdsToFederationSigningKeys(
+      signingKeys,
+      this.federationTrustRevokedKeyIds
+    );
+  }
+
+  signFederationDocumentPayload(payload) {
+    if (!this.federationSigningPrivateKeyPem || !this.federationSigningKeyId) {
+      return payload;
+    }
+
+    const signature = signUtf8Message(
+      this.federationSigningPrivateKeyPem,
+      canonicalizeSignedDocumentPayload(payload)
+    );
+    return {
+      ...payload,
+      signature: {
+        algorithm: "Ed25519",
+        key_id: this.federationSigningKeyId,
+        value: signature
+      }
+    };
+  }
+
+  getFederationKeysetDocument(domain) {
+    const normalizedDomain = String(domain || "").trim() || "localhost";
+    const protocolCapabilitiesUrl = `https://${normalizedDomain}/v1/protocol/capabilities`;
+    const keysetUrl = `https://${normalizedDomain}/.well-known/loom-keyset.json`;
+    const revocationsUrl = `https://${normalizedDomain}/.well-known/loom-revocations.json`;
+    const signingKeys = this.getLocalFederationSigningKeys();
+    const activeSigningKey =
+      resolveFederationNodeSigningKey({ signing_keys: signingKeys }, this.federationSigningKeyId) ||
+      signingKeys.find((key) => isSigningKeyUsableAt(key)) ||
+      signingKeys[0] ||
+      null;
+    const revokedKeyIds = normalizeRevokedKeyIds(this.federationTrustRevokedKeyIds);
+    const cacheKey = canonicalizeJson({
+      node_id: this.nodeId,
+      domain: normalizedDomain,
+      trust_epoch: this.federationTrustLocalEpoch,
+      version: this.federationTrustKeysetVersion,
+      signing_keys: signingKeys,
+      revoked_key_ids: revokedKeyIds
+    });
+    const cached = this.federationPublishedKeysetsByDomain.get(normalizedDomain);
+    if (cached && cached.cache_key === cacheKey && !isExpiredIso(cached.document?.valid_until)) {
+      return {
+        ...cached.document
+      };
+    }
+
+    const generatedAt = nowIso();
+    const validUntil = new Date(nowMs() + this.federationTrustKeysetPublishTtlMs).toISOString();
+    const unsigned = {
+      loom_version: "1.1",
+      type: "loom.federation.keyset@v1",
+      node_id: this.nodeId,
+      domain: normalizedDomain,
+      generated_at: generatedAt,
+      valid_until: validUntil,
+      trust_epoch: this.federationTrustLocalEpoch,
+      epoch: this.federationTrustLocalEpoch,
+      version: this.federationTrustKeysetVersion,
+      active_key_id: activeSigningKey?.key_id || null,
+      signing_key_id: activeSigningKey?.key_id || null,
+      keyset_url: keysetUrl,
+      revocations_url: revocationsUrl,
+      protocol_capabilities_url: protocolCapabilitiesUrl,
+      signing_keys: signingKeys
+    };
+    const signed = this.signFederationDocumentPayload(unsigned);
+    this.federationPublishedKeysetsByDomain.set(normalizedDomain, {
+      cache_key: cacheKey,
+      document: signed
+    });
+    return {
+      ...signed
+    };
+  }
+
+  getFederationRevocationsDocument(domain) {
+    const normalizedDomain = String(domain || "").trim() || "localhost";
+    const revokedKeyIds = normalizeRevokedKeyIds(this.federationTrustRevokedKeyIds);
+    const cacheKey = canonicalizeJson({
+      node_id: this.nodeId,
+      domain: normalizedDomain,
+      trust_epoch: this.federationTrustLocalEpoch,
+      version: this.federationTrustKeysetVersion,
+      revoked_key_ids: revokedKeyIds
+    });
+    const cached = this.federationPublishedRevocationsByDomain.get(normalizedDomain);
+    if (cached && cached.cache_key === cacheKey && !isExpiredIso(cached.document?.valid_until)) {
+      return {
+        ...cached.document
+      };
+    }
+
+    const generatedAt = nowIso();
+    const validUntil = new Date(nowMs() + this.federationTrustKeysetPublishTtlMs).toISOString();
+    const unsigned = {
+      loom_version: "1.1",
+      type: "loom.federation.revocations@v1",
+      node_id: this.nodeId,
+      domain: normalizedDomain,
+      generated_at: generatedAt,
+      valid_until: validUntil,
+      trust_epoch: this.federationTrustLocalEpoch,
+      epoch: this.federationTrustLocalEpoch,
+      version: this.federationTrustKeysetVersion,
+      revoked_key_ids: revokedKeyIds
+    };
+    const signed = this.signFederationDocumentPayload(unsigned);
+    this.federationPublishedRevocationsByDomain.set(normalizedDomain, {
+      cache_key: cacheKey,
+      document: signed
+    });
+    return {
+      ...signed
+    };
+  }
+
+  buildFederationTrustDnsTxtRecord(domain) {
+    const normalizedDomain = String(domain || "").trim() || "localhost";
+    const keysetDocument = this.getFederationKeysetDocument(normalizedDomain);
+    const keysetUrl = String(keysetDocument?.keyset_url || `https://${normalizedDomain}/.well-known/loom-keyset.json`).trim();
+    const revocationsUrl = String(
+      keysetDocument?.revocations_url || `https://${normalizedDomain}/.well-known/loom-revocations.json`
+    ).trim();
+    const keysetDigest = hashCanonicalSignedDocumentPayload(keysetDocument);
+    return [
+      "v=loomfed1",
+      `keyset=${keysetUrl}`,
+      `digest=sha256:${keysetDigest}`,
+      `revocations=${revocationsUrl}`,
+      `trust_epoch=${this.federationTrustLocalEpoch}`,
+      `version=${this.federationTrustKeysetVersion}`
+    ].join(";");
+  }
+
+  getFederationTrustDnsDescriptor(domain) {
+    const normalizedDomain = String(domain || "").trim() || "localhost";
+    let dnsName = null;
+    try {
+      dnsName = this.resolveFederationTrustDnsName(this.nodeId);
+    } catch {
+      dnsName = null;
+    }
+
+    const record = this.buildFederationTrustDnsTxtRecord(normalizedDomain);
+    return {
+      version: "loomfed1",
+      dns_name: dnsName,
+      txt_record: record,
+      trust_epoch: this.federationTrustLocalEpoch,
+      keyset_version: this.federationTrustKeysetVersion,
+      keyset_url: `https://${normalizedDomain}/.well-known/loom-keyset.json`,
+      revocations_url: `https://${normalizedDomain}/.well-known/loom-revocations.json`,
+      generated_at: nowIso()
+    };
+  }
+
+  async verifyLocalFederationTrustDnsPublication(domain) {
+    const descriptor = this.getFederationTrustDnsDescriptor(domain);
+    const dnsName = String(descriptor?.dns_name || "").trim();
+    const expectedRecord = String(descriptor?.txt_record || "").trim();
+    if (!dnsName || !expectedRecord) {
+      throw new LoomError("ENVELOPE_INVALID", "Unable to resolve local federation trust DNS publication descriptor", 400, {
+        dns_name: dnsName || null
+      });
+    }
+
+    let resolverResult = {
+      records: [],
+      dnssec_validated: null,
+      dnssec_source: null
+    };
+    let resolutionError = null;
+    try {
+      resolverResult = normalizeFederationTrustDnsResolverResult(await this.federationTrustDnsTxtResolver(dnsName));
+    } catch (error) {
+      resolutionError = error;
+      resolverResult = {
+        records: [],
+        dnssec_validated: null,
+        dnssec_source: null
+      };
+    }
+
+    const answers = resolverResult.records;
+    const dnssecValidated = resolverResult.dnssec_validated === true;
+    const dnssecRequired = this.federationTrustRequireDnssec === true;
+    const expectedFields = normalizeFederationTrustDnsFields(parseFederationTrustDnsTxtRecord(expectedRecord));
+    const candidateRecords = answers.map((record) => {
+      const parsed = parseFederationTrustDnsTxtRecord(record);
+      return {
+        record,
+        parsed,
+        normalized: normalizeFederationTrustDnsFields(parsed)
+      };
+    });
+
+    const exactMatch = candidateRecords.some((candidate) => candidate.record === expectedRecord);
+    const semanticMatchCandidate = candidateRecords.find((candidate) => {
+      const normalized = candidate.normalized;
+      return (
+        normalized.keyset_url === expectedFields.keyset_url &&
+        normalized.digest_sha256 === expectedFields.digest_sha256 &&
+        normalized.revocations_url === expectedFields.revocations_url &&
+        normalized.trust_epoch === expectedFields.trust_epoch &&
+        normalized.version === expectedFields.version
+      );
+    });
+    const semanticMatch = Boolean(semanticMatchCandidate);
+    const dnssecMissing = dnssecRequired && !dnssecValidated;
+    const status = resolutionError
+      ? "dns_unreachable"
+      : dnssecMissing
+        ? "dnssec_unverified"
+      : exactMatch
+        ? "match_exact"
+        : semanticMatch
+          ? "match_semantic"
+          : "mismatch";
+
+    return {
+      dns_name: dnsName,
+      expected_txt_record: expectedRecord,
+      expected_fields: expectedFields,
+      observed_txt_records: answers,
+      observed_record_count: answers.length,
+      observed_fields: candidateRecords.map((candidate) => candidate.normalized),
+      match_exact: exactMatch,
+      match_semantic: semanticMatch,
+      dnssec_required: dnssecRequired,
+      dnssec_validated: dnssecValidated,
+      dnssec_source: resolverResult.dnssec_source || null,
+      status,
+      verified_at: nowIso(),
+      dns_resolution_error: resolutionError?.message || null
+    };
+  }
+
+  getFederationTrustStatus(domain) {
+    return {
+      trust_anchor_mode: this.federationTrustMode,
+      trust_anchor_fail_closed: this.federationTrustFailClosed,
+      trust_anchor_dns_txt_label: this.federationTrustDnsTxtLabel,
+      trust_anchor_require_dnssec: this.federationTrustRequireDnssec,
+      trust_anchor_transparency_mode: this.federationTrustTransparencyMode,
+      trust_anchor_require_transparency: this.federationTrustRequireTransparency,
+      trust_anchor_max_clock_skew_ms: this.federationTrustMaxClockSkewMs,
+      trust_anchor_keyset_max_age_ms: this.federationTrustKeysetMaxAgeMs,
+      trust_anchor_keyset_publish_ttl_ms: this.federationTrustKeysetPublishTtlMs,
+      trust_anchor_bindings_count: this.federationTrustAnchorBindings.size,
+      trust_epoch: this.federationTrustLocalEpoch,
+      keyset_version: this.federationTrustKeysetVersion,
+      revoked_key_ids: normalizeRevokedKeyIds(this.federationTrustRevokedKeyIds),
+      dns: this.getFederationTrustDnsDescriptor(domain)
+    };
+  }
+
+  updateFederationTrustConfig(payload, actorIdentity = "system") {
+    if (!payload || typeof payload !== "object") {
+      throw new LoomError("ENVELOPE_INVALID", "Federation trust config payload must be an object", 400, {
+        field: "payload"
+      });
+    }
+
+    const previous = {
+      mode: this.federationTrustMode,
+      fail_closed: this.federationTrustFailClosed,
+      dns_txt_label: this.federationTrustDnsTxtLabel,
+      require_dnssec: this.federationTrustRequireDnssec,
+      transparency_mode: this.federationTrustTransparencyMode,
+      require_transparency: this.federationTrustRequireTransparency,
+      max_clock_skew_ms: this.federationTrustMaxClockSkewMs,
+      keyset_max_age_ms: this.federationTrustKeysetMaxAgeMs,
+      keyset_publish_ttl_ms: this.federationTrustKeysetPublishTtlMs,
+      trust_epoch: this.federationTrustLocalEpoch,
+      keyset_version: this.federationTrustKeysetVersion,
+      revoked_key_ids: normalizeRevokedKeyIds(this.federationTrustRevokedKeyIds)
+    };
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_mode")) {
+      this.federationTrustMode = normalizeFederationTrustMode(payload.trust_anchor_mode, {
+        hasTrustAnchors: this.federationTrustAnchorBindings.size > 0
+      });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_fail_closed")) {
+      this.federationTrustFailClosed = parseBoolean(payload.trust_anchor_fail_closed, this.federationTrustFailClosed);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_dns_txt_label")) {
+      const value = String(payload.trust_anchor_dns_txt_label || "").trim();
+      if (!value) {
+        throw new LoomError("ENVELOPE_INVALID", "trust_anchor_dns_txt_label must be a non-empty string", 400, {
+          field: "trust_anchor_dns_txt_label"
+        });
+      }
+      this.federationTrustDnsTxtLabel = value;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_require_dnssec")) {
+      this.federationTrustRequireDnssec = parseBoolean(
+        payload.trust_anchor_require_dnssec,
+        this.federationTrustRequireDnssec
+      );
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_transparency_mode")) {
+      const normalized = String(payload.trust_anchor_transparency_mode || "")
+        .trim()
+        .toLowerCase();
+      if (!normalized) {
+        throw new LoomError("ENVELOPE_INVALID", "trust_anchor_transparency_mode must be a non-empty string", 400, {
+          field: "trust_anchor_transparency_mode"
+        });
+      }
+      this.federationTrustTransparencyMode = normalized;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_require_transparency")) {
+      this.federationTrustRequireTransparency = parseBoolean(
+        payload.trust_anchor_require_transparency,
+        this.federationTrustRequireTransparency
+      );
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_max_clock_skew_ms")) {
+      const parsed = parsePositiveInteger(payload.trust_anchor_max_clock_skew_ms, Number.NaN);
+      if (!Number.isFinite(parsed) || parsed < 1000) {
+        throw new LoomError("ENVELOPE_INVALID", "trust_anchor_max_clock_skew_ms must be an integer >= 1000", 400, {
+          field: "trust_anchor_max_clock_skew_ms"
+        });
+      }
+      this.federationTrustMaxClockSkewMs = parsed;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_keyset_max_age_ms")) {
+      const parsed = parsePositiveInteger(payload.trust_anchor_keyset_max_age_ms, Number.NaN);
+      if (!Number.isFinite(parsed) || parsed < 60 * 1000) {
+        throw new LoomError("ENVELOPE_INVALID", "trust_anchor_keyset_max_age_ms must be an integer >= 60000", 400, {
+          field: "trust_anchor_keyset_max_age_ms"
+        });
+      }
+      this.federationTrustKeysetMaxAgeMs = parsed;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, "trust_anchor_keyset_publish_ttl_ms")) {
+      const parsed = parsePositiveInteger(payload.trust_anchor_keyset_publish_ttl_ms, Number.NaN);
+      if (!Number.isFinite(parsed) || parsed < 60 * 1000) {
+        throw new LoomError("ENVELOPE_INVALID", "trust_anchor_keyset_publish_ttl_ms must be an integer >= 60000", 400, {
+          field: "trust_anchor_keyset_publish_ttl_ms"
+        });
+      }
+      this.federationTrustKeysetPublishTtlMs = parsed;
+    }
+
+    const explicitEpoch = Object.prototype.hasOwnProperty.call(payload, "trust_epoch");
+    const bumpEpoch = payload.bump_trust_epoch === true;
+    if (explicitEpoch) {
+      const parsed = parseNonNegativeInteger(payload.trust_epoch, -1);
+      if (parsed < 0) {
+        throw new LoomError("ENVELOPE_INVALID", "trust_epoch must be a non-negative integer", 400, {
+          field: "trust_epoch"
+        });
+      }
+      this.federationTrustLocalEpoch = parsed;
+    } else if (bumpEpoch) {
+      this.federationTrustLocalEpoch += 1;
+    }
+
+    const explicitVersion = Object.prototype.hasOwnProperty.call(payload, "keyset_version");
+    const bumpVersion = payload.bump_keyset_version === true;
+    if (explicitVersion) {
+      const parsed = parseNonNegativeInteger(payload.keyset_version, -1);
+      if (parsed < 0) {
+        throw new LoomError("ENVELOPE_INVALID", "keyset_version must be a non-negative integer", 400, {
+          field: "keyset_version"
+        });
+      }
+      this.federationTrustKeysetVersion = parsed;
+    } else if (bumpVersion) {
+      this.federationTrustKeysetVersion += 1;
+    }
+
+    const hasRevokedKeyIds = Object.prototype.hasOwnProperty.call(payload, "revoked_key_ids");
+    const hasAppendRevokedKeyIds = Object.prototype.hasOwnProperty.call(payload, "append_revoked_key_ids");
+    if (hasRevokedKeyIds || hasAppendRevokedKeyIds) {
+      const nextRevoked = hasRevokedKeyIds
+        ? normalizeRevokedKeyIds(payload.revoked_key_ids)
+        : normalizeRevokedKeyIds(this.federationTrustRevokedKeyIds);
+      const appendRevoked = hasAppendRevokedKeyIds ? normalizeRevokedKeyIds(payload.append_revoked_key_ids) : [];
+      this.federationTrustRevokedKeyIds = normalizeRevokedKeyIds([...nextRevoked, ...appendRevoked]);
+      if (!explicitVersion && !bumpVersion) {
+        this.federationTrustKeysetVersion += 1;
+      }
+    }
+
+    if (this.federationTrustLocalEpoch < previous.trust_epoch) {
+      throw new LoomError("ENVELOPE_INVALID", "trust_epoch cannot decrease", 400, {
+        field: "trust_epoch",
+        previous: previous.trust_epoch,
+        next: this.federationTrustLocalEpoch
+      });
+    }
+    if (
+      this.federationTrustLocalEpoch === previous.trust_epoch &&
+      this.federationTrustKeysetVersion < previous.keyset_version
+    ) {
+      throw new LoomError("ENVELOPE_INVALID", "keyset_version cannot decrease without trust_epoch bump", 400, {
+        field: "keyset_version",
+        previous: previous.keyset_version,
+        next: this.federationTrustKeysetVersion
+      });
+    }
+
+    this.federationPublishedKeysetsByDomain.clear();
+    this.federationPublishedRevocationsByDomain.clear();
+    this.persistAndAudit("federation.trust.config.update", {
+      actor: actorIdentity,
+      trust_anchor_mode: this.federationTrustMode,
+      trust_epoch: this.federationTrustLocalEpoch,
+      keyset_version: this.federationTrustKeysetVersion,
+      revoked_key_count: this.federationTrustRevokedKeyIds.length,
+      previous_trust_epoch: previous.trust_epoch,
+      previous_keyset_version: previous.keyset_version
+    });
+
+    return this.getFederationTrustStatus();
+  }
+
+  getNodeDocument(domain) {
+    const normalizedDomain = String(domain || "").trim() || "localhost";
+    const protocolCapabilitiesUrl = `https://${normalizedDomain}/v1/protocol/capabilities`;
+    const federationKeysetUrl = `https://${normalizedDomain}/.well-known/loom-keyset.json`;
+    const federationRevocationsUrl = `https://${normalizedDomain}/.well-known/loom-revocations.json`;
+    const keysetDocument = this.getFederationKeysetDocument(normalizedDomain);
+    const federationSigningKeys = normalizeKeysetSigningKeys(keysetDocument);
+    const activeSigningKey =
+      resolveFederationNodeSigningKey({ signing_keys: federationSigningKeys }, keysetDocument?.active_key_id) ||
+      federationSigningKeys[0] ||
+      null;
+    let trustAnchorDnsName = null;
+    try {
+      trustAnchorDnsName = this.resolveFederationTrustDnsName(this.nodeId);
+    } catch {
+      trustAnchorDnsName = null;
+    }
+
     return {
       loom_version: "1.1",
       node_id: this.nodeId,
-      domain,
-      api_url: `https://${domain}/v1`,
-      websocket_url: `wss://${domain}/ws`,
-      deliver_url: `https://${domain}/v1/federation/deliver`,
-      identity_resolve_url: `https://${domain}/v1/identity/{identity}`,
+      domain: normalizedDomain,
+      api_url: `https://${normalizedDomain}/v1`,
+      websocket_url: `wss://${normalizedDomain}/ws`,
+      deliver_url: `https://${normalizedDomain}/v1/federation/deliver`,
+      identity_resolve_url: `https://${normalizedDomain}/v1/identity/{identity}`,
+      protocol_capabilities_url: protocolCapabilitiesUrl,
+      federation_keyset_url: federationKeysetUrl,
+      federation_revocations_url: federationRevocationsUrl,
+      trust_anchor_dns_name: trustAnchorDnsName,
       federation: {
-        signing_key_id: this.federationSigningKeyId,
-        public_key_pem: federationPublicKeyPem,
+        signing_key_id: activeSigningKey?.key_id || null,
+        public_key_pem: activeSigningKey?.public_key_pem || null,
         signing_keys: federationSigningKeys,
-        outbox_url: `https://${domain}/v1/federation/outbox`,
-        challenge_url: `https://${domain}/v1/federation/challenge`,
-        identity_resolve_url: `https://${domain}/v1/identity/{identity}`
+        outbox_url: `https://${normalizedDomain}/v1/federation/outbox`,
+        challenge_url: `https://${normalizedDomain}/v1/federation/challenge`,
+        identity_resolve_url: `https://${normalizedDomain}/v1/identity/{identity}`,
+        protocol_capabilities_url: protocolCapabilitiesUrl,
+        keyset_url: federationKeysetUrl,
+        revocations_url: federationRevocationsUrl,
+        trust_anchor_mode: this.getFederationTrustAnchorMode(),
+        trust_anchor_dns_name: trustAnchorDnsName,
+        trust_epoch: this.federationTrustLocalEpoch,
+        keyset_hash_sha256: hashCanonicalSignedDocumentPayload(keysetDocument)
       },
       auth_endpoints: {
-        identity_challenge: `https://${domain}/v1/identity/challenge`,
-        challenge: `https://${domain}/v1/auth/challenge`,
-        token: `https://${domain}/v1/auth/token`,
-        refresh: `https://${domain}/v1/auth/refresh`
+        identity_challenge: `https://${normalizedDomain}/v1/identity/challenge`,
+        challenge: `https://${normalizedDomain}/v1/auth/challenge`,
+        token: `https://${normalizedDomain}/v1/auth/token`,
+        refresh: `https://${normalizedDomain}/v1/auth/refresh`
       },
       supported_profiles: ["loom-core-1"],
       auth: {
         proof_of_key: true
+      },
+      generated_at: nowIso(),
+      request_id: randomUUID()
+    };
+  }
+
+  getFederationTrustAnchorMode() {
+    return this.federationTrustMode;
+  }
+
+  getProtocolCapabilities(domain = null) {
+    const normalizedDomain = String(domain || "").trim() || null;
+    const protocolCapabilitiesUrl = normalizedDomain ? `https://${normalizedDomain}/v1/protocol/capabilities` : null;
+    return {
+      loom_version: "1.1",
+      node_id: this.nodeId,
+      protocol_capabilities_url: protocolCapabilitiesUrl,
+      federation_negotiation: {
+        trust_anchor_mode: this.getFederationTrustAnchorMode(),
+        trust_anchor_modes_supported: Array.from(FEDERATION_TRUST_MODES).sort(),
+        trust_anchor_bindings_count: this.federationTrustAnchorBindings.size,
+        trust_anchor_fail_closed: this.federationTrustFailClosed,
+        trust_anchor_dns_txt_label: this.federationTrustDnsTxtLabel,
+        trust_anchor_require_dnssec: this.federationTrustRequireDnssec,
+        trust_anchor_transparency_mode: this.federationTrustTransparencyMode,
+        trust_anchor_require_transparency: this.federationTrustRequireTransparency,
+        trust_anchor_epoch: this.federationTrustLocalEpoch,
+        e2ee_profiles: listSupportedE2eeProfileCapabilities()
       },
       generated_at: nowIso(),
       request_id: randomUUID()
@@ -9534,7 +13528,8 @@ export class LoomStore {
 
     const payload = {
       ...identity,
-      signing_keys: normalizeIdentitySigningKeys(identity.signing_keys)
+      signing_keys: normalizeIdentitySigningKeys(identity.signing_keys),
+      encryption_keys: normalizeIdentityEncryptionKeys(identity.encryption_keys)
     };
 
     if (identity.imported_remote === true || identity.identity_source === "remote") {
@@ -9549,7 +13544,8 @@ export class LoomStore {
       identity: payload.id,
       type: payload.type || "human",
       displayName: payload.display_name || payload.id,
-      signingKeys: payload.signing_keys
+      signingKeys: payload.signing_keys,
+      encryptionKeys: payload.encryption_keys
     });
     const nodeSignature = signUtf8Message(
       this.federationSigningPrivateKeyPem,
@@ -9563,6 +13559,262 @@ export class LoomStore {
         key_id: this.federationSigningKeyId,
         value: nodeSignature
       }
+    };
+  }
+
+  getRetentionCutoffMs(retentionDays) {
+    const days = Math.max(0, parseNonNegativeInteger(retentionDays, 0));
+    if (days <= 0) {
+      return null;
+    }
+    return nowMs() - days * MILLISECONDS_PER_DAY;
+  }
+
+  collectProtectedEnvelopeIdsForRetention() {
+    const protectedIds = new Set();
+    for (const item of this.federationOutboxById.values()) {
+      if (item?.status !== "queued") {
+        continue;
+      }
+      for (const envelopeId of Array.isArray(item.envelope_ids) ? item.envelope_ids : []) {
+        const normalized = String(envelopeId || "").trim();
+        if (normalized) {
+          protectedIds.add(normalized);
+        }
+      }
+    }
+
+    for (const item of this.emailOutboxById.values()) {
+      if (item?.status !== "queued") {
+        continue;
+      }
+      const envelopeId = String(item?.envelope_id || "").trim();
+      if (envelopeId) {
+        protectedIds.add(envelopeId);
+      }
+    }
+
+    return protectedIds;
+  }
+
+  purgeThreadScopedArtifacts(threadId) {
+    const normalizedThreadId = String(threadId || "").trim();
+    if (!normalizedThreadId) {
+      return 0;
+    }
+
+    let removed = 0;
+    for (const [capabilityId, token] of this.capabilitiesById.entries()) {
+      if (String(token?.thread_id || "").trim() !== normalizedThreadId) {
+        continue;
+      }
+      if (token?.secret_hash) {
+        this.capabilityIdBySecretHash.delete(token.secret_hash);
+      }
+      this.capabilitiesById.delete(capabilityId);
+      removed += 1;
+    }
+
+    for (const [delegationId, delegation] of this.delegationsById.entries()) {
+      if (String(delegation?.thread_id || "").trim() !== normalizedThreadId) {
+        continue;
+      }
+      this.delegationsById.delete(delegationId);
+      this.revokedDelegationIds.delete(delegationId);
+      removed += 1;
+    }
+
+    return removed;
+  }
+
+  applyMessageRetentionSweep() {
+    const cutoffMs = this.getRetentionCutoffMs(this.messageRetentionDays);
+    if (cutoffMs == null) {
+      return {
+        removed: 0,
+        threads_removed: 0,
+        artifacts_removed: 0
+      };
+    }
+
+    const protectedEnvelopeIds = this.collectProtectedEnvelopeIdsForRetention();
+    const removedEnvelopeIds = new Set();
+    const touchedThreadIds = new Set();
+    let removed = 0;
+
+    for (const [envelopeId, envelope] of this.envelopesById.entries()) {
+      const createdAtMs = parseTime(envelope?.created_at);
+      if (createdAtMs == null || createdAtMs > cutoffMs) {
+        continue;
+      }
+      if (protectedEnvelopeIds.has(envelopeId)) {
+        continue;
+      }
+
+      this.envelopesById.delete(envelopeId);
+      removedEnvelopeIds.add(envelopeId);
+      const threadId = String(envelope?.thread_id || "").trim();
+      if (threadId) {
+        touchedThreadIds.add(threadId);
+      }
+      removed += 1;
+    }
+
+    if (removed === 0) {
+      return {
+        removed: 0,
+        threads_removed: 0,
+        artifacts_removed: 0
+      };
+    }
+
+    for (const [wrapperKey, wrapper] of this.deliveryWrappersByEnvelopeAndIdentity.entries()) {
+      const envelopeId = String(wrapper?.envelope_id || "").trim();
+      if (!envelopeId || this.envelopesById.has(envelopeId)) {
+        continue;
+      }
+      this.deliveryWrappersByEnvelopeAndIdentity.delete(wrapperKey);
+    }
+
+    for (const [messageId, entry] of this.emailMessageIndexById.entries()) {
+      const envelopeId = String(entry?.envelope_id || "").trim();
+      if (!envelopeId || this.envelopesById.has(envelopeId)) {
+        continue;
+      }
+      this.emailMessageIndexById.delete(messageId);
+    }
+
+    let threadsRemoved = 0;
+    let artifactsRemoved = 0;
+    const updatedAt = nowIso();
+    for (const threadId of touchedThreadIds) {
+      const thread = this.threadsById.get(threadId);
+      if (!thread) {
+        continue;
+      }
+
+      const remainingEnvelopeIds = (Array.isArray(thread.envelope_ids) ? thread.envelope_ids : []).filter((envelopeId) =>
+        this.envelopesById.has(envelopeId)
+      );
+      if (remainingEnvelopeIds.length === 0) {
+        this.threadsById.delete(threadId);
+        threadsRemoved += 1;
+        artifactsRemoved += this.purgeThreadScopedArtifacts(threadId);
+        continue;
+      }
+
+      thread.envelope_ids = remainingEnvelopeIds;
+      if (!remainingEnvelopeIds.includes(thread.root_envelope_id)) {
+        thread.root_envelope_id = remainingEnvelopeIds[0];
+      }
+
+      let pendingParentCount = 0;
+      for (const envelopeId of remainingEnvelopeIds) {
+        const envelope = this.envelopesById.get(envelopeId);
+        if (!envelope) {
+          continue;
+        }
+        const parentId = String(envelope.parent_id || "").trim();
+        if (parentId && !this.envelopesById.has(parentId)) {
+          envelope.parent_id = null;
+          envelope.meta = {
+            ...(envelope.meta || {}),
+            pending_parent: false,
+            parent_resolved_at: updatedAt
+          };
+        }
+        if (envelope?.meta?.pending_parent === true) {
+          pendingParentCount += 1;
+        }
+      }
+      thread.pending_parent_count = pendingParentCount;
+      thread.updated_at = updatedAt;
+    }
+
+    return {
+      removed,
+      threads_removed: threadsRemoved,
+      artifacts_removed: artifactsRemoved
+    };
+  }
+
+  applyBlobRetentionSweep() {
+    const cutoffMs = this.getRetentionCutoffMs(this.blobRetentionDays);
+    if (cutoffMs == null) {
+      return {
+        removed: 0,
+        scrubbed: 0
+      };
+    }
+
+    const referencedBlobIds = new Set();
+    for (const envelope of this.envelopesById.values()) {
+      for (const attachment of Array.isArray(envelope?.attachments) ? envelope.attachments : []) {
+        const blobId = String(attachment?.blob_id || "").trim();
+        if (blobId) {
+          referencedBlobIds.add(blobId);
+        }
+      }
+    }
+
+    let removed = 0;
+    let scrubbed = 0;
+    const expiredAt = nowIso();
+    for (const [blobId, blob] of this.blobsById.entries()) {
+      const createdAtMs = parseTime(blob?.completed_at || blob?.created_at || blob?.updated_at || null);
+      if (createdAtMs == null || createdAtMs > cutoffMs) {
+        continue;
+      }
+
+      if (!referencedBlobIds.has(blobId)) {
+        this.blobsById.delete(blobId);
+        removed += 1;
+        continue;
+      }
+
+      let changed = false;
+      if (Object.prototype.hasOwnProperty.call(blob, "data_base64")) {
+        delete blob.data_base64;
+        changed = true;
+      }
+      if (blob.parts && typeof blob.parts === "object" && Object.keys(blob.parts).length > 0) {
+        blob.parts = {};
+        changed = true;
+      }
+      if (blob.status !== "expired") {
+        blob.status = "expired";
+        changed = true;
+      }
+      if (Number(blob.size_bytes || 0) !== 0) {
+        blob.size_bytes = 0;
+        changed = true;
+      }
+      if (blob.hash != null) {
+        blob.hash = null;
+        changed = true;
+      }
+      if (blob.completed_at != null) {
+        blob.completed_at = null;
+        changed = true;
+      }
+      if (Number(blob.quota_accounted_bytes || 0) !== 0) {
+        blob.quota_accounted_bytes = 0;
+        changed = true;
+      }
+      if (changed) {
+        blob.retention_expired_at = expiredAt;
+        blob.updated_at = expiredAt;
+        scrubbed += 1;
+      }
+    }
+
+    if (removed > 0 || scrubbed > 0) {
+      this.rebuildIdentityQuotaIndexes();
+    }
+
+    return {
+      removed,
+      scrubbed
     };
   }
 
@@ -9629,7 +13881,20 @@ export class LoomStore {
     this.cleanupIdentityRegistrationChallenges(now);
     this.cleanupDailyQuotaMap(this.identityEnvelopeUsageByDay);
     this.cleanupDailyQuotaMap(this.identityBlobUsageByDay);
+    const messageRetention = this.applyMessageRetentionSweep();
+    const blobRetention = this.applyBlobRetentionSweep();
+    swept +=
+      Number(messageRetention.removed || 0) +
+      Number(messageRetention.threads_removed || 0) +
+      Number(messageRetention.artifacts_removed || 0);
+    swept += Number(blobRetention.removed || 0) + Number(blobRetention.scrubbed || 0);
 
-    return { swept };
+    return {
+      swept,
+      retention: {
+        messages: messageRetention,
+        blobs: blobRetention
+      }
+    };
   }
 }

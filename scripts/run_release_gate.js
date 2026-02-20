@@ -209,6 +209,8 @@ function main() {
       baseUrl,
       "--bearer-token",
       bearerToken,
+      "--admin-token",
+      adminToken,
       "--timeout-ms",
       String(args.timeoutMs)
     ]);

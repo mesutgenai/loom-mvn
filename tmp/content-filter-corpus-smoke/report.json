@@ -1,0 +1,36 @@
+{
+  "generated_at": "2026-02-20T13:34:46.316Z",
+  "source_filter": "federation",
+  "profile": "agent",
+  "total_vectors": 0,
+  "distribution": {
+    "by_action": {
+      "allow": 0,
+      "quarantine": 0,
+      "reject": 0
+    },
+    "by_source": {}
+  },
+  "threshold_calibration": {
+    "baseline_thresholds": {
+      "spam": 5,
+      "phish": 4,
+      "quarantine": 6,
+      "reject": 9
+    },
+    "suggested_thresholds": {
+      "spam_threshold": 1,
+      "phish_threshold": 1,
+      "quarantine_threshold": 1,
+      "reject_threshold": 3
+    },
+    "quantiles": {
+      "allow_score_p95": null,
+      "allow_score_p99": null,
+      "reject_score_p20": null,
+      "reject_score_p50": null,
+      "quarantine_score_p90": null
+    }
+  },
+  "note": "Inputs are anonymized and re-scored with the selected profile to support threshold tuning with production-like distributions."
+}

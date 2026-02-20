@@ -56,8 +56,311 @@ function quoteImapString(value) {
   return `"${String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+const RFC822_HEADER_NAME_RE = /^[!-9;-~]+$/;
+const MAX_RFC822_HEADER_LINES = 200;
+const MAX_RFC822_HEADER_VALUE_BYTES = 16 * 1024;
+const MAX_RFC822_MIME_DEPTH = 6;
+const MAX_IMAP_APPEND_LITERAL_BYTES = 16 * 1024 * 1024;
+
+function canonicalizeRfc822HeaderName(name) {
+  return String(name || "")
+    .split("-")
+    .map((part) => {
+      const normalized = String(part || "").trim();
+      if (!normalized) {
+        return "";
+      }
+      return `${normalized[0].toUpperCase()}${normalized.slice(1).toLowerCase()}`;
+    })
+    .join("-");
+}
+
+function decodeRfc822Charset(buffer, charset) {
+  const normalized = String(charset || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized || normalized === "utf-8" || normalized === "utf8") {
+    return buffer.toString("utf-8");
+  }
+  if (normalized === "us-ascii" || normalized === "ascii") {
+    return buffer.toString("ascii");
+  }
+  if (normalized === "iso-8859-1" || normalized === "latin1" || normalized === "windows-1252") {
+    return buffer.toString("latin1");
+  }
+  return buffer.toString("utf-8");
+}
+
+function decodeRfc2047HeaderValue(value) {
+  return String(value || "").replace(/=\?([^?]+)\?([bqBQ])\?([^?]*)\?=/g, (_, charset, mode, payload) => {
+    const normalizedMode = String(mode || "").toUpperCase();
+    if (normalizedMode === "B") {
+      try {
+        return decodeRfc822Charset(Buffer.from(payload || "", "base64"), charset);
+      } catch {
+        return "";
+      }
+    }
+
+    // RFC2047 Q-encoding differs from quoted-printable by using "_" for SP.
+    const text = String(payload || "").replace(/_/g, " ");
+    const bytes = [];
+    for (let index = 0; index < text.length; index += 1) {
+      const ch = text[index];
+      if (ch === "=" && index + 2 < text.length) {
+        const hex = text.slice(index + 1, index + 3);
+        if (/^[A-Fa-f0-9]{2}$/.test(hex)) {
+          bytes.push(Number.parseInt(hex, 16));
+          index += 2;
+          continue;
+        }
+      }
+      bytes.push(ch.charCodeAt(0));
+    }
+    return decodeRfc822Charset(Buffer.from(bytes), charset);
+  });
+}
+
+function decodeQuotedPrintableToBuffer(value) {
+  const text = String(value || "").replace(/=(?:\r?\n)/g, "");
+  const bytes = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    if (ch === "=" && index + 2 < text.length) {
+      const hex = text.slice(index + 1, index + 3);
+      if (/^[A-Fa-f0-9]{2}$/.test(hex)) {
+        bytes.push(Number.parseInt(hex, 16));
+        index += 2;
+        continue;
+      }
+    }
+    bytes.push(ch.charCodeAt(0));
+  }
+  return Buffer.from(bytes);
+}
+
+function parseRfc822HeaderParameters(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return {
+      type: "",
+      parameters: {}
+    };
+  }
+
+  const [typeRaw, ...parameterTokens] = raw.split(";");
+  const type = String(typeRaw || "")
+    .trim()
+    .toLowerCase();
+  const parameters = {};
+
+  for (const token of parameterTokens) {
+    const index = token.indexOf("=");
+    if (index <= 0) {
+      continue;
+    }
+    const key = token
+      .slice(0, index)
+      .trim()
+      .toLowerCase();
+    let entryValue = token.slice(index + 1).trim();
+    if (entryValue.startsWith('"') && entryValue.endsWith('"') && entryValue.length >= 2) {
+      entryValue = entryValue.slice(1, -1);
+    }
+    if (!key || !entryValue) {
+      continue;
+    }
+    parameters[key] = entryValue;
+  }
+
+  return {
+    type,
+    parameters
+  };
+}
+
+function decodeTransferEncodedBody(rawBody, transferEncoding) {
+  const normalized = String(transferEncoding || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized || normalized === "7bit" || normalized === "8bit" || normalized === "binary") {
+    return Buffer.from(String(rawBody || ""), "utf-8");
+  }
+  if (normalized === "base64") {
+    try {
+      const compact = String(rawBody || "").replace(/\s+/g, "");
+      return Buffer.from(compact, "base64");
+    } catch {
+      return Buffer.from(String(rawBody || ""), "utf-8");
+    }
+  }
+  if (normalized === "quoted-printable") {
+    return decodeQuotedPrintableToBuffer(rawBody);
+  }
+  return Buffer.from(String(rawBody || ""), "utf-8");
+}
+
+function htmlToPlainText(value) {
+  const html = String(value || "");
+  const noScript = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ");
+  const withLineBreaks = noScript
+    .replace(/<(?:br|\/p|\/div|\/li|\/tr|\/h[1-6])\s*\/?>/gi, "\n")
+    .replace(/<li[^>]*>/gi, "\n- ");
+  const stripped = withLineBreaks.replace(/<[^>]+>/g, " ");
+  return stripped
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function splitRfc822Message(rawMessage) {
+  const message = String(rawMessage || "");
+  const splitMatch = message.match(/\r?\n\r?\n/);
+  const dividerIndex = splitMatch ? splitMatch.index : -1;
+  const dividerLength = splitMatch ? splitMatch[0].length : 0;
+  return {
+    headerBlock: dividerIndex >= 0 ? message.slice(0, dividerIndex) : message,
+    body: dividerIndex >= 0 ? message.slice(dividerIndex + dividerLength) : ""
+  };
+}
+
+function parseRfc822HeaderBlock(headerBlock) {
+  const rawHeaderLines = String(headerBlock || "").split(/\r?\n/);
+  const unfoldedHeaderLines = [];
+  for (const line of rawHeaderLines) {
+    if (unfoldedHeaderLines.length >= MAX_RFC822_HEADER_LINES) {
+      break;
+    }
+    if (/^[ \t]/.test(line) && unfoldedHeaderLines.length > 0) {
+      unfoldedHeaderLines[unfoldedHeaderLines.length - 1] += ` ${line.trim()}`;
+      continue;
+    }
+    if (line.trim().length > 0) {
+      unfoldedHeaderLines.push(line);
+    }
+  }
+
+  const headers = {};
+  for (const line of unfoldedHeaderLines) {
+    const idx = line.indexOf(":");
+    if (idx <= 0) {
+      continue;
+    }
+    const keyRaw = line.slice(0, idx).trim();
+    const key = canonicalizeRfc822HeaderName(keyRaw);
+    const value = decodeRfc2047HeaderValue(
+      line
+        .slice(idx + 1)
+        .replace(/\0/g, "")
+        .trim()
+    );
+    if (!key || !RFC822_HEADER_NAME_RE.test(keyRaw)) {
+      continue;
+    }
+    if (!value) {
+      continue;
+    }
+    if (Buffer.byteLength(value, "utf-8") > MAX_RFC822_HEADER_VALUE_BYTES) {
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(headers, key)) {
+      headers[key] = `${headers[key]}, ${value}`;
+    } else {
+      headers[key] = value;
+    }
+  }
+
+  return headers;
+}
+
+function splitMimeParts(rawBody, boundary) {
+  const normalizedBoundary = String(boundary || "").trim();
+  if (!normalizedBoundary) {
+    return [];
+  }
+  const openBoundary = `--${normalizedBoundary}`;
+  const closeBoundary = `--${normalizedBoundary}--`;
+  const lines = String(rawBody || "").split(/\r?\n/);
+  const parts = [];
+  let current = [];
+  let inPart = false;
+
+  for (const line of lines) {
+    if (line === openBoundary) {
+      if (inPart && current.length > 0) {
+        parts.push(current.join("\r\n"));
+      }
+      inPart = true;
+      current = [];
+      continue;
+    }
+    if (line === closeBoundary) {
+      if (inPart && current.length > 0) {
+        parts.push(current.join("\r\n"));
+      }
+      break;
+    }
+    if (inPart) {
+      current.push(line);
+    }
+  }
+
+  return parts;
+}
+
+function extractRfc822PreferredBody(headers, rawBody, depth = 0) {
+  const headerContentType = headers["Content-Type"] || headers["Content-type"] || "text/plain";
+  const headerTransferEncoding =
+    headers["Content-Transfer-Encoding"] || headers["Content-transfer-encoding"] || "7bit";
+  const parsedContentType = parseRfc822HeaderParameters(headerContentType);
+  const mimeType = parsedContentType.type || "text/plain";
+
+  if (mimeType.startsWith("multipart/") && depth < MAX_RFC822_MIME_DEPTH) {
+    const boundary = parsedContentType.parameters.boundary;
+    const parts = splitMimeParts(rawBody, boundary);
+    let htmlCandidate = null;
+    for (const part of parts) {
+      const split = splitRfc822Message(part);
+      const partHeaders = parseRfc822HeaderBlock(split.headerBlock);
+      const extracted = extractRfc822PreferredBody(partHeaders, split.body, depth + 1);
+      if (extracted.kind === "text" && extracted.text.trim()) {
+        return extracted;
+      }
+      if (!htmlCandidate && extracted.kind === "html" && extracted.text.trim()) {
+        htmlCandidate = extracted;
+      }
+    }
+    if (htmlCandidate) {
+      return htmlCandidate;
+    }
+  }
+
+  const decodedBytes = decodeTransferEncodedBody(rawBody, headerTransferEncoding);
+  const charset = parsedContentType.parameters.charset || "utf-8";
+  const decoded = decodeRfc822Charset(decodedBytes, charset);
+  if (mimeType === "text/html") {
+    return {
+      kind: "html",
+      text: htmlToPlainText(decoded)
+    };
+  }
+  return {
+    kind: "text",
+    text: decoded.replace(/\0/g, "")
+  };
+}
+
 function parseSmtpPathWithParams(value) {
-  const trimmed = String(value || "").trim();
+  const trimmed = String(value || "")
+    .replace(/[\r\n\0]+/g, " ")
+    .trim();
   if (!trimmed) {
     return {
       address: null,
@@ -134,45 +437,15 @@ function authenticateGatewayToken(store, token, expectedIdentity = null) {
 }
 
 function parseRfc822(rawMessage) {
-  const message = String(rawMessage || "");
-  const splitMatch = message.match(/\r?\n\r?\n/);
-  const dividerIndex = splitMatch ? splitMatch.index : -1;
-  const dividerLength = splitMatch ? splitMatch[0].length : 0;
-
-  const headerBlock = dividerIndex >= 0 ? message.slice(0, dividerIndex) : message;
-  const body = dividerIndex >= 0 ? message.slice(dividerIndex + dividerLength) : "";
-
-  const rawHeaderLines = headerBlock.split(/\r?\n/);
-  const unfoldedHeaderLines = [];
-  for (const line of rawHeaderLines) {
-    if (/^[ \t]/.test(line) && unfoldedHeaderLines.length > 0) {
-      unfoldedHeaderLines[unfoldedHeaderLines.length - 1] += ` ${line.trim()}`;
-    } else if (line.trim().length > 0) {
-      unfoldedHeaderLines.push(line);
-    }
-  }
-
-  const headers = {};
-  for (const line of unfoldedHeaderLines) {
-    const idx = line.indexOf(":");
-    if (idx <= 0) {
-      continue;
-    }
-    const key = line.slice(0, idx).trim();
-    const value = line.slice(idx + 1).trim();
-    if (!key) {
-      continue;
-    }
-    if (Object.prototype.hasOwnProperty.call(headers, key)) {
-      headers[key] = `${headers[key]}, ${value}`;
-    } else {
-      headers[key] = value;
-    }
-  }
+  const split = splitRfc822Message(rawMessage);
+  const headers = parseRfc822HeaderBlock(split.headerBlock);
+  const extractedBody = extractRfc822PreferredBody(headers, split.body, 0);
 
   return {
     headers,
-    body
+    body: extractedBody.text || "",
+    body_kind: extractedBody.kind,
+    raw_body: split.body
   };
 }
 
@@ -377,97 +650,505 @@ function resolveMailboxMovePatch(store, destinationMailbox) {
   }
 }
 
-function evaluateImapSearchCriteria(message, criteriaTokens) {
-  const flags = {
-    seen: Boolean(message.mailbox_state?.seen),
-    flagged: Boolean(message.mailbox_state?.flagged),
-    deleted: Boolean(message.mailbox_state?.deleted)
-  };
+function isImapSearchGroupToken(token) {
+  const text = String(token || "").trim();
+  return text.startsWith("(") && text.endsWith(")") && text.length >= 2;
+}
 
-  if (!Array.isArray(criteriaTokens) || criteriaTokens.length === 0) {
+function isImapSequenceSetToken(token) {
+  return /^[0-9*,:]+$/.test(String(token || "").trim());
+}
+
+function normalizeImapSearchText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function imapSearchContains(haystack, needle) {
+  const normalizedNeedle = normalizeImapSearchText(needle);
+  if (!normalizedNeedle) {
     return true;
   }
+  return normalizeImapSearchText(haystack).includes(normalizedNeedle);
+}
 
-  for (let index = 0; index < criteriaTokens.length; index += 1) {
-    const token = String(criteriaTokens[index] || "").toUpperCase();
-    switch (token) {
-      case "":
-      case "ALL":
-        break;
-      case "SEEN":
-        if (!flags.seen) {
-          return false;
-        }
-        break;
-      case "UNSEEN":
-        if (flags.seen) {
-          return false;
-        }
-        break;
-      case "FLAGGED":
-        if (!flags.flagged) {
-          return false;
-        }
-        break;
-      case "UNFLAGGED":
-        if (flags.flagged) {
-          return false;
-        }
-        break;
-      case "DELETED":
-        if (!flags.deleted) {
-          return false;
-        }
-        break;
-      case "UNDELETED":
-        if (flags.deleted) {
-          return false;
-        }
-        break;
-      case "RECENT":
-      case "OLD":
-      case "ANSWERED":
-      case "UNANSWERED":
-      case "DRAFT":
-      case "UNDRAFT":
-        // Not yet mapped to LOOM message model.
-        break;
-      case "CHARSET":
-        index += 1;
-        break;
-      case "SINCE":
-      case "BEFORE":
-      case "ON":
-      case "SENTSINCE":
-      case "SENTBEFORE":
-      case "SENTON":
-      case "FROM":
-      case "TO":
-      case "CC":
-      case "BCC":
-      case "SUBJECT":
-      case "BODY":
-      case "TEXT":
-      case "KEYWORD":
-      case "UNKEYWORD":
-      case "HEADER":
-      case "LARGER":
-      case "SMALLER":
-      case "UID":
-        // Skip the next token for operators that take one argument.
-        index += 1;
-        break;
-      case "OR":
-      case "NOT":
-        // Minimal parser does not implement boolean group operators.
-        break;
-      default:
-        // Treat unknown criteria as non-fatal and continue.
-        break;
+function parseImapSearchDateFloor(value) {
+  const parsed = Date.parse(String(value || "").trim());
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  const date = new Date(parsed);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+}
+
+function resolveImapSearchMessageDateFloor(message) {
+  return parseImapSearchDateFloor(message?.date || "");
+}
+
+function resolveImapSearchMessageHeaders(message) {
+  return message?.headers && typeof message.headers === "object" ? message.headers : {};
+}
+
+function resolveImapSearchHeaderValue(message, fieldName) {
+  const target = normalizeImapSearchText(fieldName);
+  if (!target) {
+    return "";
+  }
+  const headers = resolveImapSearchMessageHeaders(message);
+  for (const [headerName, headerValue] of Object.entries(headers)) {
+    if (normalizeImapSearchText(headerName) === target) {
+      return String(headerValue || "");
     }
   }
+  return "";
+}
 
-  return true;
+function resolveImapSearchMessageSize(message) {
+  return Buffer.byteLength(renderImapRfc822(message), "utf-8");
+}
+
+function resolveImapSearchMessageFlags(message) {
+  return {
+    seen: Boolean(message?.mailbox_state?.seen),
+    flagged: Boolean(message?.mailbox_state?.flagged),
+    deleted: Boolean(message?.mailbox_state?.deleted)
+  };
+}
+
+function resolveImapSearchMessageText(message) {
+  const headers = resolveImapSearchMessageHeaders(message);
+  const headerText = Object.entries(headers)
+    .map(([key, value]) => `${key}: ${String(value || "")}`)
+    .join("\n");
+  const recipients = Array.isArray(message?.to) ? message.to.map((entry) => String(entry || "")) : [];
+  return [
+    String(message?.subject || ""),
+    String(message?.body_text || ""),
+    String(message?.from_email || message?.from || ""),
+    recipients.join(","),
+    headerText
+  ].join("\n");
+}
+
+function createImapSearchMatcher(criteriaTokens, options = {}) {
+  const tokens = Array.isArray(criteriaTokens)
+    ? criteriaTokens
+        .map((token) => String(token || "").trim())
+        .filter((token) => token.length > 0)
+    : [];
+  if (tokens.length === 0) {
+    return () => true;
+  }
+
+  const maxUid = Math.max(
+    1,
+    Number.isFinite(Number(options.maxUid || 0)) ? Math.floor(Number(options.maxUid || 0)) : 1
+  );
+  const maxSequence = Math.max(
+    1,
+    Number.isFinite(Number(options.maxSequence || 0)) ? Math.floor(Number(options.maxSequence || 0)) : maxUid
+  );
+
+  const compile = (inputTokens) => {
+    const criteriaList = Array.isArray(inputTokens)
+      ? inputTokens
+          .map((token) => String(token || "").trim())
+          .filter((token) => token.length > 0)
+      : [];
+
+    const parseKey = (index) => {
+      if (index >= criteriaList.length) {
+        return {
+          matcher: () => false,
+          nextIndex: index + 1
+        };
+      }
+
+      const tokenRaw = criteriaList[index];
+      const token = String(tokenRaw || "").trim();
+      const upperToken = token.toUpperCase();
+
+      if (!token) {
+        return {
+          matcher: () => true,
+          nextIndex: index + 1
+        };
+      }
+
+      if (isImapSearchGroupToken(token)) {
+        const innerTokens = parseImapAtoms(token.slice(1, -1));
+        return {
+          matcher: compile(innerTokens),
+          nextIndex: index + 1
+        };
+      }
+
+      const argAt = (offset) => {
+        const position = index + offset;
+        return position < criteriaList.length ? criteriaList[position] : null;
+      };
+
+      const withOneArg = (predicate) => {
+        const arg = argAt(1);
+        if (arg == null) {
+          return {
+            matcher: () => false,
+            nextIndex: index + 1
+          };
+        }
+        return {
+          matcher: (message, context = {}) => predicate(message, arg, context),
+          nextIndex: index + 2
+        };
+      };
+
+      const withTwoArgs = (predicate) => {
+        const first = argAt(1);
+        const second = argAt(2);
+        if (first == null || second == null) {
+          return {
+            matcher: () => false,
+            nextIndex: index + (first == null ? 1 : 2)
+          };
+        }
+        return {
+          matcher: (message, context = {}) => predicate(message, first, second, context),
+          nextIndex: index + 3
+        };
+      };
+
+      if (upperToken === "OR") {
+        const left = parseKey(index + 1);
+        const right = parseKey(Math.max(left.nextIndex, index + 1));
+        return {
+          matcher: (message, context = {}) => left.matcher(message, context) || right.matcher(message, context),
+          nextIndex: Math.max(right.nextIndex, left.nextIndex, index + 1)
+        };
+      }
+
+      if (upperToken === "NOT") {
+        const operand = parseKey(index + 1);
+        return {
+          matcher: (message, context = {}) => !operand.matcher(message, context),
+          nextIndex: Math.max(operand.nextIndex, index + 1)
+        };
+      }
+
+      switch (upperToken) {
+        case "ALL":
+          return {
+            matcher: () => true,
+            nextIndex: index + 1
+          };
+        case "SEEN":
+          return {
+            matcher: (message) => resolveImapSearchMessageFlags(message).seen,
+            nextIndex: index + 1
+          };
+        case "UNSEEN":
+          return {
+            matcher: (message) => !resolveImapSearchMessageFlags(message).seen,
+            nextIndex: index + 1
+          };
+        case "FLAGGED":
+          return {
+            matcher: (message) => resolveImapSearchMessageFlags(message).flagged,
+            nextIndex: index + 1
+          };
+        case "UNFLAGGED":
+          return {
+            matcher: (message) => !resolveImapSearchMessageFlags(message).flagged,
+            nextIndex: index + 1
+          };
+        case "DELETED":
+          return {
+            matcher: (message) => resolveImapSearchMessageFlags(message).deleted,
+            nextIndex: index + 1
+          };
+        case "UNDELETED":
+          return {
+            matcher: (message) => !resolveImapSearchMessageFlags(message).deleted,
+            nextIndex: index + 1
+          };
+        case "RECENT":
+        case "OLD":
+        case "ANSWERED":
+        case "UNANSWERED":
+        case "DRAFT":
+        case "UNDRAFT":
+          // Not yet mapped to LOOM mailbox model.
+          return {
+            matcher: () => true,
+            nextIndex: index + 1
+          };
+        case "CHARSET":
+          return {
+            matcher: () => true,
+            nextIndex: argAt(1) == null ? index + 1 : index + 2
+          };
+        case "SINCE":
+        case "SENTSINCE":
+          return withOneArg((message, value) => {
+            const expected = parseImapSearchDateFloor(value);
+            const actual = resolveImapSearchMessageDateFloor(message);
+            return expected != null && actual != null ? actual >= expected : false;
+          });
+        case "BEFORE":
+        case "SENTBEFORE":
+          return withOneArg((message, value) => {
+            const expected = parseImapSearchDateFloor(value);
+            const actual = resolveImapSearchMessageDateFloor(message);
+            return expected != null && actual != null ? actual < expected : false;
+          });
+        case "ON":
+        case "SENTON":
+          return withOneArg((message, value) => {
+            const expected = parseImapSearchDateFloor(value);
+            const actual = resolveImapSearchMessageDateFloor(message);
+            return expected != null && actual != null ? actual === expected : false;
+          });
+        case "FROM":
+          return withOneArg((message, value) => {
+            const fromText = String(message?.from_email || message?.from || "");
+            return imapSearchContains(fromText, value);
+          });
+        case "TO":
+          return withOneArg((message, value) => {
+            const recipients = Array.isArray(message?.to) ? message.to : [];
+            return imapSearchContains(recipients.join(","), value);
+          });
+        case "CC":
+        case "BCC":
+          return withOneArg(() => false);
+        case "SUBJECT":
+          return withOneArg((message, value) => imapSearchContains(message?.subject || "", value));
+        case "BODY":
+          return withOneArg((message, value) => imapSearchContains(message?.body_text || "", value));
+        case "TEXT":
+          return withOneArg((message, value) => imapSearchContains(resolveImapSearchMessageText(message), value));
+        case "HEADER":
+          return withTwoArgs((message, fieldName, value) =>
+            imapSearchContains(resolveImapSearchHeaderValue(message, fieldName), value)
+          );
+        case "LARGER":
+          return withOneArg((message, value) => {
+            const threshold = Number(value);
+            return Number.isFinite(threshold) ? resolveImapSearchMessageSize(message) > threshold : false;
+          });
+        case "SMALLER":
+          return withOneArg((message, value) => {
+            const threshold = Number(value);
+            return Number.isFinite(threshold) ? resolveImapSearchMessageSize(message) < threshold : false;
+          });
+        case "KEYWORD":
+          return withOneArg((message, value) => {
+            const flags = resolveImapSearchMessageFlags(message);
+            const keyword = String(value || "").trim().toUpperCase();
+            if (keyword === "\\SEEN") {
+              return flags.seen;
+            }
+            if (keyword === "\\FLAGGED") {
+              return flags.flagged;
+            }
+            if (keyword === "\\DELETED") {
+              return flags.deleted;
+            }
+            return false;
+          });
+        case "UNKEYWORD":
+          return withOneArg((message, value) => {
+            const flags = resolveImapSearchMessageFlags(message);
+            const keyword = String(value || "").trim().toUpperCase();
+            if (keyword === "\\SEEN") {
+              return !flags.seen;
+            }
+            if (keyword === "\\FLAGGED") {
+              return !flags.flagged;
+            }
+            if (keyword === "\\DELETED") {
+              return !flags.deleted;
+            }
+            return true;
+          });
+        case "UID":
+          return withOneArg((message, value) => {
+            const requested = new Set(parseSequenceToken(value, maxUid));
+            return requested.has(Number(message?.uid || 0));
+          });
+        default:
+          if (isImapSequenceSetToken(token)) {
+            const requested = new Set(parseSequenceToken(token, maxSequence));
+            return {
+              matcher: (_message, context = {}) => requested.has(Number(context?.sequence || 0)),
+              nextIndex: index + 1
+            };
+          }
+          // Treat unknown criteria as non-fatal and continue.
+          return {
+            matcher: () => true,
+            nextIndex: index + 1
+          };
+      }
+    };
+
+    const parts = [];
+    let cursor = 0;
+    while (cursor < criteriaList.length) {
+      const parsed = parseKey(cursor);
+      parts.push(parsed.matcher);
+      cursor = parsed.nextIndex > cursor ? parsed.nextIndex : cursor + 1;
+    }
+
+    return (message, context = {}) => parts.every((matcher) => matcher(message, context));
+  };
+
+  return compile(tokens);
+}
+
+function parseImapSortCriteria(rawToken) {
+  const token = String(rawToken || "").trim();
+  if (!token) {
+    return [{ key: "DATE", reverse: false }];
+  }
+
+  const normalized = token.startsWith("(") && token.endsWith(")") ? token.slice(1, -1) : token;
+  const atoms = normalized
+    .split(/\s+/)
+    .map((value) => String(value || "").trim().toUpperCase())
+    .filter(Boolean);
+  const criteria = [];
+  let reverseNext = false;
+  for (const atom of atoms) {
+    if (atom === "REVERSE") {
+      reverseNext = true;
+      continue;
+    }
+    if (
+      atom === "ARRIVAL" ||
+      atom === "CC" ||
+      atom === "DATE" ||
+      atom === "FROM" ||
+      atom === "SIZE" ||
+      atom === "SUBJECT" ||
+      atom === "TO"
+    ) {
+      criteria.push({
+        key: atom,
+        reverse: reverseNext
+      });
+    }
+    reverseNext = false;
+  }
+
+  if (criteria.length === 0) {
+    criteria.push({
+      key: "DATE",
+      reverse: false
+    });
+  }
+
+  return criteria;
+}
+
+function normalizeThreadSubject(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "(no-subject)";
+  }
+  return raw
+    .replace(/^(?:\s*(?:re|fw|fwd)\s*:\s*)+/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function resolveSortFieldValue(message, field) {
+  if (field === "ARRIVAL" || field === "DATE") {
+    const parsed = Date.parse(String(message?.date || ""));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (field === "FROM") {
+    return String(message?.from_email || message?.from || "").toLowerCase();
+  }
+  if (field === "TO" || field === "CC") {
+    const values = Array.isArray(message?.to) ? message.to : [];
+    return values.map((entry) => String(entry || "").toLowerCase()).join(",");
+  }
+  if (field === "SUBJECT") {
+    return normalizeThreadSubject(message?.subject || "");
+  }
+  if (field === "SIZE") {
+    return Buffer.byteLength(String(message?.body_text || ""), "utf-8");
+  }
+  return 0;
+}
+
+function compareMessagesForSort(left, right, criteria) {
+  for (const rule of criteria) {
+    const leftValue = resolveSortFieldValue(left, rule.key);
+    const rightValue = resolveSortFieldValue(right, rule.key);
+    let delta = 0;
+    if (typeof leftValue === "number" && typeof rightValue === "number") {
+      delta = leftValue - rightValue;
+    } else {
+      delta = String(leftValue).localeCompare(String(rightValue));
+    }
+    if (delta === 0) {
+      continue;
+    }
+    return rule.reverse ? -delta : delta;
+  }
+
+  const leftUid = Number(left?.uid || 0);
+  const rightUid = Number(right?.uid || 0);
+  return leftUid - rightUid;
+}
+
+function buildUidThreadResponseGroups(messages, algorithm = "REFERENCES") {
+  const normalizedAlgorithm = String(algorithm || "")
+    .trim()
+    .toUpperCase();
+  const buckets = new Map();
+
+  for (const message of messages) {
+    const key =
+      normalizedAlgorithm === "ORDEREDSUBJECT"
+        ? `subject:${normalizeThreadSubject(message?.subject || "")}`
+        : `thread:${String(message?.thread_id || "") || String(message?.uid || "")}`;
+    if (!buckets.has(key)) {
+      buckets.set(key, []);
+    }
+    buckets.get(key).push(message);
+  }
+
+  const groups = [];
+  for (const bucket of buckets.values()) {
+    bucket.sort((a, b) => {
+      const aTime = Date.parse(String(a?.date || ""));
+      const bTime = Date.parse(String(b?.date || ""));
+      const normalizedATime = Number.isFinite(aTime) ? aTime : 0;
+      const normalizedBTime = Number.isFinite(bTime) ? bTime : 0;
+      if (normalizedATime === normalizedBTime) {
+        return Number(a?.uid || 0) - Number(b?.uid || 0);
+      }
+      return normalizedATime - normalizedBTime;
+    });
+    groups.push(bucket);
+  }
+
+  groups.sort((left, right) => {
+    const leftTime = Date.parse(String(left[0]?.date || ""));
+    const rightTime = Date.parse(String(right[0]?.date || ""));
+    const normalizedLeftTime = Number.isFinite(leftTime) ? leftTime : 0;
+    const normalizedRightTime = Number.isFinite(rightTime) ? rightTime : 0;
+    if (normalizedLeftTime === normalizedRightTime) {
+      return Number(left[0]?.uid || 0) - Number(right[0]?.uid || 0);
+    }
+    return normalizedLeftTime - normalizedRightTime;
+  });
+
+  return groups
+    .map((group) => group.map((message) => Number(message?.uid || 0)).filter((uid) => Number.isInteger(uid) && uid > 0))
+    .filter((group) => group.length > 0);
 }
 
 function buildImapFetchResponse(message, sequence, fetchSpec = "") {
@@ -1044,7 +1725,8 @@ function createImapGatewayServer(options) {
       selectedMessages: [],
       readOnly: false,
       idleTag: null,
-      authFailures: 0
+      authFailures: 0,
+      appendLiteralPending: null
     };
     let activeSocket = socket;
     let detachLineReader = () => {};
@@ -1088,7 +1770,18 @@ function createImapGatewayServer(options) {
     };
 
     const capabilityTokens = () => {
-      const caps = ["IMAP4rev1", "UIDPLUS", "NAMESPACE", "ID", "IDLE", "MOVE", "UNSELECT"];
+      const caps = [
+        "IMAP4rev1",
+        "UIDPLUS",
+        "NAMESPACE",
+        "ID",
+        "IDLE",
+        "MOVE",
+        "UNSELECT",
+        "SORT",
+        "THREAD=REFERENCES",
+        "THREAD=ORDEREDSUBJECT"
+      ];
       if (!requireSecureAuth || state.secure) {
         caps.push("AUTH=PLAIN", "AUTH=LOGIN");
       } else {
@@ -1172,10 +1865,22 @@ function createImapGatewayServer(options) {
     };
 
     const runSearch = (criteriaTokens, useUid = false) => {
+      const maxSelectedUid = state.selectedMessages.reduce(
+        (current, message) => Math.max(current, Number(message?.uid || 0)),
+        0
+      );
+      const matcher = createImapSearchMatcher(criteriaTokens, {
+        maxUid: maxSelectedUid,
+        maxSequence: state.selectedMessages.length
+      });
       const values = [];
       for (let index = 0; index < state.selectedMessages.length; index += 1) {
         const message = state.selectedMessages[index];
-        if (!evaluateImapSearchCriteria(message, criteriaTokens)) {
+        if (
+          !matcher(message, {
+            sequence: index + 1
+          })
+        ) {
           continue;
         }
         values.push(useUid ? Number(message.uid || index + 1) : index + 1);
@@ -1250,6 +1955,130 @@ function createImapGatewayServer(options) {
       return result;
     };
 
+    const completeAppendLiteral = (pendingState, rawMessage) => {
+      if (!pendingState) {
+        return;
+      }
+      try {
+        appendMessageToMailbox(pendingState.mailbox, rawMessage);
+        writeLine(`${pendingState.tag} OK APPEND completed`);
+      } catch (error) {
+        if (error instanceof LoomError && error.status === 403) {
+          writeLine(`${pendingState.tag} NO Authentication required`);
+          return;
+        }
+        writeLine(`${pendingState.tag} NO APPEND failed`);
+      }
+    };
+
+    const maybeStartAppendLiteral = (tag, rawArgs) => {
+      const literalMatch = String(rawArgs || "").match(/^(.*)\{(\d+)(\+)?\}\s*$/);
+      if (!literalMatch) {
+        return false;
+      }
+
+      const literalBytes = Number.parseInt(literalMatch[2], 10);
+      if (!Number.isInteger(literalBytes) || literalBytes < 0) {
+        writeLine(`${tag} BAD APPEND literal byte length is invalid`);
+        return true;
+      }
+      if (literalBytes > MAX_IMAP_APPEND_LITERAL_BYTES) {
+        writeLine(`${tag} NO APPEND literal exceeds maximum supported size`);
+        return true;
+      }
+
+      const args = parseImapAtoms(literalMatch[1] || "");
+      const mailbox = args[0] || state.selectedFolder || "INBOX";
+      const pendingState = {
+        tag,
+        mailbox,
+        bytesExpected: literalBytes,
+        bytesCollected: 0,
+        chunks: [],
+        firstChunk: true
+      };
+
+      if (literalBytes === 0) {
+        completeAppendLiteral(pendingState, "");
+        return true;
+      }
+
+      state.appendLiteralPending = pendingState;
+      writeLine("+ Ready for literal data");
+      return true;
+    };
+
+    const consumeAppendLiteralLine = (line) => {
+      const pending = state.appendLiteralPending;
+      if (!pending) {
+        return false;
+      }
+
+      let chunkText = String(line || "");
+      if (!pending.firstChunk) {
+        chunkText = `\r\n${chunkText}`;
+      }
+      pending.firstChunk = false;
+      const chunkBytes = Buffer.from(chunkText, "utf-8");
+      const remaining = Math.max(0, pending.bytesExpected - pending.bytesCollected);
+      const toWrite = chunkBytes.subarray(0, remaining);
+      if (toWrite.length > 0) {
+        pending.chunks.push(toWrite);
+        pending.bytesCollected += toWrite.length;
+      }
+
+      if (pending.bytesCollected < pending.bytesExpected) {
+        return true;
+      }
+
+      const rawMessage = Buffer.concat(pending.chunks).toString("utf-8");
+      state.appendLiteralPending = null;
+      completeAppendLiteral(pending, rawMessage);
+      return true;
+    };
+
+    const runUidSortResponse = (sortToken, criteriaTokens) => {
+      const criteria = parseImapSortCriteria(sortToken);
+      const maxSelectedUid = state.selectedMessages.reduce(
+        (current, message) => Math.max(current, Number(message?.uid || 0)),
+        0
+      );
+      const matcher = createImapSearchMatcher(criteriaTokens, {
+        maxUid: maxSelectedUid,
+        maxSequence: state.selectedMessages.length
+      });
+      const sorted = state.selectedMessages
+        .filter((message, index) =>
+          matcher(message, {
+            sequence: index + 1
+          })
+        )
+        .sort((left, right) => compareMessagesForSort(left, right, criteria));
+      const uids = sorted
+        .map((message) => Number(message?.uid || 0))
+        .filter((uid) => Number.isInteger(uid) && uid > 0);
+      writeLine(`* SORT${uids.length > 0 ? ` ${uids.join(" ")}` : ""}`);
+    };
+
+    const runUidThreadResponse = (algorithm, criteriaTokens) => {
+      const maxSelectedUid = state.selectedMessages.reduce(
+        (current, message) => Math.max(current, Number(message?.uid || 0)),
+        0
+      );
+      const matcher = createImapSearchMatcher(criteriaTokens, {
+        maxUid: maxSelectedUid,
+        maxSequence: state.selectedMessages.length
+      });
+      const filtered = state.selectedMessages.filter((message, index) =>
+        matcher(message, {
+          sequence: index + 1
+        })
+      );
+      const groups = buildUidThreadResponseGroups(filtered, algorithm);
+      const payload = groups.map((group) => `(${group.join(" ")})`).join(" ");
+      writeLine(`* THREAD${payload ? ` ${payload}` : ""}`);
+    };
+
     const startTls = async (tag) => {
       if (!startTlsEnabled || !tlsContext) {
         writeLine(`${tag} NO STARTTLS not available`);
@@ -1285,6 +2114,11 @@ function createImapGatewayServer(options) {
           return;
         }
         writeLine("+ idling");
+        return;
+      }
+
+      if (state.appendLiteralPending) {
+        consumeAppendLiteralLine(line);
         return;
       }
 
@@ -1395,16 +2229,15 @@ function createImapGatewayServer(options) {
           return;
         }
 
+        if (maybeStartAppendLiteral(tag, rawArgs)) {
+          return;
+        }
+
         const args = parseImapAtoms(rawArgs);
         const mailbox = args[0] || state.selectedFolder || "INBOX";
         const payload = args.slice(1);
         if (payload.length === 0) {
           writeLine(`${tag} BAD APPEND requires mailbox and message data`);
-          return;
-        }
-
-        if (payload[payload.length - 1].match(/^\{\d+\}$/)) {
-          writeLine(`${tag} NO APPEND literal syntax is not supported`);
           return;
         }
 
@@ -1681,12 +2514,38 @@ function createImapGatewayServer(options) {
         }
 
         if (subCommand === "THREAD") {
-          writeLine(`${tag} NO UID THREAD not implemented`);
+          const algorithm = String(args[1] || "REFERENCES")
+            .trim()
+            .toUpperCase();
+          if (algorithm !== "REFERENCES" && algorithm !== "ORDEREDSUBJECT") {
+            writeLine(`${tag} NO UID THREAD unsupported algorithm`);
+            return;
+          }
+          const charset = String(args[2] || "US-ASCII")
+            .trim()
+            .toUpperCase();
+          if (charset && charset !== "US-ASCII" && charset !== "UTF-8" && charset !== "UTF8") {
+            writeLine(`${tag} NO UID THREAD unsupported charset`);
+            return;
+          }
+          const criteria = args.slice(3);
+          runUidThreadResponse(algorithm, criteria);
+          writeLine(`${tag} OK UID THREAD completed`);
           return;
         }
 
         if (subCommand === "SORT") {
-          writeLine(`${tag} NO UID SORT not implemented`);
+          const sortToken = args[1] || "(DATE)";
+          const charset = String(args[2] || "US-ASCII")
+            .trim()
+            .toUpperCase();
+          if (charset && charset !== "US-ASCII" && charset !== "UTF-8" && charset !== "UTF8") {
+            writeLine(`${tag} NO UID SORT unsupported charset`);
+            return;
+          }
+          const criteria = args.slice(3);
+          runUidSortResponse(sortToken, criteria);
+          writeLine(`${tag} OK UID SORT completed`);
           return;
         }
 

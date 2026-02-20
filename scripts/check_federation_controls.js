@@ -28,6 +28,22 @@ function parseCommaList(value) {
     .filter(Boolean);
 }
 
+function parseNonNegativeInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
 function normalizeHostname(value) {
   return String(value || "")
     .trim()
@@ -98,6 +114,7 @@ function parseArgs(argv) {
     envFile: null,
     baseUrl: null,
     bearerToken: null,
+    adminToken: null,
     timeoutMs: 10000
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -114,6 +131,11 @@ function parseArgs(argv) {
     }
     if (arg === "--bearer-token" && i + 1 < argv.length) {
       args.bearerToken = argv[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg === "--admin-token" && i + 1 < argv.length) {
+      args.adminToken = argv[i + 1];
       i += 1;
       continue;
     }
@@ -264,6 +286,47 @@ async function main() {
     remoteIdentity: parseCommaList(env.LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST),
     webhook: parseCommaList(env.LOOM_WEBHOOK_HOST_ALLOWLIST)
   };
+  const federationTrustMode = String(env.LOOM_FEDERATION_TRUST_MODE || "").trim().toLowerCase();
+  const federationTrustFailClosed = parseBoolean(env.LOOM_FEDERATION_TRUST_FAIL_CLOSED, true);
+  const federationTrustDnsTxtLabel = String(env.LOOM_FEDERATION_TRUST_DNS_TXT_LABEL || "").trim();
+  const federationTrustRequireDnssec = parseBoolean(
+    env.LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC,
+    federationTrustMode === "public_dns_webpki"
+  );
+  const federationTrustTransparencyMode = String(
+    env.LOOM_FEDERATION_TRUST_TRANSPARENCY_MODE || "local_append_only"
+  )
+    .trim()
+    .toLowerCase();
+  const federationTrustRequireTransparency = parseBoolean(
+    env.LOOM_FEDERATION_TRUST_REQUIRE_TRANSPARENCY,
+    federationTrustMode === "public_dns_webpki"
+  );
+  const requireExternalSigningKeys = parseBoolean(env.LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS, publicService);
+  const systemSigningPrivateKeyPem = String(env.LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM || "").trim();
+  const federationSigningPrivateKeyPem = String(env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM || "").trim();
+  const federationTrustLocalEpoch = parsePositiveInteger(env.LOOM_FEDERATION_TRUST_LOCAL_EPOCH, 1);
+  const federationTrustKeysetVersion = parsePositiveInteger(env.LOOM_FEDERATION_TRUST_KEYSET_VERSION, 1);
+  const federationTrustRevalidateIntervalMs = parseNonNegativeInteger(
+    env.LOOM_FEDERATION_TRUST_REVALIDATE_INTERVAL_MS,
+    15 * 60 * 1000
+  );
+  const federationTrustRevalidateBatchLimit = parsePositiveInteger(
+    env.LOOM_FEDERATION_TRUST_REVALIDATE_BATCH_LIMIT,
+    100
+  );
+  const federationTrustRevalidateIncludeNonPublicModes = parseBoolean(
+    env.LOOM_FEDERATION_TRUST_REVALIDATE_INCLUDE_NON_PUBLIC_MODES,
+    false
+  );
+  const federationTrustRevalidateTimeoutMs = parsePositiveInteger(
+    env.LOOM_FEDERATION_TRUST_REVALIDATE_TIMEOUT_MS,
+    5000
+  );
+  const federationTrustRevalidateMaxResponseBytes = parsePositiveInteger(
+    env.LOOM_FEDERATION_TRUST_REVALIDATE_MAX_RESPONSE_BYTES,
+    256 * 1024
+  );
 
   if (!publicService) {
     warnings.push("LOOM_PUBLIC_SERVICE is false; federation outbound controls are typically enforced for public deployments.");
@@ -291,12 +354,99 @@ async function main() {
     );
   }
 
+  if (!federationTrustMode) {
+    warnings.push("LOOM_FEDERATION_TRUST_MODE is not set; expected public_dns_webpki for internet-grade trust.");
+  } else if (federationTrustMode !== "public_dns_webpki") {
+    if (publicService) {
+      errors.push(
+        `LOOM_FEDERATION_TRUST_MODE=${federationTrustMode} is not internet-grade; expected public_dns_webpki for public service.`
+      );
+    } else {
+      warnings.push(
+        `LOOM_FEDERATION_TRUST_MODE=${federationTrustMode}; public_dns_webpki is recommended for internet-grade federation.`
+      );
+    }
+  } else {
+    checks.push("LOOM_FEDERATION_TRUST_MODE=public_dns_webpki");
+  }
+
+  if (!federationTrustFailClosed) {
+    errors.push("LOOM_FEDERATION_TRUST_FAIL_CLOSED must be true.");
+  } else {
+    checks.push("LOOM_FEDERATION_TRUST_FAIL_CLOSED=true");
+  }
+
+  if (!federationTrustRequireDnssec) {
+    errors.push("LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC must be true for hardened federation trust.");
+  } else {
+    checks.push("LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC=true");
+  }
+
+  checks.push(`LOOM_FEDERATION_TRUST_TRANSPARENCY_MODE configured (${federationTrustTransparencyMode})`);
+  if (!federationTrustRequireTransparency) {
+    warnings.push("LOOM_FEDERATION_TRUST_REQUIRE_TRANSPARENCY=false; enable for stronger trust provenance.");
+  } else {
+    checks.push("LOOM_FEDERATION_TRUST_REQUIRE_TRANSPARENCY=true");
+  }
+
+  if (publicService) {
+    if (!requireExternalSigningKeys) {
+      errors.push("LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS must be true on public service.");
+    } else {
+      checks.push("LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS=true");
+    }
+
+    if (!systemSigningPrivateKeyPem) {
+      errors.push("LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM must be configured on public service.");
+    } else {
+      checks.push("LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM configured");
+    }
+
+    if (!federationSigningPrivateKeyPem) {
+      errors.push("LOOM_NODE_SIGNING_PRIVATE_KEY_PEM must be configured on public service.");
+    } else {
+      checks.push("LOOM_NODE_SIGNING_PRIVATE_KEY_PEM configured");
+    }
+  }
+
+  if (!federationTrustDnsTxtLabel) {
+    errors.push("LOOM_FEDERATION_TRUST_DNS_TXT_LABEL must not be empty.");
+  } else {
+    checks.push(`LOOM_FEDERATION_TRUST_DNS_TXT_LABEL configured (${federationTrustDnsTxtLabel})`);
+  }
+
+  checks.push(`LOOM_FEDERATION_TRUST_LOCAL_EPOCH configured (${federationTrustLocalEpoch})`);
+  checks.push(`LOOM_FEDERATION_TRUST_KEYSET_VERSION configured (${federationTrustKeysetVersion})`);
+
+  if (federationTrustRevalidateIntervalMs <= 0) {
+    errors.push(
+      "LOOM_FEDERATION_TRUST_REVALIDATE_INTERVAL_MS must be > 0 for automatic federation trust revalidation."
+    );
+  } else {
+    checks.push(
+      `LOOM_FEDERATION_TRUST_REVALIDATE_INTERVAL_MS configured (${federationTrustRevalidateIntervalMs}ms)`
+    );
+  }
+  checks.push(`LOOM_FEDERATION_TRUST_REVALIDATE_BATCH_LIMIT configured (${federationTrustRevalidateBatchLimit})`);
+  checks.push(`LOOM_FEDERATION_TRUST_REVALIDATE_TIMEOUT_MS configured (${federationTrustRevalidateTimeoutMs}ms)`);
+  checks.push(
+    `LOOM_FEDERATION_TRUST_REVALIDATE_MAX_RESPONSE_BYTES configured (${federationTrustRevalidateMaxResponseBytes})`
+  );
+  if (federationTrustRevalidateIncludeNonPublicModes) {
+    warnings.push(
+      "LOOM_FEDERATION_TRUST_REVALIDATE_INCLUDE_NON_PUBLIC_MODES=true; prefer false for internet-grade public_dns_webpki federation."
+    );
+  } else {
+    checks.push("LOOM_FEDERATION_TRUST_REVALIDATE_INCLUDE_NON_PUBLIC_MODES=false");
+  }
+
   if (errors.length === 0) {
     checks.push("Static allowlist policy checks passed");
   }
 
   const baseUrl = args.baseUrl || env.LOOM_BASE_URL || null;
   const bearerToken = args.bearerToken || env.LOOM_FEDERATION_AUDIT_BEARER_TOKEN || null;
+  const adminToken = args.adminToken || env.LOOM_ADMIN_TOKEN || null;
   if (baseUrl || bearerToken) {
     if (!baseUrl || !bearerToken) {
       warnings.push("Runtime federation node audit skipped (both --base-url and --bearer-token are required).");
@@ -331,6 +481,108 @@ async function main() {
     }
   } else {
     warnings.push("Runtime federation node audit skipped (no --base-url/--bearer-token provided).");
+  }
+
+  if (baseUrl) {
+    if (!adminToken) {
+      warnings.push(
+        "Runtime federation trust revalidation worker audit skipped (provide --admin-token or LOOM_ADMIN_TOKEN)."
+      );
+    } else {
+      try {
+        const url = new URL("/v1/admin/status", baseUrl).toString();
+        const { response, json } = await fetchJson(url, {
+          timeoutMs: args.timeoutMs,
+          headers: {
+            "x-loom-admin-token": adminToken
+          }
+        });
+        if (!response.ok || !json) {
+          errors.push(`Runtime federation trust revalidation worker audit failed: HTTP ${response.status}`);
+        } else {
+          const worker = json?.runtime?.federation_trust_revalidation_worker;
+          if (!worker || typeof worker !== "object") {
+            errors.push("Runtime federation trust revalidation worker status is missing in /v1/admin/status.");
+          } else {
+            if (!worker.enabled) {
+              errors.push("Runtime federation trust revalidation worker is not enabled.");
+            } else {
+              checks.push("Runtime federation trust revalidation worker enabled");
+            }
+
+            const runtimeIntervalMs = parseNonNegativeInteger(worker.interval_ms, 0);
+            if (runtimeIntervalMs !== federationTrustRevalidateIntervalMs) {
+              warnings.push(
+                `Runtime trust revalidation interval (${runtimeIntervalMs}) differs from configured env (${federationTrustRevalidateIntervalMs}).`
+              );
+            } else {
+              checks.push(
+                `Runtime trust revalidation interval matches configured env (${federationTrustRevalidateIntervalMs}ms)`
+              );
+            }
+
+            const runtimeBatchLimit = parsePositiveInteger(worker.batch_limit, 0);
+            if (runtimeBatchLimit !== federationTrustRevalidateBatchLimit) {
+              warnings.push(
+                `Runtime trust revalidation batch_limit (${runtimeBatchLimit}) differs from configured env (${federationTrustRevalidateBatchLimit}).`
+              );
+            } else {
+              checks.push(
+                `Runtime trust revalidation batch_limit matches configured env (${federationTrustRevalidateBatchLimit})`
+              );
+            }
+
+            const runtimeIncludeNonPublicModes = worker.include_non_public_modes === true;
+            if (runtimeIncludeNonPublicModes !== federationTrustRevalidateIncludeNonPublicModes) {
+              warnings.push(
+                `Runtime trust revalidation include_non_public_modes=${runtimeIncludeNonPublicModes} differs from configured env=${federationTrustRevalidateIncludeNonPublicModes}.`
+              );
+            } else {
+              checks.push(
+                `Runtime trust revalidation include_non_public_modes matches configured env (${runtimeIncludeNonPublicModes})`
+              );
+            }
+
+            if (worker.last_error) {
+              errors.push(`Runtime federation trust revalidation worker last_error is set: ${worker.last_error}`);
+            } else {
+              checks.push("Runtime federation trust revalidation worker last_error is clear");
+            }
+          }
+        }
+      } catch (error) {
+        errors.push(`Runtime federation trust revalidation worker audit error: ${error?.message || String(error)}`);
+      }
+    }
+
+    if (!adminToken) {
+      warnings.push(
+        "Runtime federation trust DNS verification skipped (provide --admin-token or LOOM_ADMIN_TOKEN)."
+      );
+    } else {
+      try {
+        const url = new URL("/v1/federation/trust/verify-dns?require_match=true", baseUrl).toString();
+        const { response, json } = await fetchJson(url, {
+          timeoutMs: args.timeoutMs,
+          headers: {
+            "x-loom-admin-token": adminToken
+          }
+        });
+        if (!response.ok || !json) {
+          errors.push(`Runtime federation trust DNS verification failed: HTTP ${response.status}`);
+        } else if (!json.match_semantic) {
+          errors.push("Runtime federation trust DNS verification mismatch: published TXT record does not match local trust descriptor.");
+        } else if (json.dnssec_required === true && json.dnssec_validated !== true) {
+          errors.push("Runtime federation trust DNS verification is not DNSSEC-validated while DNSSEC is required.");
+        } else {
+          checks.push(
+            `Runtime trust DNS verification passed (${json.status || "match"}) for ${json.dns_name || "unknown"}`
+          );
+        }
+      } catch (error) {
+        errors.push(`Runtime federation trust DNS verification error: ${error?.message || String(error)}`);
+      }
+    }
   }
 
   console.log("\nFederation controls summary:");

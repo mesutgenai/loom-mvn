@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-02-20T13:54:39.317Z",
+  "input_mode": "decision_log_file",
+  "input_path": "/Users/mesut/Desktop/email++/tmp/content-filter-decisions-sample.jsonl",
+  "source_filter": "federation",
+  "profile": "agent",
+  "total_vectors": 4,
+  "distribution": {
+    "by_action": {
+      "allow": 2,
+      "quarantine": 1,
+      "reject": 1
+    },
+    "by_source": {
+      "federation": 4
+    }
+  },
+  "threshold_calibration": {
+    "baseline_thresholds": {
+      "spam": 5,
+      "phish": 4,
+      "quarantine": 6,
+      "reject": 9
+    },
+    "suggested_thresholds": {
+      "spam_threshold": 5,
+      "phish_threshold": 4,
+      "quarantine_threshold": 6,
+      "reject_threshold": 9
+    },
+    "quantiles": {
+      "allow_score_p95": 0.95,
+      "allow_score_p99": 0.99,
+      "reject_score_p20": 10,
+      "reject_score_p50": 10,
+      "quarantine_score_p90": 7
+    },
+    "insufficient_sample_size": {
+      "vectors": 4,
+      "allow_vectors": 2,
+      "minimum_vectors_required": 50,
+      "minimum_allow_vectors_required": 20
+    }
+  },
+  "note": "Inputs are anonymized and re-scored with the selected profile to support threshold tuning with production-like distributions."
+}

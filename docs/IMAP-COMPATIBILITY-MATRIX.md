@@ -24,21 +24,22 @@ LOOM targets practical IMAP interoperability for common mailbox clients using a 
 | `STATUS` | Supported | `MESSAGES`, `UNSEEN`, `UIDNEXT`, `UIDVALIDITY`, `RECENT`. |
 | `SELECT`, `EXAMINE` | Supported | Read-write and read-only selection modes. |
 | `CHECK`, `NOOP`, `LOGOUT` | Supported | Standard control commands. |
-| `SEARCH`, `UID SEARCH` | Supported | Core criteria and permissive parser for additional tokens. |
+| `SEARCH`, `UID SEARCH` | Supported | Core criteria plus boolean composition (`OR`, `NOT`) with grouped expressions (`(...)`). Parser remains permissive for unknown tokens. |
 | `FETCH`, `UID FETCH` | Supported | Sectioned body/header fetches supported. |
 | `STORE`, `UID STORE` | Supported | `\Seen`, `\Flagged`, `\Deleted` mutation semantics. |
 | `MOVE`, `UID MOVE` | Supported | Maps to LOOM mailbox state transitions. |
 | `IDLE` | Supported | `DONE` terminates IDLE as expected. |
-| `APPEND` | Partial | Inline message data supported; IMAP literal syntax `{n}` not currently supported. |
+| `APPEND` | Supported | Inline message data and IMAP literal continuation mode (`{n}`) are supported. |
 | `EXPUNGE`, `UID EXPUNGE` | Partial | Accepted for compatibility; LOOM applies mailbox-state changes eagerly, so expunge is effectively a no-op. |
 | `COPY`, `UID COPY` | Not Supported | Explicitly rejected to preserve single effective-folder mailbox model. |
-| `UID THREAD`, `UID SORT` | Not Supported | Explicitly rejected in current profile. |
+| `UID THREAD` | Supported | `REFERENCES` and `ORDEREDSUBJECT` algorithms; unsupported algorithms/charsets are rejected. |
+| `UID SORT` | Supported | Standard sort keys with `US-ASCII`/`UTF-8` charset handling. |
 
 ## Known Intentional Limitations
 
 - single effective folder per participant/thread prevents full IMAP `COPY` parity
-- no IMAP server-side threading/sorting extensions yet
-- no APPEND literal continuation mode (`{n}`) yet
+- non-`UID` `THREAD`/`SORT` commands are outside the current compatibility profile
+- many RFC3501 criteria tokens are accepted permissively but not all map to full mailbox semantics yet
 
 ## Validation
 

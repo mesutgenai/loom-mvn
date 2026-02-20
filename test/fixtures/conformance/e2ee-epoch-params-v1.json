@@ -1,0 +1,76 @@
+{
+  "spec": "loom.e2ee.epoch-params.v1",
+  "vectors": [
+    {
+      "id": "valid-distribution-covers-participants",
+      "parameters": {
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 3,
+        "wrapped_keys": [
+          {
+            "to": "loom://alice@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_alice_agents_1",
+            "ciphertext": "YWJj"
+          },
+          {
+            "to": "loom://bob@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_bob_agents_1",
+            "ciphertext": "ZGVm"
+          }
+        ]
+      },
+      "required_recipients": [
+        "loom://alice@agents.example",
+        "loom://bob@agents.example"
+      ],
+      "expected_valid": true
+    },
+    {
+      "id": "rejects-missing-participant-key",
+      "parameters": {
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 3,
+        "wrapped_keys": [
+          {
+            "to": "loom://alice@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_alice_agents_1",
+            "ciphertext": "YWJj"
+          }
+        ]
+      },
+      "required_recipients": [
+        "loom://alice@agents.example",
+        "loom://bob@agents.example"
+      ],
+      "expected_error_field": "content.structured.parameters.wrapped_keys"
+    },
+    {
+      "id": "rejects-duplicate-recipient-entry",
+      "parameters": {
+        "profile": "loom-e2ee-x25519-xchacha20-v1",
+        "epoch": 3,
+        "wrapped_keys": [
+          {
+            "to": "loom://alice@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_alice_agents_1",
+            "ciphertext": "YWJj"
+          },
+          {
+            "to": "loom://alice@agents.example",
+            "algorithm": "X25519-HKDF-SHA256",
+            "key_id": "k_enc_alice_agents_2",
+            "ciphertext": "ZGVm"
+          }
+        ]
+      },
+      "required_recipients": [
+        "loom://alice@agents.example"
+      ],
+      "expected_error_field": "content.structured.parameters.wrapped_keys[1].to"
+    }
+  ]
+}

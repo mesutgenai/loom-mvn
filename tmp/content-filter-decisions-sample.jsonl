@@ -1,0 +1,4 @@
+{"timestamp":"2026-02-20T00:00:00.000Z","source":"federation","profile":"agent","action":"allow","score":0,"spam_score":0,"phish_score":0,"malware_score":0,"signal_codes":[]}
+{"timestamp":"2026-02-20T00:00:01.000Z","source":"federation","profile":"agent","action":"allow","score":1,"spam_score":1,"phish_score":0,"malware_score":0,"signal_codes":["keyword.spam"]}
+{"timestamp":"2026-02-20T00:00:02.000Z","source":"federation","profile":"agent","action":"quarantine","score":7,"spam_score":1,"phish_score":6,"malware_score":0,"signal_codes":["keyword.phish_cluster","url.shortener"]}
+{"timestamp":"2026-02-20T00:00:03.000Z","source":"federation","profile":"agent","action":"reject","score":10,"spam_score":1,"phish_score":4,"malware_score":5,"signal_codes":["attachment.risky_extension"]}

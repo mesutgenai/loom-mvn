@@ -1,0 +1,39 @@
+{
+  "version": "agent-production-like-agent-v1",
+  "generated_at": "2026-02-20T13:43:59.737Z",
+  "source_filter": "all",
+  "profile": "agent",
+  "total_vectors": 2,
+  "vectors": [
+    {
+      "id": "prod_0001",
+      "source": "unknown",
+      "subject": "message.general@v1",
+      "text": "hello via smtp gateway",
+      "expected_action": "allow",
+      "scores": {
+        "total_score": 0,
+        "spam_score": 0,
+        "phish_score": 0,
+        "malware_score": 0
+      },
+      "signal_codes": [],
+      "original_envelope_id_hash": "6c6ea77b338e3f9f"
+    },
+    {
+      "id": "prod_0002",
+      "source": "bridge_email",
+      "subject": "message.general@v1",
+      "text": "hello from email",
+      "expected_action": "allow",
+      "scores": {
+        "total_score": 0,
+        "spam_score": 0,
+        "phish_score": 0,
+        "malware_score": 0
+      },
+      "signal_codes": [],
+      "original_envelope_id_hash": "75b5caecd5b9d694"
+    }
+  ]
+}

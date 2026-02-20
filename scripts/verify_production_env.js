@@ -148,6 +148,14 @@ const bridgeInboundWeakAuthPolicyConfirmed = parseBoolean(
 );
 const pgUrl = String(env.LOOM_PG_URL || "").trim();
 const pgSslEnabled = parseBoolean(env.LOOM_PG_SSL, false);
+const federationTrustMode = String(env.LOOM_FEDERATION_TRUST_MODE || "").trim().toLowerCase();
+const federationTrustRequireDnssec = parseBoolean(
+  env.LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC,
+  publicService && federationTrustMode === "public_dns_webpki"
+);
+const requireExternalSigningKeys = parseBoolean(env.LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS, publicService);
+const systemSigningPrivateKeyPem = String(env.LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM || "").trim();
+const federationSigningPrivateKeyPem = String(env.LOOM_NODE_SIGNING_PRIVATE_KEY_PEM || "").trim();
 
 if (!publicService) {
   fail("LOOM_PUBLIC_SERVICE must be true for internet-facing production.");
@@ -183,6 +191,24 @@ if (publicService) {
     fail("LOOM_ADMIN_TOKEN is required for public service.");
   } else {
     ok("LOOM_ADMIN_TOKEN is set");
+  }
+
+  if (!requireExternalSigningKeys) {
+    fail("LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS must be true for public service.");
+  } else {
+    ok("LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS=true");
+  }
+
+  if (!systemSigningPrivateKeyPem) {
+    fail("LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM is required for public service.");
+  } else {
+    ok("LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM is set");
+  }
+
+  if (!federationSigningPrivateKeyPem) {
+    fail("LOOM_NODE_SIGNING_PRIVATE_KEY_PEM is required for public service.");
+  } else {
+    ok("LOOM_NODE_SIGNING_PRIVATE_KEY_PEM is set");
   }
 
   if (!pgUrl) {
@@ -289,6 +315,12 @@ if (publicService) {
     }
   } else {
     fail("LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true is not allowed for hardened public deployment.");
+  }
+
+  if (federationTrustMode === "public_dns_webpki" && !federationTrustRequireDnssec) {
+    fail("LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC must be true when LOOM_FEDERATION_TRUST_MODE=public_dns_webpki.");
+  } else if (federationTrustMode === "public_dns_webpki") {
+    ok("LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC=true");
   }
 }
 

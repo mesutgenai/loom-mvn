@@ -14,6 +14,7 @@ import {
   isIsoDateTime,
   isThreadId
 } from "./ids.js";
+import { validateEncryptedContentShape } from "./e2ee.js";
 
 function pushError(errors, field, reason) {
   errors.push({ field, reason });
@@ -130,14 +131,9 @@ function validateContent(content, errors) {
   const encrypted = Boolean(content.encrypted);
 
   if (encrypted) {
-    if (!content.profile) {
-      pushError(errors, "content.profile", "required when content.encrypted=true");
-    }
-    if (typeof content.epoch !== "number" || content.epoch < 0) {
-      pushError(errors, "content.epoch", "must be a non-negative integer when encrypted");
-    }
-    if (typeof content.ciphertext !== "string" || content.ciphertext.length === 0) {
-      pushError(errors, "content.ciphertext", "required when encrypted");
+    const encryptedErrors = validateEncryptedContentShape(content);
+    for (const encryptedError of encryptedErrors) {
+      pushError(errors, encryptedError.field, encryptedError.reason);
     }
     return;
   }
@@ -172,7 +168,7 @@ const INTENT_PREFIXES_BY_TYPE = {
   data: ["data."],
   receipt: ["receipt."],
   workflow: ["workflow."],
-  thread_op: ["thread.", "capability."]
+  thread_op: ["thread.", "capability.", "encryption."]
 };
 
 function validateTypeIntentConsistency(envelope, errors) {

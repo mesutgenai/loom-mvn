@@ -4,7 +4,7 @@ This runbook is the implementation artifact for `P0-09` in `docs/PRODUCTION-READ
 
 ## Objective
 
-Ensure `/ready`, `/metrics`, and `/v1/admin/status` are scraped and alert policies cover readiness failures, queue lag, auth error spikes, and persistence/database failures.
+Ensure `/ready`, `/metrics`, and `/v1/admin/status` are scraped and alert policies cover readiness failures, queue lag, auth error spikes, persistence/database failures, inbound content-policy drift, and federation trust-revalidation failures.
 
 ## Alert Policy Baseline
 
@@ -66,6 +66,15 @@ Minimum scrape/blackbox coverage:
 - `loom_persistence_writes_failed`
 - `loom_persistence_last_error`
 - `loom_persistence_enabled`
+- `loom_inbound_content_filter_profile_evaluated_total{profile=...}`
+- `loom_inbound_content_filter_profile_spam_labeled_total{profile=...}`
+- `loom_inbound_content_filter_decisions_total{profile=...,action=allow|quarantine|reject}`
+- `loom_inbound_content_filter_decision_log_enabled`
+- `loom_inbound_content_filter_decision_log_sink_configured`
+- `loom_federation_trust_revalidation_worker_enabled`
+- `loom_federation_trust_revalidation_worker_last_failed_count`
+- `loom_federation_trust_revalidation_worker_last_error`
+- `loom_federation_trust_revalidation_worker_runs_total`
 
 ## Evidence Required For P0-09
 

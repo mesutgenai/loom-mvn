@@ -120,6 +120,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `LOOM-protocol-design.md`
   - `LOOM-specification-v1.0.md`
   - `LOOM-Protocol-Spec-v1.1.md`
+  - `LOOM-Agent-First-Protocol-v2.0.md` (ground-up reboot draft)
   - `docs/CONFORMANCE.md`
   - `docs/DEVELOPMENT-PLAN.md`
   - `docs/STABILITY.md`
@@ -154,6 +155,18 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `LICENSE` (Apache-2.0)
   - GitHub Actions CI workflow (`.github/workflows/ci.yml`)
 
+## Ground-Up Reboot Track (v2.0 Draft)
+
+The repository now includes a v2.0 reboot draft focused on closing protocol gaps identified in the latest evaluation report:
+
+- explicit trust anchors and authority validation (`src/protocol/trust.js`)
+- signing-key lifecycle enforcement primitives (`src/protocol/key_lifecycle.js`)
+- strict E2EE profile validation plus concrete X25519+HKDF+XChaCha20 payload/attachment encrypt-decrypt, wrapped-key packaging, and replay/commitment metadata enforcement (`src/protocol/e2ee.js`)
+- store internals split into explicit protocol core, policy engine, and adapter modules (`src/node/store/protocol_core.js`, `src/node/store/policy_engine.js`, `src/node/store/adapters.js`)
+- publishable conformance fixtures for cross-language implementations (`test/fixtures/conformance/`)
+
+See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
+
 ## MVN features implemented
 
 - Envelope shape validation (`loom: "1.1"`, ids, recipients, content checks)
@@ -179,16 +192,20 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 - Federation distributed guard support: global inbound rate controls and shared abuse/challenge state via persistence adapter
 - Federation challenge escalation + challenge token flow (`/v1/federation/challenge`)
 - Signed federation delivery receipts with optional strict verification
+- Federation protocol-capability negotiation with enforceable trust-mode parity and E2EE-profile overlap policy gates
 - Outbound federation outbox with retry-based store-and-forward processing and per-node deliver URL safety enforcement
 - Outbox claim leasing hooks for distributed worker coordination (`email`, `federation`, `webhook`)
+- Automatic periodic federation trust-anchor revalidation worker with admin/runtime visibility
 - SMTP/IMAP gateway interoperability hardening (address-list parsing, case-insensitive headers, folder aliases)
-- Optional wire-level legacy gateway daemon (SMTP submission + IMAP mailbox access) for legacy clients, with optional STARTTLS support and extended IMAP commands (`STATUS`, `SEARCH`, `FETCH`, `STORE`, `APPEND`, `IDLE`, `MOVE`, `UID SEARCH`, `UID FETCH`, `UID STORE`, `UID MOVE`)
+- Optional wire-level legacy gateway daemon (SMTP submission + IMAP mailbox access) for legacy clients, with optional STARTTLS support and extended IMAP commands (`STATUS`, `SEARCH`, `FETCH`, `STORE`, `APPEND` including IMAP literal mode, `IDLE`, `MOVE`, `UID SEARCH`, `UID FETCH`, `UID STORE`, `UID MOVE`, `UID THREAD`, `UID SORT`)
+- Inbound bridge content filter with profile-aware policy (`strict|balanced|agent`), profile-labeled decision counters, optional anonymized decision telemetry log, and admin canary/apply/rollback workflow
 - Outbound MIME attachment mapping from LOOM blob-backed envelope attachments
 - DSN-style per-recipient delivery status updates for email outbox entries
 - Recipient-view delivery wrappers for BCC privacy (`delivery.wrapper@v1`) with per-recipient visible roster
 - Per-user mailbox state (`seen`, `flagged`, `archived`, `deleted`) without mutating other participants
 - Idempotency-key replay protection for key POST mutations
 - Webhook destination hardening (private-network block by default with per-webhook override)
+- Maintenance sweep support for token/cache cleanup and retention enforcement (`message` + `blob` policies)
 - Admin persistence operations: schema status, backup export, and restore
 - In-memory node API:
   - `GET /.well-known/loom.json`
@@ -234,8 +251,19 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `GET /v1/delegations?role=all|delegator|delegate`
   - `DELETE /v1/delegations/{id}`
   - `GET /v1/federation/hello`
+  - `GET /v1/protocol/capabilities` (supported E2EE profiles + federation trust-anchor negotiation posture)
+  - `GET /.well-known/loom-capabilities.json` (well-known alias for protocol capabilities)
+  - `GET /.well-known/loom-keyset.json` (signed federation keyset)
+  - `GET /.well-known/loom-revocations.json` (signed federation key revocations)
+  - `GET /.well-known/loom-trust.json` (DNS TXT publication descriptor)
+  - `GET /.well-known/loom-trust.txt` (ready-to-publish DNS TXT value)
+  - `GET /v1/federation/trust` (admin token required; current trust posture/config)
+  - `GET /v1/federation/trust/verify-dns` (admin token required; verifies published DNS TXT trust anchor)
+  - `POST /v1/federation/trust` (admin token required; rotate trust epoch/version/revocations)
   - `POST /v1/federation/nodes`
   - `POST /v1/federation/nodes/bootstrap` (discovery bootstrap)
+  - `POST /v1/federation/nodes/revalidate` (batch trust-anchor revalidation for known peers)
+  - `POST /v1/federation/nodes/{node_id}/revalidate` (single-node trust-anchor revalidation)
   - `GET /v1/federation/nodes`
   - `POST /v1/federation/challenge` (signed node challenge token issue)
   - `POST /v1/federation/deliver` (signed wrapper)
@@ -252,6 +280,8 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `GET /v1/outbox/dlq?kind=email|federation|webhook|all` (admin token required)
   - `POST /v1/outbox/dlq/requeue` (admin token required)
   - `GET /v1/admin/status` (admin token required)
+  - `GET /v1/admin/content-filter/config` (admin token required)
+  - `POST /v1/admin/content-filter/config` (admin token required; `mode=canary|apply|rollback`)
   - `GET /v1/admin/persistence/schema` (admin token required)
   - `GET /v1/admin/persistence/backup` (admin token required)
   - `POST /v1/admin/persistence/restore` (admin token required, `confirm=restore`)
@@ -502,6 +532,9 @@ There is no separate mailbox provisioning step for local identities. If an ident
 Optional persistence:
 
 - Set `LOOM_DATA_DIR=/absolute/path` to persist state and audit log between restarts.
+- Optional local state-file encryption at rest:
+  - `LOOM_STATE_ENCRYPTION_KEY` (32-byte key as base64url/base64/hex)
+  - `LOOM_REQUIRE_STATE_ENCRYPTION_AT_REST=true|false` (when `true`, plaintext state files are refused)
 - Optional keyed audit integrity:
   - `LOOM_AUDIT_HMAC_KEY` signs each audit entry with HMAC-SHA256 (recommended for tamper evidence).
   - `LOOM_AUDIT_REQUIRE_MAC_VALIDATION=true|false` (default `false`; when enabled, loading unsigned audit entries fails).
@@ -512,6 +545,12 @@ Optional persistence:
   - Optional TLS: `LOOM_PG_SSL=true`, `LOOM_PG_SSL_REJECT_UNAUTHORIZED=true|false`.
   - On startup, node hydrates from Postgres first when configured.
 - Set `LOOM_NODE_SIGNING_PRIVATE_KEY_PEM` and `LOOM_NODE_SIGNING_KEY_ID` to enable outbound signed federation delivery.
+- Public-service signing key hardening:
+  - `LOOM_REQUIRE_EXTERNAL_SIGNING_KEYS=true` is required on public service.
+  - `LOOM_SYSTEM_SIGNING_KEY_ID` defines the local bridge/system signing key id (default `k_sign_system_1`).
+  - `LOOM_SYSTEM_SIGNING_PRIVATE_KEY_PEM` and `LOOM_NODE_SIGNING_PRIVATE_KEY_PEM` must be externally provisioned (no auto-generated fallback).
+  - `LOOM_SYSTEM_SIGNING_PUBLIC_KEY_PEM` is optional (derived from private key when omitted).
+  - `LOOM_REQUIRE_DISTINCT_FEDERATION_SIGNING_KEY=true|false` enforces different key material for system vs federation signing.
 - Set `LOOM_MAX_BODY_BYTES` to cap request payload size (default `2097152`).
 - Set `LOOM_IDENTITY_DOMAIN` to override the local identity authority domain used by `POST /v1/identity` local-domain checks (defaults to `LOOM_NODE_ID` host/domain).
 - Set `LOOM_IDENTITY_REQUIRE_PROOF=true` to require registration proof-of-key on self-service identity creation.
@@ -560,6 +599,12 @@ Optional persistence:
 - Set `LOOM_FEDERATION_GLOBAL_RATE_WINDOW_MS` (default `60000`) and `LOOM_FEDERATION_GLOBAL_RATE_MAX` (default `1000`) for global inbound federation rate limiting.
 - Set `LOOM_FEDERATION_INBOUND_MAX_ENVELOPES` (default `100`) to cap envelopes accepted per federation delivery.
 - Set `LOOM_FEDERATION_REQUIRE_SIGNED_RECEIPTS=true` to require signed receipt verification for outbound federation delivery.
+- Optional strict federation capability negotiation gates:
+  - `LOOM_FEDERATION_REQUIRE_PROTOCOL_CAPABILITIES=true|false` (require remote `/v1/protocol/capabilities` publication)
+  - `LOOM_FEDERATION_REQUIRE_E2EE_PROFILE_OVERLAP=true|false` (require negotiated encrypted-profile overlap)
+  - `LOOM_FEDERATION_REQUIRE_TRUST_MODE_PARITY=true|false` (require negotiated trust-anchor mode parity)
+- Controlled E2EE profile migration policy:
+  - `LOOM_E2EE_PROFILE_MIGRATION_ALLOWLIST` (comma/newline list of `fromProfile>toProfile` exceptions)
 - Outbound host allowlists (comma-separated hostnames, suffixes like `.example.com`, or wildcards like `*.example.com`):
   - `LOOM_FEDERATION_HOST_ALLOWLIST` for federation delivery/outbound federation requests.
   - `LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST` for node discovery bootstrap fetches.
@@ -578,6 +623,28 @@ Optional persistence:
   - `LOOM_FEDERATION_CHALLENGE_DURATION_MS` (default `900000`)
 - Set `LOOM_EMAIL_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_EMAIL_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process outbound email outbox.
 - Set `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_INTERVAL_MS` (default `5000`) and `LOOM_WEBHOOK_OUTBOX_AUTO_PROCESS_BATCH_SIZE` (default `20`) to auto-process webhook outbox.
+- Set periodic federation trust-anchor revalidation worker controls:
+  - `LOOM_FEDERATION_TRUST_REVALIDATE_INTERVAL_MS` (default `900000`; set `0` to disable)
+  - `LOOM_FEDERATION_TRUST_REVALIDATE_BATCH_LIMIT` (default `100`; max `1000`)
+  - `LOOM_FEDERATION_TRUST_REVALIDATE_INCLUDE_NON_PUBLIC_MODES` (default `false`)
+  - `LOOM_FEDERATION_TRUST_REVALIDATE_TIMEOUT_MS` (default `5000`)
+  - `LOOM_FEDERATION_TRUST_REVALIDATE_MAX_RESPONSE_BYTES` (default `262144`)
+- DNSSEC-backed federation trust-anchor resolution controls:
+  - `LOOM_FEDERATION_TRUST_REQUIRE_DNSSEC=true|false` (default `true` on public service with `public_dns_webpki` mode)
+  - `LOOM_FEDERATION_TRUST_DNS_RESOLVER_MODE=system|dnssec_doh` (default `system`)
+  - `LOOM_FEDERATION_TRUST_DNSSEC_DOH_URL` (default `https://cloudflare-dns.com/dns-query` when `dnssec_doh` mode is used)
+  - `LOOM_FEDERATION_TRUST_DNSSEC_DOH_TIMEOUT_MS` (default `5000`)
+  - `LOOM_FEDERATION_TRUST_DNSSEC_DOH_MAX_RESPONSE_BYTES` (default `262144`)
+  - `LOOM_FEDERATION_TRUST_MAX_CLOCK_SKEW_MS` (default `300000`)
+  - `LOOM_FEDERATION_TRUST_KEYSET_MAX_AGE_MS` (default `86400000`)
+  - `LOOM_FEDERATION_TRUST_KEYSET_PUBLISH_TTL_MS` (default `86400000`)
+  - `LOOM_FEDERATION_TRUST_TRANSPARENCY_MODE` (default `local_append_only`)
+  - `LOOM_FEDERATION_TRUST_REQUIRE_TRANSPARENCY=true|false` (default `true` on public service with `public_dns_webpki` mode)
+  - `LOOM_FEDERATION_REVOKED_KEY_IDS` (comma-separated historical federation key ids to publish as revoked)
+- Retention/maintenance controls:
+  - `LOOM_MESSAGE_RETENTION_DAYS` (default `0`, disabled)
+  - `LOOM_BLOB_RETENTION_DAYS` (default `0`, disabled)
+  - `LOOM_MAINTENANCE_SWEEP_INTERVAL_MS` (default `60000`; set `0` to disable periodic sweeps)
 - Set `LOOM_ADMIN_TOKEN` to protect operational endpoints (`/metrics`, `/v1/admin/status`).
 - Set `LOOM_METRICS_PUBLIC=true` only if you intentionally want unauthenticated `/metrics`.
 - Set `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true` only if you intentionally want to disable strict outbound host allowlist startup guards on public service.
@@ -608,7 +675,7 @@ Optional persistence:
     - `LOOM_SMTP_DKIM_KEY_SELECTOR`
     - `LOOM_SMTP_DKIM_PRIVATE_KEY_PEM` or `LOOM_SMTP_DKIM_PRIVATE_KEY_FILE`
     - `LOOM_SMTP_DKIM_HEADER_FIELD_NAMES` (optional override)
-- Optional API send-surface kill switches:
+  - Optional API send-surface kill switches:
   - `LOOM_BRIDGE_EMAIL_INBOUND_ENABLED=true|false` (default `true`)
   - `LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true|false` (default `false`; required to keep inbound bridge enabled on public service)
   - Inbound bridge authentication policy controls:
@@ -617,7 +684,23 @@ Optional persistence:
     - `LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_DMARC_PASS=true|false` (default `true` on public service, else `false`)
     - `LOOM_BRIDGE_EMAIL_INBOUND_REJECT_ON_AUTH_FAILURE=true|false` (default `true` on public service, else `false`; if `false`, failures can be quarantined instead)
     - `LOOM_BRIDGE_EMAIL_INBOUND_QUARANTINE_ON_AUTH_FAILURE=true|false` (default `true`)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_PAYLOAD_AUTH_RESULTS=true|false` (default `true`; when `false`, only sanitized header auth evidence is trusted)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_HEADER_ALLOWLIST` (comma-separated inbound header names to retain in bridge metadata)
     - `LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true|false` (default `false`; required only if you intentionally weaken public inbound auth policy defaults)
+  - Inbound content filter controls:
+    - `LOOM_INBOUND_CONTENT_FILTER_ENABLED=true|false` (default `true`)
+    - `LOOM_INBOUND_CONTENT_FILTER_REJECT_MALWARE=true|false` (default `true`)
+    - `LOOM_INBOUND_CONTENT_FILTER_PROFILE_DEFAULT=strict|balanced|agent` (default `balanced`)
+    - `LOOM_INBOUND_CONTENT_FILTER_PROFILE_BRIDGE=strict|balanced|agent` (default inherits profile default)
+    - `LOOM_INBOUND_CONTENT_FILTER_PROFILE_FEDERATION=strict|balanced|agent` (default `agent`)
+    - `LOOM_INBOUND_CONTENT_FILTER_SPAM_THRESHOLD` (default `3`)
+    - `LOOM_INBOUND_CONTENT_FILTER_PHISH_THRESHOLD` (default `3`)
+    - `LOOM_INBOUND_CONTENT_FILTER_QUARANTINE_THRESHOLD` (default `4`)
+    - `LOOM_INBOUND_CONTENT_FILTER_REJECT_THRESHOLD` (default `7`, must remain above quarantine threshold)
+    - Optional anonymized decision telemetry:
+      - `LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_ENABLED=true|false` (default `false`)
+      - `LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_FILE` (default `${LOOM_DATA_DIR}/content-filter-decisions.jsonl` when `LOOM_DATA_DIR` is set)
+      - `LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_SALT` (recommended rotated secret)
   - `LOOM_BRIDGE_EMAIL_SEND_ENABLED=true|false` (default `true`)
   - `LOOM_GATEWAY_SMTP_SUBMIT_ENABLED=true|false` (default `true`)
 - Outbound SSRF hardening:
@@ -708,6 +791,20 @@ Focused inbound bridge negative tests:
 npm run test:inbound-bridge-hardening
 ```
 
+Content-filter corpus tuning (from anonymized decision telemetry or snapshot export):
+
+```bash
+npm run build:content-filter-corpus -- --decision-log-file <path-to-content-filter-decisions.jsonl>
+```
+
+Alternative corpus inputs:
+
+```bash
+npm run build:content-filter-corpus -- --data-dir <loom-data-dir>
+npm run build:content-filter-corpus -- --state-file <state.json>
+npm run build:content-filter-corpus -- --backup-file <backup.json>
+```
+
 Rate-limit policy validation:
 
 ```bash
@@ -730,6 +827,12 @@ Observability and alerting validation:
 
 ```bash
 npm run check:observability -- --env-file .env.production
+```
+
+Federation trust freshness drill (revalidation cycle + trust-anchor assertions):
+
+```bash
+npm run drill:federation-trust
 ```
 
 Request tracing validation:
@@ -816,6 +919,12 @@ Federation interop drill:
 npm run drill:federation-interop -- --base-url https://<loom-host> --admin-token <admin-token> --remote-node-id <external-node-id>
 ```
 
+Federation trust freshness drill (self-contained local+remote revalidation cycle):
+
+```bash
+npm run drill:federation-trust
+```
+
 Federation interop matrix drill (staging + pre-prod):
 
 ```bash
@@ -846,15 +955,18 @@ npm run drill:persistence -- --base-url https://<loom-host> --execute-restore
 - `package.json` intentionally keeps `"private": true` to prevent accidental npm publication; source remains fully open in this repository under Apache-2.0.
 - Legacy compatibility now includes both API-level gateway behavior (`/v1/gateway/*` + bridge/relay) and an optional wire-level gateway daemon (SMTP + IMAP + optional STARTTLS + extended mailbox commands). Full parity with all enterprise IMAP/SMTP extensions is still a separate hardening track.
 - Wire SMTP now advertises and accepts the `SMTPUTF8` ESMTP parameter for gateway-compatible flows.
+- Wire IMAP supports boolean SEARCH composition (`OR`, `NOT`, grouped criteria) plus server-side `UID THREAD` (`REFERENCES|ORDEREDSUBJECT`) and `UID SORT`.
 - Inbound internet-email authentication (SPF/DKIM/DMARC verification and policy enforcement) is expected to run in an upstream MTA; the MVN inbound bridge route should remain private unless explicitly confirmed.
 - Current wire IMAP limitation: `COPY`/`UID COPY` are intentionally rejected because LOOM mailbox state currently models a single effective folder per thread participant.
 - Wire IMAP compatibility profile and extension coverage are tracked in `docs/IMAP-COMPATIBILITY-MATRIX.md`.
 - Compliance control mapping (audit export + retention + policy links) is tracked in `docs/COMPLIANCE-CONTROLS.md`.
 - Federation abuse/rate-policy hardening is implemented for baseline operations; deeper interoperability coverage can be extended.
+- Federation onboarding can be made fail-closed via strict protocol capability gates (`LOOM_FEDERATION_REQUIRE_PROTOCOL_CAPABILITIES`, `LOOM_FEDERATION_REQUIRE_E2EE_PROFILE_OVERLAP`, `LOOM_FEDERATION_REQUIRE_TRUST_MODE_PARITY`).
 - Production hardening included in this MVP baseline: payload-size guard, sensitive-route rate limiting, and automatic outbox worker loop.
 - Operational surfaces included: `/ready`, Prometheus `/metrics`, `/v1/admin/status`, outbound email relay outbox with worker automation.
 - Optional production persistence backend now included: PostgreSQL (`LOOM_PG_URL`).
 - Persistence operations now include admin schema status, backup export, and restore APIs.
+- Periodic maintenance sweeps can enforce message/blob retention windows when configured.
 - Operational recovery surfaces include admin DLQ inspection + requeue for failed outbox deliveries.
 - Signed webhook receipt delivery is supported via webhook subscriptions and webhook outbox processing endpoints.
 - For retries from clients, send `Idempotency-Key` header on supported POST mutations (for example: `/v1/envelopes`, `/v1/email/outbox`, `/v1/bridge/email/send`, `/v1/gateway/smtp/submit`, `/v1/federation/outbox`).
