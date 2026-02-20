@@ -1,6 +1,6 @@
 {
   "name": "loom-mvn",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "private": true,
   "description": "LOOM Protocol v1.1 Minimum Viable Node scaffold",
   "type": "module",
