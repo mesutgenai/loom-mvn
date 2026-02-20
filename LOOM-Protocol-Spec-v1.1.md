@@ -5,7 +5,7 @@
 **Status:** Draft Specification  
 **Version:** 1.1.0  
 **Date:** February 2026  
-**Author:** Mesut (CoWork-OS)  
+**Author:** Almarion (CoWork-OS)  
 **License:** Open Specification — free to implement, extend, and build upon.
 
 ---
@@ -204,10 +204,10 @@ loom://{local}@{domain}[#{fragment}]
 ```
 
 Examples:
-- `loom://mesut@cowork-os.com` — human identity  
-- `loom://assistant.mesut@cowork-os.com` — agent scoped to human  
+- `loom://Almarion@cowork-os.com` — human identity  
+- `loom://assistant.Almarion@cowork-os.com` — agent scoped to human  
 - `loom://billing@acme.corp` — role/team identity  
-- `loom://mesut@cowork-os.com#thr_01JMKB7W...` — client-side deep link  
+- `loom://Almarion@cowork-os.com#thr_01JMKB7W...` — client-side deep link  
 - `bridge://alice@gmail.com` — bridged email identity  
 
 Rules:
@@ -224,9 +224,9 @@ Each identity resolves to an Identity Document retrievable via the LOOM API and/
 ```json
 {
   "loom": "1.1",
-  "id": "loom://mesut@cowork-os.com",
+  "id": "loom://Almarion@cowork-os.com",
   "type": "human",
-  "display_name": "Mesut",
+  "display_name": "Almarion",
   "node": "cowork-os.com",
   "created_at": "2026-01-15T10:00:00Z",
   "public_keys": {
@@ -240,7 +240,7 @@ Each identity resolves to an Identity Document retrievable via the LOOM API and/
   },
   "delegations": [],
   "capabilities": ["send", "receive", "create_thread", "delegate"],
-  "verified_bridges": { "email": "mesut@cowork-os.com" },
+  "verified_bridges": { "email": "Almarion@cowork-os.com" },
   "aliases": ["loom://m@cowork-os.com"],
   "metadata": { "timezone": "Europe/Lisbon", "locale": "en" }
 }
@@ -264,11 +264,11 @@ Agent identities add required fields:
 ```json
 {
   "loom": "1.1",
-  "id": "loom://assistant.mesut@cowork-os.com",
+  "id": "loom://assistant.Almarion@cowork-os.com",
   "type": "agent",
-  "display_name": "Mesut's Assistant",
+  "display_name": "Almarion's Assistant",
   "node": "cowork-os.com",
-  "delegator": "loom://mesut@cowork-os.com",
+  "delegator": "loom://Almarion@cowork-os.com",
   "agent_info": { "provider": "anthropic", "model": "claude-opus-4", "version": "2026.02" },
   "delegation_scope": ["read.*", "reply.routine", "task.create", "calendar.*"],
   "delegation_expires": "2026-06-01T00:00:00Z",
@@ -300,38 +300,72 @@ Agent rules:
 
 ### 7.2 Canonical JSON Serialization
 
-For signature computation, envelopes are serialized to canonical JSON:
+For signature computation, envelopes are serialized to canonical JSON per RFC 8785 (JSON Canonicalization Scheme):
 - Keys sorted lexicographically at all nesting levels
 - No whitespace (no spaces or newlines)
 - UTF-8 encoding
-- Numbers without leading zeros or trailing decimal points
+- Number serialization MUST follow RFC 8785 Section 3.2.2.3: explicit handling of `-0` (serialized as `0`), integers (no decimal point), and exponent formatting for very large/small values
 - `null` values included (not omitted)
+- Lone surrogate code points MUST be rejected
 - The `signature` field and `meta` field are excluded from the canonical form
-- Any explicitly defined “ephemeral fields” MUST also be excluded (see attachments / URLs)
+- Any explicitly defined "ephemeral fields" MUST also be excluded (see attachments / URLs)
 
 ### 7.3 Envelope Signing (Required)
 
 Signing process:
 1. Serialize canonical envelope JSON excluding `signature` and `meta`
-2. Sign bytes with Ed25519 signing key referenced by `signature.key_id`
-3. Store signature value as base64url
+2. Prepend the domain-separation context prefix `LOOM-ENVELOPE-SIG-v1\0` to the canonical bytes
+3. Sign the prefixed bytes with Ed25519 signing key referenced by `signature.key_id`
+4. Store signature value as base64url
+5. Set `signature.context` to `"LOOM-ENVELOPE-SIG-v1"` to indicate context-prefixed signing
 
 Nodes MUST verify all inbound envelope signatures before delivery or storage.
 
+Verification:
+- If `signature.context` is present, verify using the indicated context prefix
+- If `signature.context` is absent (legacy envelopes), attempt context-prefixed verification first; if that fails, fall back to legacy (non-prefixed) verification during migration window
+- New implementations MUST always produce context-prefixed signatures
+
 ### 7.4 End-to-End Encryption (E2EE) (Optional per thread)
 
-LOOM defines E2EE profile `loom-e2ee-1` with membership-aware epochs (see Sections 10.6 and 11.7).
+LOOM defines E2EE profiles with membership-aware epochs (see Sections 10.6 and 11.7).
 
 Key rules:
 - Routing metadata remains in cleartext (`from`, `to`, `thread_id`, `type`) to permit delivery
 - Payload (`content`) and attachments MAY be encrypted end-to-end
 - Membership changes MUST increment epoch and rekey
 
+#### 7.4.1 E2EE Profile Security Properties
+
+Each E2EE profile declares its security properties to enable informed profile selection:
+
+| Profile | Status | Forward Secrecy | Post-Compromise Security | Confidentiality |
+|---|---|---|---|---|
+| `loom-e2ee-x25519-xchacha20-v1` | active | No | No | best_effort |
+| `loom-e2ee-x25519-xchacha20-v2` | active | No | No | best_effort |
+| `loom-e2ee-mls-1` | reserved | Yes | Yes | mls_grade |
+
+- **best_effort**: Per-epoch key wrapping without forward secrecy or post-compromise security. Suitable for stored-message confidentiality.
+- **mls_grade**: Full forward secrecy and post-compromise security via MLS (RFC 9420) TreeKEM ratcheting.
+
+#### 7.4.2 MLS Migration Path (Future)
+
+The `loom-e2ee-mls-1` profile is reserved for future implementation of MLS (RFC 9420) based encryption. When implemented, it will provide:
+
+- **TreeKEM key agreement** replacing per-recipient key wrapping
+- **Forward secrecy** through continuous key ratcheting
+- **Post-compromise security** via tree-based key update
+- **Group state management** through MLS Welcome/Commit messages mapped to LOOM epoch operations
+
+Implementations MUST NOT attempt to use the `loom-e2ee-mls-1` profile for encryption or decryption until it transitions from `reserved` to `active` status. The `resolveE2eeProfile()` function returns `null` for reserved profiles.
+
 ---
 
 ## 8. Envelope Specification
 
 ### 8.1 Envelope Schema (v1.1)
+
+An informational JSON Schema (draft 2020-12) is published alongside the reference implementation at `src/protocol/schemas/envelope-v1.1.schema.json`. In-code `validateEnvelopeShape` remains the authoritative validation path; the schema serves as a machine-readable reference for cross-language implementations.
 
 ```json
 {
@@ -346,7 +380,8 @@ Key rules:
     "display": "{name}",
     "key_id": "k_sign_{...}",
     "type": "human | agent | team | service | bridge",
-    "delegation_chain": [ "{delegation_link}", "..."] 
+    "device_id": "{string, 1-128 chars} | undefined",
+    "delegation_chain": [ "{delegation_link}", "..."]
   },
   "to": [
     { "identity": "loom://{local}@{domain} | bridge://{email}", "role": "primary | cc | observer | bcc" }
@@ -421,6 +456,7 @@ Key rules:
 | parent_id | SHOULD | `null` for thread roots |
 | type | MUST | Defined registry (Section 9) |
 | from | MUST | Sender identity + signing key reference |
+| from.device_id | MAY | Optional device identifier (1-128 chars) for multi-device replay tracking |
 | to | MUST | At least one `primary` recipient |
 | audience | MAY | Defaults to `thread` for native threads |
 | created_at | MUST | ISO 8601 |
@@ -496,7 +532,7 @@ A Thread is:
   "created_at": "2026-02-16T16:37:00Z",
   "updated_at": "2026-02-16T17:10:00Z",
   "participants": [
-    { "identity": "loom://mesut@cowork-os.com", "role": "owner", "joined_at": "2026-02-16T16:37:00Z", "left_at": null }
+    { "identity": "loom://Almarion@cowork-os.com", "role": "owner", "joined_at": "2026-02-16T16:37:00Z", "left_at": null }
   ],
   "labels": ["finance", "q1-2026"],
   "forks": [
@@ -548,6 +584,14 @@ Nodes MUST NOT infer participants from recipients alone (except during bootstrap
 If `thread.encryption.enabled=true`:
 - Any membership change MUST increment `thread.encryption.key_epoch`.
 - Nodes MUST emit an `encryption.epoch` operation to distribute secrets to current participants (Section 11.8).
+
+### 10.7 Thread Size Limits (Required)
+
+Nodes MUST enforce configurable thread size limits to prevent unbounded growth:
+- `max_envelopes_per_thread` (default 10000): maximum number of envelopes in a single thread. When the limit is reached, new envelopes MUST be rejected with `ENVELOPE_INVALID`.
+- `max_pending_parents` (default 500): maximum number of unresolved parent references in a thread. When exceeded, new envelopes with unresolved parents MUST be rejected with `ENVELOPE_INVALID`.
+- Setting a limit to `0` disables that limit.
+- Limits are configurable at the node level and MAY be overridden per-ingest via request context.
 
 ---
 
@@ -693,8 +737,25 @@ If `single_use=true`:
 - Node MUST mark token spent upon first successful use and broadcast:
   - `capability.spent@v1` (thread_op)
 
-### 12.6 Proof-of-possession hardening (Optional)
+### 12.6 Proof-of-Possession (PoP) Hardening (Optional)
+
 Nodes MAY require an actor-signed capability proof bound to the envelope id to mitigate stolen bearer token replay.
+
+When a capability token includes `cnf.key_id`, PoP verification is required for sensitive intents:
+- `delegation.revoked@v1`
+- `encryption.epoch@v1`
+- `encryption.rotate@v1`
+- `capability.revoked@v1`
+
+PoP proof construction:
+1. Build canonical JSON payload: `{ "capability_id": "<cap_id>", "envelope_id": "<env_id>", "timestamp": "<ISO 8601>" }`
+2. Prepend the domain-separation context prefix `LOOM-CAPABILITY-POP-v1\0` to the canonical payload bytes
+3. Sign with Ed25519 key matching `cnf.key_id`
+4. Include the signature as `pop_signature` in the capability token presentation
+
+PoP verification:
+- Node verifies the PoP signature against the public key identified by `cnf.key_id`
+- Node rejects with `CAPABILITY_DENIED` if PoP is missing or invalid for sensitive intents
 
 ---
 
@@ -706,8 +767,8 @@ Delegation chains prove agent authority and scope.
 
 ```json
 {
-  "delegator": "loom://mesut@cowork-os.com",
-  "delegate": "loom://assistant.mesut@cowork-os.com",
+  "delegator": "loom://Almarion@cowork-os.com",
+  "delegate": "loom://assistant.Almarion@cowork-os.com",
   "scope": ["read.*", "reply.routine", "task.create", "calendar.*"],
   "created_at": "2026-01-15T10:00:00Z",
   "expires_at": "2026-06-01T00:00:00Z",
@@ -733,13 +794,23 @@ Sub-delegations MUST be strict subsets of parent scope.
 When receiving an envelope from an agent, a node MUST:
 1. Verify envelope signature
 2. Extract `from.delegation_chain`
-3. Verify each link:
-   - signature valid
-   - not expired
+3. Verify chain length does not exceed `maxChainLength` (default 10; configurable)
+4. Verify root delegator is not an agent type identity (when `enforceRootDelegatorType` is enabled)
+5. Verify each link:
+   - `created_at` MUST be present and valid ISO-8601
+   - `created_at` MUST NOT be more than `maxCreatedAtFutureSkewMs` in the future (default 5 minutes)
+   - signature valid (using `LOOM-DELEGATION-SIG-v1\0` context prefix; legacy fallback during migration window)
+   - not expired (`expires_at` not in the past)
    - not revoked
    - scope is subset of previous link
-4. Verify envelope action is within leaf scope
-5. Reject on failure with `DELEGATION_INVALID`
+6. Verify envelope action is within leaf scope
+7. Reject on failure with `DELEGATION_INVALID`
+
+#### 13.3.1 Delegation Signature Context
+
+Delegation link signatures MUST use the domain-separation context prefix `LOOM-DELEGATION-SIG-v1\0` prepended to the canonical delegation payload before signing. The `signature_context` field SHOULD be set to `"LOOM-DELEGATION-SIG-v1"`.
+
+Verification follows the same migration-window fallback as envelope signatures (Section 7.3).
 
 ### 13.4 Revocation (Required)
 Delegation revocation MUST be recorded via thread_op or notification:
@@ -1245,7 +1316,7 @@ Legacy gateway MUST:
 | Envelope spoofing | Ed25519 signatures verified by nodes |
 | Agent impersonation | type enforcement + delegation chain verification |
 | MITM | TLS 1.3 mandatory; optional E2EE |
-| Replay | envelope dedupe by id; federation wrapper nonce+timestamp |
+| Replay | envelope dedupe by id; configurable replay counter per (sender identity, device_id, epoch) with strict-monotonic or sliding-window (64-entry) mode; federation wrapper nonce+timestamp |
 | Scope escalation | capability tokens + delegation scope enforcement |
 | Node compromise | E2EE protects payload confidentiality; key rotation limits blast radius |
 | Spam/abuse | rate limits + quarantine + policy allow/deny |
@@ -1512,6 +1583,17 @@ Agent     Node A         Node B       Sarah
 ---
 
 ## Changelog
+
+### 1.1.0-patch.1 — February 2026 (MVN v0.2.9)
+- Explicit RFC 8785 JCS number serialization reference (Section 7.2)
+- Domain-separated signature context prefix for envelopes (`LOOM-ENVELOPE-SIG-v1\0`) and delegations (`LOOM-DELEGATION-SIG-v1\0`) with legacy fallback migration window (Section 7.3, 13.3.1)
+- Optional `from.device_id` field for multi-device replay tracking (Section 8.1)
+- Informational JSON Schema (draft 2020-12) published for envelope validation (Section 8.1)
+- Thread size limits: `max_envelopes_per_thread` and `max_pending_parents` (Section 10.7)
+- Formalized Proof-of-Possession (PoP) hardening for capability tokens with `cnf.key_id` binding (Section 12.6)
+- Delegation chain tightening: `created_at` enforcement, clock-skew rejection, max chain depth, root delegator type binding (Section 13.3)
+- E2EE security property labels on all profiles; MLS reserved placeholder profile `loom-e2ee-mls-1` (Section 7.4.1, 7.4.2)
+- Configurable sliding-window replay protection as alternative to strict-monotonic mode (Section 23.1)
 
 ### 1.1.0 — February 2026
 - Added authoritative **thread operations** as `thread_op` envelopes

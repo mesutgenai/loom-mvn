@@ -7,7 +7,7 @@ This repository tracks **LOOM** (Linked Operations & Orchestrated Messaging).
 Clone and run locally:
 
 ```bash
-git clone https://github.com/mesutgenai/loom-mvn.git
+git clone https://github.com/Almariongenai/loom-mvn.git
 cd loom-mvn
 npm install
 npm start
@@ -112,8 +112,8 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 
 ## Current status
 
-- Current release tag is `v0.2.7` (see `CHANGELOG.md` for release-level change history).
-- Repository package version is `0.2.7` (`package.json`).
+- Current release tag is `v0.2.9` (see `CHANGELOG.md` for release-level change history).
+- Repository package version is `0.2.9` (`package.json`).
 - npm publication is intentionally disabled (`"private": true`), so versioning is tracked in git tags/changelog rather than npm registry releases.
 - Protocol design docs are available in:
   - `CHANGELOG.md`
@@ -170,17 +170,22 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
 ## MVN features implemented
 
 - Envelope shape validation (`loom: "1.1"`, ids, recipients, content checks)
-- RFC8785-style canonical JSON serialization (excludes `signature` and `meta`, deterministic member ordering, rejects unsupported/non-finite values)
-- Ed25519 envelope signing and verification
-- Thread DAG validation and canonical rendering order
+- RFC 8785 canonical JSON serialization (excludes `signature` and `meta`, deterministic member ordering, explicit JCS number serialization per RFC 8785 Section 3.2.2.3, rejects unsupported/non-finite values and lone surrogates)
+- Ed25519 envelope signing and verification with domain-separated signature context prefix (`LOOM-ENVELOPE-SIG-v1\0`); legacy non-prefixed verification accepted during migration window
+- Thread DAG validation and canonical rendering order with O(1) queue operations for large threads
+- Thread size limits enforced at ingest: configurable `max_envelopes_per_thread` (default 10000) and `max_pending_parents` (default 500), overridable per-ingest via context
 - Proof-of-key auth (`challenge` -> signed nonce -> bearer token)
 - Optional proof-of-key identity registration (`/v1/identity/challenge` + `registration_proof`)
 - Imported remote identities are stored in a read-only remote cache namespace with TTL-based expiry
 - Private-by-default mailbox reads: thread/envelope read endpoints require bearer auth unless explicit demo mode is enabled
-- Capability token hardening: one-time presentation secret, hashed-at-rest secret tracking, signed portable capability tokens, and `thread_op` authorization via portable payload token or legacy header presentation token
+- Capability token hardening: one-time presentation secret, hashed-at-rest secret tracking, signed portable capability tokens, `thread_op` authorization via portable payload token or legacy header presentation token, and optional Proof-of-Possession (PoP) via `cnf.key_id` binding with `LOOM-CAPABILITY-POP-v1\0` context-prefixed signature verification for sensitive intents
 - `thread_op` authorization with owner/capability enforcement
-- Agent delegation-chain verification with signature/scope/revocation checks
+- Agent delegation-chain verification with signature/scope/revocation checks, `created_at` enforcement, configurable max chain depth (default 10), root delegator type binding, and domain-separated delegation signature context (`LOOM-DELEGATION-SIG-v1\0`)
 - Optional disk persistence (`LOOM_DATA_DIR`) with hash-chained audit log
+- Envelope `from.device_id` support for multi-device replay tracking (1-128 character string, optional)
+- Configurable replay protection: `strict` mode (monotonic counter) or `sliding_window` mode (64-entry sliding window allowing out-of-order delivery); replay state keyed by `senderIdentity:deviceId`
+- E2EE profile security property labels (`forward_secrecy`, `post_compromise_security`, `confidentiality`) on all profiles; MLS placeholder profile (`loom-e2ee-mls-1`) reserved for future RFC 9420 implementation
+- Informational JSON Schema (draft 2020-12) published at `src/protocol/schemas/envelope-v1.1.schema.json`; in-code `validateEnvelopeShape` remains authoritative
 - Signed inbound federation verification with replay protection
 - Federation replay nonce persistence in node snapshots (prevents nonce replay after restart when persistence is enabled)
 - Federation node policies: `trusted`, `quarantine`, `deny`
@@ -291,7 +296,7 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
 From a fresh machine:
 
 ```bash
-git clone https://github.com/mesutgenai/loom-mvn.git
+git clone https://github.com/Almariongenai/loom-mvn.git
 cd loom-mvn
 npm install
 npm start
@@ -561,6 +566,10 @@ Optional persistence:
   - `LOOM_FEDERATION_REQUIRE_SIGNED_REMOTE_IDENTITY=true|false` (default `true`)
   - `LOOM_FEDERATION_REMOTE_IDENTITY_TIMEOUT_MS` (default `5000`)
   - `LOOM_FEDERATION_REMOTE_IDENTITY_MAX_RESPONSE_BYTES` (default `262144`)
+- Set `LOOM_REPLAY_MODE=strict|sliding_window` (default `sliding_window`) to control envelope replay protection mode.
+- Set thread size limits to control thread growth:
+  - `LOOM_THREAD_MAX_ENVELOPES_PER_THREAD` (default `10000`; set `0` to disable)
+  - `LOOM_THREAD_MAX_PENDING_PARENTS` (default `500`; set `0` to disable)
 - Set `LOOM_DEMO_PUBLIC_READS=true` only for non-production demos that need unauthenticated thread/envelope reads (default `false`).
 - Public service safety checks:
   - Set `LOOM_PUBLIC_SERVICE=true` when this node is internet-facing (including reverse-proxy deployments on loopback).
