@@ -7,7 +7,7 @@
 **Status:** Draft Specification  
 **Version:** 1.0.0  
 **Date:** February 2026  
-**Authors:** Mesut (CoWork-OS)  
+**Authors:** Almarion (CoWork-OS)  
 **License:** Open Specification — free to implement, extend, and build upon.
 
 ---
@@ -200,7 +200,7 @@ loom://{local}@{domain}[#{fragment}]
 | Part | Required | Description | Example |
 |------|----------|-------------|---------|
 | `loom://` | Yes | Scheme identifier | — |
-| `{local}` | Yes | Local part — user, agent, team, or service name | `mesut`, `assistant.mesut`, `billing` |
+| `{local}` | Yes | Local part — user, agent, team, or service name | `Almarion`, `assistant.Almarion`, `billing` |
 | `@` | Yes | Separator | — |
 | `{domain}` | Yes | Domain of the hosting LOOM node | `cowork-os.com`, `acme.corp` |
 | `#{fragment}` | No | Deep-link to a thread, envelope, or object | `#thr_01JMK8W`, `#invoice-q1` |
@@ -208,12 +208,12 @@ loom://{local}@{domain}[#{fragment}]
 **Address examples:**
 
 ```
-loom://mesut@cowork-os.com                    — Human identity
-loom://assistant.mesut@cowork-os.com          — Agent scoped to a human
-loom://research.assistant.mesut@cowork-os.com — Sub-agent (nested delegation)
+loom://Almarion@cowork-os.com                    — Human identity
+loom://assistant.Almarion@cowork-os.com          — Agent scoped to a human
+loom://research.assistant.Almarion@cowork-os.com — Sub-agent (nested delegation)
 loom://billing@acme.corp                      — Team/role address
 loom://ci-bot@acme.corp                       — Service identity
-loom://mesut@cowork-os.com#thr_01JMK8W        — Deep-link to a specific thread
+loom://Almarion@cowork-os.com#thr_01JMK8W        — Deep-link to a specific thread
 bridge://alice@gmail.com                      — Bridged email identity
 ```
 
@@ -232,9 +232,9 @@ Every LOOM identity resolves to an **Identity Document** — a JSON object publi
 ```json
 {
   "loom": "1.0",
-  "id": "loom://mesut@cowork-os.com",
+  "id": "loom://Almarion@cowork-os.com",
   "type": "human",
-  "display_name": "Mesut",
+  "display_name": "Almarion",
   "node": "cowork-os.com",
   "created_at": "2026-01-15T10:00:00Z",
   "public_keys": {
@@ -256,10 +256,10 @@ Every LOOM identity resolves to an **Identity Document** — a JSON object publi
   "delegations": [],
   "capabilities": ["send", "receive", "create_thread", "delegate"],
   "verified_bridges": {
-    "email": "mesut@cowork-os.com"
+    "email": "Almarion@cowork-os.com"
   },
   "metadata": {
-    "avatar_url": "https://cowork-os.com/avatars/mesut.png",
+    "avatar_url": "https://cowork-os.com/avatars/Almarion.png",
     "timezone": "Europe/Lisbon",
     "locale": "en"
   }
@@ -283,11 +283,11 @@ Agent identities carry additional required fields:
 ```json
 {
   "loom": "1.0",
-  "id": "loom://assistant.mesut@cowork-os.com",
+  "id": "loom://assistant.Almarion@cowork-os.com",
   "type": "agent",
-  "display_name": "Mesut's Assistant",
+  "display_name": "Almarion's Assistant",
   "node": "cowork-os.com",
-  "delegator": "loom://mesut@cowork-os.com",
+  "delegator": "loom://Almarion@cowork-os.com",
   "agent_info": {
     "model": "claude-opus-4",
     "provider": "anthropic",
@@ -852,7 +852,7 @@ A Thread is a **directed acyclic graph (DAG)** of envelopes, rooted at a single 
 Threads can be addressed directly using fragment identifiers:
 
 ```
-loom://mesut@cowork-os.com#thr_01JMKB7W8P
+loom://Almarion@cowork-os.com#thr_01JMKB7W8P
 ```
 
 This is a client-side convenience — the node resolves the identity and then looks up the thread in the local store.
@@ -921,21 +921,21 @@ Delegation is the mechanism by which humans authorize agents (and agents authori
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        DELEGATION CHAIN                                │
 │                                                                        │
-│   Human (Mesut)                                                        │
-│   loom://mesut@cowork-os.com                                          │
+│   Human (Almarion)                                                        │
+│   loom://Almarion@cowork-os.com                                          │
 │   scope: * (root authority)                                            │
 │        │                                                               │
 │        │  DELEGATES (signed)                                           │
 │        ▼                                                               │
-│   Agent (Mesut's Assistant)                                            │
-│   loom://assistant.mesut@cowork-os.com                                │
+│   Agent (Almarion's Assistant)                                            │
+│   loom://assistant.Almarion@cowork-os.com                                │
 │   scope: [read.*, reply.routine, task.create, calendar.*]             │
 │   expires: 2026-06-01                                                  │
 │        │                                                               │
 │        │  SUB-DELEGATES (signed, scope ⊂ parent)                      │
 │        ▼                                                               │
 │   Sub-Agent (Calendar Specialist)                                      │
-│   loom://cal.assistant.mesut@cowork-os.com                            │
+│   loom://cal.assistant.Almarion@cowork-os.com                            │
 │   scope: [calendar.schedule, calendar.read]                           │
 │   expires: 2026-02-28, single_use: false                              │
 │                                                                        │
@@ -946,8 +946,8 @@ Delegation is the mechanism by which humans authorize agents (and agents authori
 
 ```json
 {
-  "delegator": "loom://mesut@cowork-os.com",
-  "delegate": "loom://assistant.mesut@cowork-os.com",
+  "delegator": "loom://Almarion@cowork-os.com",
+  "delegate": "loom://assistant.Almarion@cowork-os.com",
   "scope": ["read.*", "reply.routine", "task.create", "calendar.*"],
   "created_at": "2026-01-15T10:00:00Z",
   "expires_at": "2026-06-01T00:00:00Z",
@@ -1003,8 +1003,8 @@ Delegation revocations are broadcast via a signed `delegation.revoked` event:
     "structured": {
       "intent": "delegation.revoked",
       "parameters": {
-        "delegator": "loom://mesut@cowork-os.com",
-        "delegate": "loom://assistant.mesut@cowork-os.com",
+        "delegator": "loom://Almarion@cowork-os.com",
+        "delegate": "loom://assistant.Almarion@cowork-os.com",
         "revoked_at": "2026-02-16T18:00:00Z",
         "reason": "Agent compromised"
       }
@@ -1066,7 +1066,7 @@ LOOM uses **cryptographic proof-of-key** for authentication (no passwords):
 ```json
 // POST /v1/auth/challenge
 {
-  "identity": "loom://mesut@cowork-os.com",
+  "identity": "loom://Almarion@cowork-os.com",
   "key_id": "k_sign_01JMK..."
 }
 
@@ -1078,7 +1078,7 @@ LOOM uses **cryptographic proof-of-key** for authentication (no passwords):
 
 // POST /v1/auth/token
 {
-  "identity": "loom://mesut@cowork-os.com",
+  "identity": "loom://Almarion@cowork-os.com",
   "key_id": "k_sign_01JMK...",
   "challenge": "base64url-random-nonce",
   "signature": "base64url-ed25519-signature"
@@ -1391,7 +1391,7 @@ After connection, the client sends a subscription message:
   "action": "subscribe",
   "channels": [
     { "type": "thread", "id": "thr_01JMKB7W..." },
-    { "type": "identity", "id": "loom://mesut@cowork-os.com" },
+    { "type": "identity", "id": "loom://Almarion@cowork-os.com" },
     { "type": "all_threads" }
   ]
 }
@@ -1443,7 +1443,7 @@ Identities MAY broadcast presence:
 {
   "action": "presence.update",
   "data": {
-    "identity": "loom://assistant.mesut@cowork-os.com",
+    "identity": "loom://assistant.Almarion@cowork-os.com",
     "status": "available | busy | away | offline",
     "response_time": "instant | minutes | hours | days",
     "capabilities_active": ["reply.routine", "task.triage", "calendar.read"],
@@ -1492,13 +1492,13 @@ When an agent sends an envelope, the `from` block MUST include:
 
 ```json
 "from": {
-  "identity": "loom://assistant.mesut@cowork-os.com",
-  "display": "Mesut's Assistant",
+  "identity": "loom://assistant.Almarion@cowork-os.com",
+  "display": "Almarion's Assistant",
   "key_id": "k_sign_agent_01JMK...",
   "type": "agent",
   "delegation_chain": [
     {
-      "delegator": "loom://mesut@cowork-os.com",
+      "delegator": "loom://Almarion@cowork-os.com",
       "scope": ["read.*", "reply.routine"],
       "signature": "sig_EdDSA_..."
     }
@@ -1644,7 +1644,7 @@ Workflows are multi-step processes defined as special envelopes:
           {
             "id": "step_3",
             "action": "notification",
-            "to": "loom://mesut@cowork-os.com",
+            "to": "loom://Almarion@cowork-os.com",
             "parameters": {
               "template": "expense_processed",
               "data": { "expense_id": "exp_892", "status": "paid" }
@@ -1653,7 +1653,7 @@ Workflows are multi-step processes defined as special envelopes:
           {
             "id": "step_abort",
             "action": "notification",
-            "to": "loom://mesut@cowork-os.com",
+            "to": "loom://Almarion@cowork-os.com",
             "parameters": {
               "template": "expense_rejected",
               "data": { "expense_id": "exp_892" }
@@ -1662,7 +1662,7 @@ Workflows are multi-step processes defined as special envelopes:
           {
             "id": "step_error_notify",
             "action": "notification",
-            "to": ["loom://mesut@cowork-os.com", "loom://finance-admin@acme.corp"],
+            "to": ["loom://Almarion@cowork-os.com", "loom://finance-admin@acme.corp"],
             "parameters": {
               "template": "payment_failed",
               "data": { "expense_id": "exp_892" }
@@ -1718,7 +1718,7 @@ Workflow steps support conditions:
 ┌─────────────────┐         ┌──────────────────────────┐         ┌─────────────────┐
 │   Email World    │         │      EMAIL BRIDGE         │         │   LOOM World    │
 │                  │         │                           │         │                 │
-│  alice@gmail.com │──SMTP──►│  ┌──────────────────┐   │         │ loom://mesut@   │
+│  alice@gmail.com │──SMTP──►│  ┌──────────────────┐   │         │ loom://Almarion@   │
 │                  │         │  │ Inbound Gateway   │───┼──LOOM──►│ cowork-os.com   │
 │                  │         │  │ • SMTP receiver    │   │         │                 │
 │                  │         │  │ • SPF/DKIM verify  │   │         │                 │
@@ -1921,7 +1921,7 @@ Every LOOM node maintains an immutable audit log of:
   "id": "audit_01JMK...",
   "timestamp": "2026-02-16T17:10:00Z",
   "event_type": "envelope.delivered",
-  "actor": "loom://mesut@cowork-os.com",
+  "actor": "loom://Almarion@cowork-os.com",
   "target": "env_01JMKB9X...",
   "details": {
     "thread_id": "thr_01JMKB7W...",
@@ -2148,7 +2148,7 @@ Alice (Human)          Node A              Bob (Human)
 #### C.2 Agent Sends on Behalf of Human (Federated)
 
 ```
-Agent (Mesut's)       Node A              Node B           Sarah (Human)
+Agent (Almarion's)       Node A              Node B           Sarah (Human)
      │                    │                    │                  │
      │── POST /v1/envelopes ──►│                    │                  │
      │   (signed + delegation  │                    │                  │
@@ -2156,7 +2156,7 @@ Agent (Mesut's)       Node A              Node B           Sarah (Human)
      │                    │── verify envelope   │                  │
      │                    │   signature          │                  │
      │                    │── verify delegation │                  │
-     │                    │   chain (Mesut→Agent)│                  │
+     │                    │   chain (Almarion→Agent)│                  │
      │                    │── check scope       │                  │
      │                    │                    │                  │
      │                    │── DNS lookup ──────►│                  │

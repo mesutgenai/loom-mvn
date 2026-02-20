@@ -1,4 +1,4 @@
-Evaluation of mesutgenai/loom-mvn as an Agent-
+Evaluation of Almariongenai/loom-mvn as an Agent-
 Oriented “Email Protocol” Replacement
 Executive summary
 Enabled connectors used: GitHub       1   (repository contents, including specs and source code)

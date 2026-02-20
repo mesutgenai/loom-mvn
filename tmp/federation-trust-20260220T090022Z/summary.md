@@ -14,5 +14,5 @@
 - Single batch revalidation cycle trigger
 - Freshness enforcement on signed federation delivery
 
-- Report JSON: `/Users/mesut/Desktop/email++/tmp/federation-trust-20260220T090022Z/report.json`
+- Report JSON: `/Users/Almarion/Desktop/email++/tmp/federation-trust-20260220T090022Z/report.json`
 - Failure: `Fresh trust epoch delivery failed (expected HTTP 202, got 400)`

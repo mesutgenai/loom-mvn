@@ -1,7 +1,7 @@
 {
   "generated_at": "2026-02-20T13:54:39.317Z",
   "input_mode": "decision_log_file",
-  "input_path": "/Users/mesut/Desktop/email++/tmp/content-filter-decisions-sample.jsonl",
+  "input_path": "/Users/Almarion/Desktop/email++/tmp/content-filter-decisions-sample.jsonl",
   "source_filter": "federation",
   "profile": "agent",
   "total_vectors": 4,

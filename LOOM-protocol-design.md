@@ -30,7 +30,7 @@ The name captures the core idea: a loom — an interconnected network where mess
 │  ┌───────────┐    ┌───────────┐    ┌───────────┐       │
 │  │  LOOM     │    │  LOOM     │    │  LOOM     │       │
 │  │  Node     │◄──►│  Node     │◄──►│  Node     │       │
-│  │ (mesut@)  │    │ (agent@)  │    │ (corp@)   │       │
+│  │ (Almarion@)  │    │ (agent@)  │    │ (corp@)   │       │
 │  └─────┬─────┘    └─────┬─────┘    └─────┬─────┘       │
 │        │                │                │              │
 │  ┌─────┴─────┐    ┌─────┴─────┐    ┌─────┴─────┐       │
@@ -63,8 +63,8 @@ The name captures the core idea: a loom — an interconnected network where mess
 LOOM uses **Universal Resource Identities (URIs)**:
 
 ```
-loom://mesut@cowork-os.com              — human identity
-loom://assistant.mesut@cowork-os.com    — agent scoped to a human
+loom://Almarion@cowork-os.com              — human identity
+loom://assistant.Almarion@cowork-os.com    — agent scoped to a human
 loom://billing@acme.corp                — role/team address
 loom://billing@acme.corp#invoice-q1     — deep-link to a specific thread/object
 ```
@@ -104,13 +104,13 @@ The **Envelope** replaces the email message. It's a structured container, not a 
   "parent_id": null,
   "type": "message",
   "from": {
-    "identity": "loom://mesut@cowork-os.com",
-    "display": "Mesut",
+    "identity": "loom://Almarion@cowork-os.com",
+    "display": "Almarion",
     "key_id": "k_01JMK..."
   },
   "to": [
     { "identity": "loom://billing@acme.corp", "role": "primary" },
-    { "identity": "loom://assistant.mesut@cowork-os.com", "role": "observer" }
+    { "identity": "loom://assistant.Almarion@cowork-os.com", "role": "observer" }
   ],
   "created_at": "2026-02-16T16:37:00Z",
   "content": {
@@ -151,9 +151,9 @@ A **Thread** is an ordered, branching graph of envelopes.
   "subject": "Q1 Invoice Request",
   "state": "active",
   "participants": [
-    { "identity": "loom://mesut@cowork-os.com", "role": "owner", "joined": "2026-02-16T16:37:00Z" },
+    { "identity": "loom://Almarion@cowork-os.com", "role": "owner", "joined": "2026-02-16T16:37:00Z" },
     { "identity": "loom://billing@acme.corp", "role": "participant", "joined": "2026-02-16T16:37:00Z" },
-    { "identity": "loom://assistant.mesut@cowork-os.com", "role": "observer", "joined": "2026-02-16T16:37:00Z" }
+    { "identity": "loom://assistant.Almarion@cowork-os.com", "role": "observer", "joined": "2026-02-16T16:37:00Z" }
   ],
   "labels": ["finance", "q1-2026"],
   "forks": [],
@@ -175,9 +175,9 @@ Every participant — human or agent — holds a **LOOM Identity**.
 
 ```json
 {
-  "id": "loom://mesut@cowork-os.com",
+  "id": "loom://Almarion@cowork-os.com",
   "type": "human",
-  "display_name": "Mesut",
+  "display_name": "Almarion",
   "node": "cowork-os.com",
   "public_keys": {
     "signing": "ed25519:pk_01JMK...",
@@ -185,7 +185,7 @@ Every participant — human or agent — holds a **LOOM Identity**.
   },
   "delegations": [
     {
-      "delegate": "loom://assistant.mesut@cowork-os.com",
+      "delegate": "loom://assistant.Almarion@cowork-os.com",
       "scope": ["read.*", "reply.routine", "task.create"],
       "expires": "2026-06-01T00:00:00Z",
       "revocable": true
@@ -193,7 +193,7 @@ Every participant — human or agent — holds a **LOOM Identity**.
   ],
   "capabilities": ["send", "receive", "create_thread", "delegate"],
   "verified_bridges": {
-    "email": "mesut@cowork-os.com"
+    "email": "Almarion@cowork-os.com"
   }
 }
 ```
@@ -228,7 +228,7 @@ Instead of email's all-or-nothing access, LOOM uses **capability tokens** — fi
   "token": "cap_01JMK...",
   "grants": ["reply", "add_participant"],
   "scope": "thr_01JMK8W...",
-  "issued_by": "loom://mesut@cowork-os.com",
+  "issued_by": "loom://Almarion@cowork-os.com",
   "issued_to": "loom://contractor@freelance.dev",
   "expires": "2026-03-01T00:00:00Z",
   "single_use": false
@@ -246,7 +246,7 @@ These are the features that make LOOM fundamentally different from email for the
 ### 4.1 Delegation Chains
 
 ```
-Human (Mesut) ──delegates──► Personal Agent ──sub-delegates──► Specialist Agent
+Human (Almarion) ──delegates──► Personal Agent ──sub-delegates──► Specialist Agent
      │                              │                               │
      │  scope: *                    │  scope: calendar.*            │  scope: calendar.schedule
      │                              │  expires: 30d                 │  expires: 1h, single_use
@@ -304,7 +304,7 @@ LOOM supports real-time presence (optional, via WebSocket):
 
 ```json
 {
-  "identity": "loom://assistant.mesut@cowork-os.com",
+  "identity": "loom://assistant.Almarion@cowork-os.com",
   "status": "available",
   "response_time": "instant",
   "capabilities_active": ["reply.routine", "task.triage", "calendar.read"],
@@ -336,7 +336,7 @@ Agents can chain envelopes into **workflows** — multi-step processes that exec
     },
     {
       "action": "notification",
-      "to": "loom://mesut@cowork-os.com",
+      "to": "loom://Almarion@cowork-os.com",
       "template": "payment_processed"
     }
   ]
@@ -368,7 +368,7 @@ LOOM doesn't require the world to switch overnight. The migration is **gradual a
 ┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
 │   Email World    │         │   Email Bridge     │         │   LOOM World    │
 │                  │         │                    │         │                 │
-│  alice@gmail.com │──SMTP──►│  Inbound Gateway   │──LOOM──►│ mesut@cowork-os │
+│  alice@gmail.com │──SMTP──►│  Inbound Gateway   │──LOOM──►│ Almarion@cowork-os │
 │                  │         │  - Parse headers    │         │                 │
 │                  │◄──SMTP──│  Outbound Gateway   │◄──LOOM──│                 │
 │                  │         │  - Render to HTML   │         │                 │
@@ -376,7 +376,7 @@ LOOM doesn't require the world to switch overnight. The migration is **gradual a
 ```
 
 **Inbound (Email → LOOM):**
-1. Email arrives at a LOOM node's bridge address (e.g., `mesut@cowork-os.com` via SMTP)
+1. Email arrives at a LOOM node's bridge address (e.g., `Almarion@cowork-os.com` via SMTP)
 2. Bridge extracts: sender, recipients, subject, body, attachments, headers
 3. Bridge creates a LOOM envelope with:
    - `from`: bridged identity (`bridge://alice@gmail.com`)
@@ -404,7 +404,7 @@ LOOM doesn't require the world to switch overnight. The migration is **gradual a
 
 ### 5.4 Compatibility Guarantees
 
-- **Every LOOM identity can have a verified email bridge** — so `loom://mesut@cowork-os.com` can still receive from and send to `alice@gmail.com`
+- **Every LOOM identity can have a verified email bridge** — so `loom://Almarion@cowork-os.com` can still receive from and send to `alice@gmail.com`
 - **Threads started via email bridge preserve full email threading** — `In-Reply-To` and `References` headers are mapped to `thread_id` and `parent_id`
 - **Attachments pass through unchanged** — MIME attachments become LOOM attachments and vice versa
 - **No data loss** — the bridge preserves original email headers in envelope metadata for compliance/legal holds
