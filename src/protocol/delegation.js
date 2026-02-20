@@ -1,7 +1,9 @@
 import { canonicalizeJson } from "./canonical.js";
 import { LoomError } from "./errors.js";
 import { isIdentity, isIsoDateTime } from "./ids.js";
-import { verifyUtf8MessageSignature } from "./crypto.js";
+import { verifyUtf8MessageSignature, signUtf8Message } from "./crypto.js";
+
+const DELEGATION_SIGNATURE_CONTEXT = "LOOM-DELEGATION-SIG-v1\0";
 
 const ENVELOPE_TYPE_ACTIONS = {
   message: "message.send@v1",
@@ -42,6 +44,19 @@ function normalizeStringArray(value, field) {
   }
 
   return normalized;
+}
+
+export function signDelegationLink(link, privateKeyPem, options = {}) {
+  const useContext = options.signatureContext !== null;
+  const context = useContext ? (options.signatureContext ?? DELEGATION_SIGNATURE_CONTEXT) : "";
+  const canonical = canonicalizeDelegationLink(link);
+  const message = context + canonical;
+  const signature = signUtf8Message(privateKeyPem, message);
+  return {
+    ...link,
+    signature,
+    ...(useContext ? { signature_context: "LOOM-DELEGATION-SIG-v1" } : {})
+  };
 }
 
 export function canonicalizeDelegationLink(link) {
@@ -236,9 +251,40 @@ export function verifyDelegationLinkOrThrow(link, options = {}) {
     }
   }
 
+  // Enforce created_at presence and clock skew
+  if (!link.created_at) {
+    throw new LoomError("DELEGATION_INVALID", "Delegation link must include created_at", 403, {
+      field: "created_at"
+    });
+  }
+
+  const createdAt = parseIsoTime(link.created_at);
+  if (createdAt == null) {
+    throw new LoomError("DELEGATION_INVALID", "Delegation created_at must be valid ISO-8601", 403, {
+      field: "created_at"
+    });
+  }
+
+  const maxFutureSkew = options.maxCreatedAtFutureSkewMs ?? 5 * 60 * 1000;
+  const now = options.now ?? Date.now();
+  if (createdAt > now + maxFutureSkew) {
+    throw new LoomError("DELEGATION_INVALID", "Delegation created_at is too far in the future", 403, {
+      field: "created_at",
+      created_at: link.created_at
+    });
+  }
+
   const { publicKeyPem } = resolveDelegatorSigningKey(link, resolveIdentity, resolvePublicKey);
   const canonical = canonicalizeDelegationLink(link);
-  const valid = verifyUtf8MessageSignature(publicKeyPem, canonical, link.signature);
+
+  // Try context-prefixed verification first
+  const contextMessage = DELEGATION_SIGNATURE_CONTEXT + canonical;
+  let valid = verifyUtf8MessageSignature(publicKeyPem, contextMessage, link.signature);
+
+  // Legacy fallback for delegation links signed without context prefix
+  if (!valid && !link.signature_context) {
+    valid = verifyUtf8MessageSignature(publicKeyPem, canonical, link.signature);
+  }
 
   if (!valid) {
     throw new LoomError("DELEGATION_INVALID", "Delegation signature verification failed", 403, {
@@ -261,6 +307,25 @@ export function verifyDelegationChainOrThrow(envelope, options = {}) {
     throw new LoomError("DELEGATION_INVALID", "Agent envelope requires non-empty delegation_chain", 403, {
       field: "from.delegation_chain"
     });
+  }
+
+  const maxChainLength = options.maxChainLength ?? 10;
+  if (chain.length > maxChainLength) {
+    throw new LoomError("DELEGATION_INVALID", "Delegation chain exceeds maximum allowed length", 403, {
+      chain_length: chain.length,
+      max_chain_length: maxChainLength
+    });
+  }
+
+  if (options.enforceRootDelegatorType !== false && resolveIdentity) {
+    const rootLink = chain[0];
+    const rootIdentity = resolveIdentity(rootLink.delegator);
+    if (rootIdentity?.type === "agent") {
+      throw new LoomError("DELEGATION_INVALID", "Delegation chain root delegator must not be an agent identity", 403, {
+        delegator: rootLink.delegator,
+        delegator_type: "agent"
+      });
+    }
   }
 
   for (let index = 0; index < chain.length; index += 1) {

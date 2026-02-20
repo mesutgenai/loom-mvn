@@ -1,0 +1,70 @@
+{
+  "description": "Delegation chain conformance vectors (negative cases)",
+  "version": 1,
+  "owner_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA4cnicE0ZzhaLMhnoOJA/SOwBbadnpP68ZeuPuY81JWQ=\n-----END PUBLIC KEY-----\n",
+  "owner_private_key_pem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEILB3ollTz0YetaCNaNr6ye5a4gvkvs2Lwe5eLpZDPPmZ\n-----END PRIVATE KEY-----\n",
+  "agent_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA1zBq80c6a/VKgXF6Q8c6Id5ZAuvgDPfEe27hbePMSC0=\n-----END PUBLIC KEY-----\n",
+  "agent_private_key_pem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIBqLJkh3s8zGS5S9dz+sIbR7Hh3r6A2HixCgG50hjFs1\n-----END PRIVATE KEY-----\n",
+  "valid_link": {
+    "delegator": "loom://owner@node.test",
+    "delegate": "loom://agent@node.test",
+    "scope": { "actions": ["send"] },
+    "created_at": "2025-01-15T12:00:00.000Z",
+    "expires_at": "2026-01-15T12:00:00.000Z",
+    "signature": "sjaMF81GuXvnpMV9namdcWUOpYBLIf6cd42FjGs6ytzy6lFTD0ULfe4KEq0tvxOumxuhGdBYsxkytY4yxQOlAQ",
+    "signature_context": "LOOM-DELEGATION-SIG-v1"
+  },
+  "vectors": [
+    {
+      "id": "missing-created-at",
+      "description": "Delegation link without created_at should be rejected",
+      "link": {
+        "delegator": "loom://owner@node.test",
+        "delegate": "loom://agent@node.test",
+        "scope": { "actions": ["send"] },
+        "expires_at": "2026-01-15T12:00:00.000Z",
+        "signature": "sjaMF81GuXvnpMV9namdcWUOpYBLIf6cd42FjGs6ytzy6lFTD0ULfe4KEq0tvxOumxuhGdBYsxkytY4yxQOlAQ",
+        "signature_context": "LOOM-DELEGATION-SIG-v1"
+      },
+      "expected_error": "DELEGATION_INVALID",
+      "expected_error_field": "created_at"
+    },
+    {
+      "id": "future-created-at",
+      "description": "Delegation link with created_at far in the future should be rejected",
+      "link": {
+        "delegator": "loom://owner@node.test",
+        "delegate": "loom://agent@node.test",
+        "scope": { "actions": ["send"] },
+        "created_at": "2099-01-15T12:00:00.000Z",
+        "expires_at": "2026-01-15T12:00:00.000Z",
+        "signature": "sjaMF81GuXvnpMV9namdcWUOpYBLIf6cd42FjGs6ytzy6lFTD0ULfe4KEq0tvxOumxuhGdBYsxkytY4yxQOlAQ",
+        "signature_context": "LOOM-DELEGATION-SIG-v1"
+      },
+      "expected_error": "DELEGATION_INVALID",
+      "expected_error_field": "created_at"
+    },
+    {
+      "id": "expired-link",
+      "description": "Delegation link with past expires_at should be rejected in chain verification",
+      "link": {
+        "delegator": "loom://owner@node.test",
+        "delegate": "loom://agent@node.test",
+        "scope": { "actions": ["send"] },
+        "created_at": "2025-01-15T12:00:00.000Z",
+        "expires_at": "2020-01-01T00:00:00.000Z",
+        "signature": "sjaMF81GuXvnpMV9namdcWUOpYBLIf6cd42FjGs6ytzy6lFTD0ULfe4KEq0tvxOumxuhGdBYsxkytY4yxQOlAQ",
+        "signature_context": "LOOM-DELEGATION-SIG-v1"
+      },
+      "expected_error": "DELEGATION_INVALID",
+      "expected_error_field": "expires_at"
+    },
+    {
+      "id": "chain-depth-exceeded",
+      "description": "Chain longer than maxChainLength should be rejected",
+      "max_chain_length": 1,
+      "expected_error": "DELEGATION_INVALID",
+      "expected_error_field": "chain_length"
+    }
+  ]
+}
