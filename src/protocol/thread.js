@@ -26,8 +26,8 @@ function compareQueueIds(idA, idB, byId, orphanSet) {
  * entire array on every insertion (O(log n) search + O(n) splice instead
  * of O(n log n) full sort).
  */
-function sortedInsert(arr, id, cmp) {
-  let lo = 0;
+function sortedInsert(arr, id, cmp, startFrom = 0) {
+  let lo = startFrom;
   let hi = arr.length;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
@@ -93,15 +93,17 @@ export function validateThreadDag(envelopes) {
   }
 
   let seen = 0;
-  while (queue.length > 0) {
-    const id = queue.shift();
+  let queueHead = 0;
+  while (queueHead < queue.length) {
+    const id = queue[queueHead];
+    queueHead += 1;
     seen += 1;
 
     for (const childId of childrenByParent.get(id)) {
       const nextDegree = indegree.get(childId) - 1;
       indegree.set(childId, nextDegree);
       if (nextDegree === 0) {
-        sortedInsert(queue, childId, cmp);
+        sortedInsert(queue, childId, cmp, queueHead);
       }
     }
   }
@@ -139,16 +141,18 @@ export function canonicalThreadOrder(envelopes) {
   }
 
   const ordered = [];
+  let orderHead = 0;
 
-  while (queue.length > 0) {
-    const id = queue.shift();
+  while (orderHead < queue.length) {
+    const id = queue[orderHead];
+    orderHead += 1;
     ordered.push(byId.get(id));
 
     for (const childId of childrenByParent.get(id)) {
       const nextDegree = indegree.get(childId) - 1;
       indegree.set(childId, nextDegree);
       if (nextDegree === 0) {
-        sortedInsert(queue, childId, cmp);
+        sortedInsert(queue, childId, cmp, orderHead);
       }
     }
   }
