@@ -41,6 +41,12 @@ function validateSender(from, errors) {
   if (from.type === "agent" && !Array.isArray(from.delegation_chain)) {
     pushError(errors, "from.delegation_chain", "required for agent senders");
   }
+
+  if (from.device_id !== undefined && from.device_id !== null) {
+    if (typeof from.device_id !== "string" || from.device_id.length < 1 || from.device_id.length > 128) {
+      pushError(errors, "from.device_id", "must be a string of 1-128 characters when present");
+    }
+  }
 }
 
 function validateRecipients(to, errors) {

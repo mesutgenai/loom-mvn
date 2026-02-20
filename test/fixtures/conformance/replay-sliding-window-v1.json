@@ -1,0 +1,96 @@
+{
+  "description": "Replay sliding window conformance vectors",
+  "version": 1,
+  "default_window_size": 64,
+  "vectors": [
+    {
+      "id": "sequential-delivery",
+      "description": "Sequential counter delivery should all be accepted",
+      "window_size": 8,
+      "operations": [
+        { "counter": 0, "expected_accepted": true },
+        { "counter": 1, "expected_accepted": true },
+        { "counter": 2, "expected_accepted": true },
+        { "counter": 3, "expected_accepted": true }
+      ]
+    },
+    {
+      "id": "out-of-order-within-window",
+      "description": "Out-of-order delivery within window should be accepted",
+      "window_size": 8,
+      "operations": [
+        { "counter": 0, "expected_accepted": true },
+        { "counter": 3, "expected_accepted": true },
+        { "counter": 1, "expected_accepted": true },
+        { "counter": 2, "expected_accepted": true }
+      ]
+    },
+    {
+      "id": "duplicate-rejected",
+      "description": "Duplicate counter should be rejected",
+      "window_size": 8,
+      "operations": [
+        { "counter": 0, "expected_accepted": true },
+        { "counter": 1, "expected_accepted": true },
+        { "counter": 1, "expected_accepted": false, "expected_reason": "duplicate_counter" }
+      ]
+    },
+    {
+      "id": "counter-too-old",
+      "description": "Counter below window floor should be rejected",
+      "window_size": 4,
+      "operations": [
+        { "counter": 0, "expected_accepted": true },
+        { "counter": 1, "expected_accepted": true },
+        { "counter": 2, "expected_accepted": true },
+        { "counter": 3, "expected_accepted": true },
+        { "counter": 4, "expected_accepted": true },
+        { "counter": 5, "expected_accepted": true },
+        { "counter": 6, "expected_accepted": true },
+        { "counter": 7, "expected_accepted": true },
+        { "counter": 8, "expected_accepted": true },
+        { "counter": 9, "expected_accepted": true },
+        { "counter": 5, "expected_accepted": false, "expected_reason": "counter_too_old" }
+      ]
+    },
+    {
+      "id": "large-gap-forward",
+      "description": "Large forward gap should be accepted and old counters should be rejected",
+      "window_size": 8,
+      "operations": [
+        { "counter": 0, "expected_accepted": true },
+        { "counter": 100, "expected_accepted": true },
+        { "counter": 5, "expected_accepted": false, "expected_reason": "counter_too_old" },
+        { "counter": 95, "expected_accepted": true }
+      ]
+    },
+    {
+      "id": "invalid-counter-negative",
+      "description": "Negative counter should be rejected",
+      "window_size": 8,
+      "check_only": true,
+      "operations": [
+        { "counter": -1, "expected_accepted": false, "expected_reason": "invalid_counter" }
+      ]
+    },
+    {
+      "id": "invalid-counter-non-integer",
+      "description": "Non-integer counter should be rejected",
+      "window_size": 8,
+      "check_only": true,
+      "operations": [
+        { "counter": 1.5, "expected_accepted": false, "expected_reason": "invalid_counter" }
+      ]
+    },
+    {
+      "id": "multi-device-isolation",
+      "description": "Different device IDs should have independent replay state",
+      "note": "This vector tests the replayStateKey function rather than the tracker itself",
+      "state_keys": [
+        { "identity": "loom://alice@node.test", "device_id": "device-1", "expected_key": "loom://alice@node.test:device-1" },
+        { "identity": "loom://alice@node.test", "device_id": "device-2", "expected_key": "loom://alice@node.test:device-2" },
+        { "identity": "loom://alice@node.test", "device_id": null, "expected_key": "loom://alice@node.test:default" }
+      ]
+    }
+  ]
+}
