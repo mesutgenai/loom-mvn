@@ -205,24 +205,26 @@ test("e2ee profiles: all profiles have security_properties", () => {
   }
 });
 
-test("e2ee profiles: MLS placeholder exists as reserved", () => {
+test("e2ee profiles: MLS profile is active with FS and PCS", () => {
   const allProfiles = listAllE2eeProfiles();
   const mls = allProfiles.find((p) => p.id === "loom-e2ee-mls-1");
-  assert.ok(mls, "MLS placeholder profile should exist");
-  assert.equal(mls.status, "reserved");
+  assert.ok(mls, "MLS profile should exist");
+  assert.equal(mls.status, "active");
   assert.equal(mls.security_properties.forward_secrecy, true);
   assert.equal(mls.security_properties.post_compromise_security, true);
   assert.equal(mls.security_properties.confidentiality, "mls_grade");
 });
 
-test("e2ee profiles: resolveE2eeProfile returns null for reserved profiles", () => {
+test("e2ee profiles: resolveE2eeProfile resolves active MLS profile", () => {
   const resolved = resolveE2eeProfile("loom-e2ee-mls-1");
-  assert.equal(resolved, null, "reserved profiles should not be resolvable");
+  assert.ok(resolved, "MLS profile should be resolvable");
+  assert.equal(resolved.id, "loom-e2ee-mls-1");
+  assert.equal(resolved.requires_mls_metadata, true);
 });
 
-test("e2ee profiles: listSupportedE2eeProfiles excludes reserved profiles", () => {
+test("e2ee profiles: listSupportedE2eeProfiles includes all active profiles", () => {
   const supported = listSupportedE2eeProfiles();
-  assert.ok(!supported.includes("loom-e2ee-mls-1"), "reserved profile should not appear in supported list");
+  assert.ok(supported.includes("loom-e2ee-mls-1"), "MLS profile should appear in supported list");
   assert.ok(supported.includes("loom-e2ee-x25519-xchacha20-v1"), "v1 should be in supported list");
   assert.ok(supported.includes("loom-e2ee-x25519-xchacha20-v2"), "v2 should be in supported list");
 });
