@@ -6,6 +6,156 @@ All notable changes to this project are documented in this file.
 
 No unreleased changes yet.
 
+## v0.3.0 - 2026-02-20
+
+Full LOOM v1.1 specification coverage: 24 new protocol modules, MCP
+client/server runtime, store integration for all protocol features,
+new HTTP endpoints, and 955 total passing tests.
+
+### New Protocol Modules
+
+All modules are standalone, framework-free, and return `{field, reason}[]`
+error arrays. Each module has full unit test coverage.
+
+- **intents.js**: Intent taxonomy validation against the v1.1 intent
+  registry (Section 5).
+- **receipts.js**: Delivery, read, and failure receipt envelope builders
+  with auto-reply suppression (Section 6.4).
+- **audit_log.js**: Hash-chained audit log entry creation and chain
+  verification (Section 7).
+- **retention.js**: Retention policy normalization, per-label expiry
+  resolution, and legal hold checks (Section 8).
+- **deletion.js**: Content-level erasure records and thread-level
+  crypto-shred builders (Section 9).
+- **discovery.js**: Well-known identity resolution helpers (Section 10).
+- **distribution.js**: Routing policy normalization, team recipient
+  expansion, and moderation checks (Section 11).
+- **autoresponder.js**: Auto-reply rule validation, loop prevention via
+  receipt suppression, and per-sender frequency limiting (Section 12).
+- **channel_rules.js**: Channel automation rule engine with label,
+  quarantine, and priority actions (Section 13).
+- **search.js**: Thread and envelope query filtering; metadata-only
+  search for E2EE threads (Section 16.6).
+- **import_export.js**: Portable mailbox export packaging and import
+  validation with thread/envelope preservation (Section 17).
+- **email_bridge.js**: Inbound and outbound email bridge parameter
+  validation (Section 18).
+- **legacy_gateway.js**: Legacy protocol gateway transform helpers
+  (Section 19).
+- **blob.js**: Blob initiation and chunk validation (Section 14).
+- **websocket.js**: Real-time event log creation, event emission,
+  subscription/ack message validation, and cursor-based retrieval
+  (Section 15).
+- **rate_limit.js**: RFC-compliant `RateLimit-Limit`,
+  `RateLimit-Remaining`, `RateLimit-Reset` header builders (Section 20).
+- **idempotency.js**: Idempotency key format and TTL validation
+  (Section 21).
+- **mcp.js**: MCP tool-use request/response envelope validation
+  (Section 22).
+- **mls.js**: MLS key package and welcome message validation with
+  cipher suite and credential type checks (Section 23).
+- **mls_codec.js**: TLS-style encoding/decoding primitives for MLS
+  wire format (Section 23).
+- **workflow.js**: Workflow orchestration state machine with execute,
+  step_complete, complete, and failed transitions (Section 24).
+- **agent_info.js**: Inference provider `agent_info` field validation
+  and normalization for agent-type identities (Section 25).
+- **loop_protection.js**: Agent loop detection helpers for chain depth
+  and cycle detection (Section 26).
+- **context_window.js**: Context window token budget tracking for agent
+  conversations (Section 27).
+
+### New Runtime Modules
+
+- **mcp_client.js**: MCP client handles tool-use request/response
+  lifecycle with the store, including service identity registration
+  and thread participant management.
+- **mcp_server.js**: MCP server provides tool discovery and execution
+  dispatch for agent-facing MCP endpoints.
+
+### Store Integration
+
+All 16 protocol modules wired into the store ingestion pipeline, identity
+lifecycle, and state management:
+
+- **Post-ingestion hooks**: Every ingested envelope triggers event
+  emission (`_emitEnvelopeEvent`), channel rule evaluation
+  (`_applyChannelRules`), and autoresponder processing
+  (`_processAutoresponder`).
+- **Receipts**: `generateDeliveryReceipt()`, `generateReadReceipt()`,
+  `generateFailureReceipt()` create signed system envelopes.
+- **Deletion**: `deleteEnvelopeContent()` with legal hold enforcement;
+  `cryptoShredThread()` for thread-level erasure.
+- **Retention**: `enforceRetentionPolicies()` collects and removes
+  expired envelopes per configured policies.
+- **Channel rules**: `setChannelRules()` configures rules;
+  `_applyChannelRules()` evaluates on ingestion (label, quarantine,
+  priority actions).
+- **Autoresponder**: `setAutoresponderRule()` configures per-identity
+  rules; `_processAutoresponder()` generates auto-replies with loop
+  prevention and frequency limiting.
+- **Distribution**: `setIdentityRoutingPolicy()` configures routing;
+  `resolveDistributionRecipients()` expands team recipients.
+- **Search**: `validateAndSearchEnvelopes()` with full query validation.
+- **Import/Export**: `exportMailbox()` and `importMailbox()` for
+  portable mailbox backup and restore.
+- **Events**: `_emitEnvelopeEvent()` appends to event log;
+  `getEventsSince()` supports cursor-based retrieval.
+- **Blob**: `validateBlobPayload()` augments existing `createBlob()`.
+- **Rate limits**: `buildRateLimitResponseHeaders()` generates RFC
+  headers.
+- **Identity**: `agent_info` support in `registerIdentity()` and
+  `updateIdentity()` for agent-type identities.
+- **Workflow**: Workflow state tracking on threads via `protocol_core.js`
+  (running → step_complete → complete/failed).
+- **State serialization**: `channel_rules`, `retention_policies`,
+  `autoresponder_rules`, `autoresponder_sent_history`, and `workflow`
+  state survive serialization/deserialization round-trips.
+- **System service identity**: `_ensureSystemServiceIdentity()`,
+  `_signSystemEnvelope()`, `_ensureServiceParticipant()` pattern for
+  system-generated envelopes (receipts, auto-replies).
+
+### New HTTP Endpoints
+
+- `GET /v1/events?cursor=...` — cursor-based real-time event retrieval
+- `GET /v1/export` — full mailbox export
+- `POST /v1/import` — mailbox import with validation
+- `POST /v1/admin/retention/enforce` — trigger retention policy
+  enforcement (admin token required)
+- `DELETE /v1/envelopes/{id}/content` — content-level envelope deletion
+  with legal hold enforcement
+
+### Server Enhancements
+
+- Rate limit headers (`RateLimit-Limit`, `RateLimit-Remaining`,
+  `RateLimit-Reset`) on 429 responses.
+- Search query validation with URL parameter type coercion (string
+  `limit` param converted to number).
+- Extended envelope type validation for `workflow`, `mcp_request`,
+  `mcp_response` types.
+
+### Protocol Changes
+
+- **constants.js**: New envelope types (`workflow`, `mcp_request`,
+  `mcp_response`), intent prefixes, and MLS-related constants.
+- **e2ee.js**: Security property labels and MLS group state tracking.
+- **envelope.js**: Extended validation for workflow and MCP envelope
+  types.
+
+### Tests
+
+- 344 new unit tests across 23 test files for all protocol modules.
+- 69 new integration tests across 4 files:
+  - `protocol_wiring_integration.test.js` (37 tests): receipts,
+    deletion, retention, channel rules, autoresponder, distribution,
+    search, import/export, events, state serialization, blob, rate
+    limit headers.
+  - `workflow_integration.test.js`: workflow state machine through store.
+  - `mls_integration.test.js`: MLS key packages through store.
+  - `mcp_client.test.js`: MCP client tool-use lifecycle.
+- Updated conformance fixture vectors for extended envelope types.
+- **Total: 955 tests, 0 failures.**
+
 ## v0.2.9 - 2026-02-20
 
 Release-readiness hardening based on deep research protocol assessment.

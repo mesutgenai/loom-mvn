@@ -112,8 +112,8 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 
 ## Current status
 
-- Current release tag is `v0.2.9` (see `CHANGELOG.md` for release-level change history).
-- Repository package version is `0.2.9` (`package.json`).
+- Current release tag is `v0.3.0` (see `CHANGELOG.md` for release-level change history).
+- Repository package version is `0.3.0` (`package.json`).
 - npm publication is intentionally disabled (`"private": true`), so versioning is tracked in git tags/changelog rather than npm registry releases.
 - Protocol design docs are available in:
   - `CHANGELOG.md`
@@ -185,6 +185,47 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
 - Envelope `from.device_id` support for multi-device replay tracking (1-128 character string, optional)
 - Configurable replay protection: `strict` mode (monotonic counter) or `sliding_window` mode (64-entry sliding window allowing out-of-order delivery); replay state keyed by `senderIdentity:deviceId`
 - E2EE profile security property labels (`forward_secrecy`, `post_compromise_security`, `confidentiality`) on all profiles; MLS placeholder profile (`loom-e2ee-mls-1`) reserved for future RFC 9420 implementation
+- Protocol module library covering all LOOM v1.1 specification sections:
+  - Intent taxonomy validation (`src/protocol/intents.js`) — validates intent strings against the v1.1 taxonomy
+  - Delivery/read/failure receipts (`src/protocol/receipts.js`) — system-generated receipt envelope builders
+  - Hash-chained audit log entries (`src/protocol/audit_log.js`) — audit entry creation and chain verification
+  - Retention policies (`src/protocol/retention.js`) — policy normalization, expiry resolution, legal hold checks
+  - Content deletion and crypto-shredding (`src/protocol/deletion.js`) — erasure records and shred builders
+  - Identity discovery (`src/protocol/discovery.js`) — well-known identity resolution helpers
+  - Distribution and routing policies (`src/protocol/distribution.js`) — team expansion, moderation checks
+  - Autoresponder rules (`src/protocol/autoresponder.js`) — auto-reply generation with loop prevention and frequency limiting
+  - Channel automation rules (`src/protocol/channel_rules.js`) — label/quarantine/priority rule evaluation engine
+  - Search filtering (`src/protocol/search.js`) — thread and envelope query matching (metadata-only for E2EE)
+  - Mailbox import/export (`src/protocol/import_export.js`) — portable mailbox packaging and validation
+  - Email bridge validation (`src/protocol/email_bridge.js`) — inbound/outbound bridge parameter validation
+  - Legacy gateway transforms (`src/protocol/legacy_gateway.js`) — protocol translation for legacy systems
+  - Blob validation (`src/protocol/blob.js`) — blob initiation and chunk validation
+  - Real-time event log (`src/protocol/websocket.js`) — event emission, subscription messages, cursor-based retrieval
+  - Rate limit headers (`src/protocol/rate_limit.js`) — RFC-compliant `RateLimit-*` header builders
+  - Idempotency key validation (`src/protocol/idempotency.js`) — key format and TTL validation
+  - MCP tool-use envelopes (`src/protocol/mcp.js`) — MCP request/response envelope validation
+  - MLS key packages (`src/protocol/mls.js`) — MLS key package and welcome message validation
+  - MLS TLS codec (`src/protocol/mls_codec.js`) — TLS-style encoding/decoding primitives
+  - Workflow orchestration (`src/protocol/workflow.js`) — workflow state machine (execute → step_complete → complete/failed)
+  - Inference provider identity (`src/protocol/agent_info.js`) — agent_info field validation and normalization
+  - Agent loop detection (`src/protocol/loop_protection.js`) — loop detection helpers for agent chains
+  - Context window tracking (`src/protocol/context_window.js`) — token budget tracking for agent conversations
+- MCP client and server runtime modules (`src/node/mcp_client.js`, `src/node/mcp_server.js`) — tool-use request/response lifecycle with service identity management
+- Store-integrated protocol features (all wired into the ingestion pipeline and state management):
+  - Post-ingestion event emission for real-time event streams
+  - Channel rules evaluation on every ingested envelope (label, quarantine, priority actions)
+  - Autoresponder processing with loop prevention and per-sender frequency limiting
+  - Workflow state tracking on threads (running → step_complete → complete/failed)
+  - System-generated receipts (delivery, read, failure) with signed service identity
+  - Content-level envelope deletion with legal hold enforcement
+  - Thread-level crypto-shredding
+  - Retention policy enforcement with legal hold awareness
+  - Distribution routing policies and team recipient expansion
+  - Validated search with URL parameter type coercion
+  - Full mailbox export/import with thread and envelope preservation
+  - Agent identity `agent_info` fields (provider, model, version, capabilities)
+  - Cursor-based event log retrieval
+  - Rate limit response headers on 429 errors
 - Informational JSON Schema (draft 2020-12) published at `src/protocol/schemas/envelope-v1.1.schema.json`; in-code `validateEnvelopeShape` remains authoritative
 - Signed inbound federation verification with replay protection
 - Federation replay nonce persistence in node snapshots (prevents nonce replay after restart when persistence is enabled)
@@ -230,7 +271,12 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - `GET /v1/threads`
   - `GET /v1/threads/{id}` (authenticated)
   - `GET /v1/threads/{id}/envelopes` (authenticated)
-  - `GET /v1/search?q=...&type=...&intent=...`
+  - `GET /v1/search?q=...&type=...&intent=...` (validated search with type coercion)
+  - `GET /v1/events?cursor=...` (cursor-based real-time event retrieval)
+  - `GET /v1/export` (full mailbox export)
+  - `POST /v1/import` (mailbox import with validation)
+  - `DELETE /v1/envelopes/{id}/content` (content-level envelope deletion with legal hold enforcement)
+  - `POST /v1/admin/retention/enforce` (admin token required; trigger retention policy enforcement)
   - `GET /v1/audit?limit=...`
   - `POST /v1/bridge/email/inbound`
   - `POST /v1/bridge/email/outbound`
