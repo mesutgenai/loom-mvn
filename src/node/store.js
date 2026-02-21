@@ -42,7 +42,46 @@ import {
   parseLoomIdentityAuthority,
   parseTrustAnchorBindings
 } from "../protocol/trust.js";
+import { deserializeMlsGroupState } from "../protocol/mls_codec.js";
+import { validateAgentInfo, normalizeAgentInfo } from "../protocol/agent_info.js";
+import { buildDeliveryReceipt, buildReadReceipt, buildFailureReceipt, shouldSuppressAutoReply } from "../protocol/receipts.js";
+import {
+  DEFAULT_RETENTION_POLICIES,
+  normalizeRetentionPolicies,
+  resolveRetentionDays,
+  isExpiredByRetention,
+  isLegalHoldActive,
+  collectExpiredEnvelopes
+} from "../protocol/retention.js";
+import { canDeleteEnvelope, eraseEnvelopeContent, buildCryptoShredRecord } from "../protocol/deletion.js";
+import { normalizeChannelRules, evaluateRules, applyRuleActions } from "../protocol/channel_rules.js";
+import {
+  validateAutoresponderRule,
+  isAutoresponderActive,
+  shouldAutoRespond,
+  buildAutoReplyEnvelope
+} from "../protocol/autoresponder.js";
+import { normalizeRoutingPolicy, resolveTeamRecipients, requiresModeration } from "../protocol/distribution.js";
+import { validateSearchQuery } from "../protocol/search.js";
+import {
+  validateImportPayload,
+  buildExportPackage,
+  prepareImportEnvelopes,
+  prepareImportThreads,
+  IMPORT_LABEL
+} from "../protocol/import_export.js";
+import { validateBlobInitiation } from "../protocol/blob.js";
+import {
+  createEventLog,
+  appendEvent,
+  getEventsSince,
+  pruneEventLog,
+  WS_EVENT_TYPES
+} from "../protocol/websocket.js";
+import { buildRateLimitHeaders } from "../protocol/rate_limit.js";
 import { parseBoolean } from "./env.js";
+import { processMcpToolRequest, isMcpToolRequestEnvelope } from "./mcp_client.js";
+import { createMcpToolRegistry } from "./mcp_server.js";
 import {
   enforceThreadEnvelopeEncryptionPolicyCore,
   getThreadEnvelopesCore,
@@ -120,7 +159,8 @@ const DEFAULT_BRIDGE_INBOUND_HEADER_ALLOWLIST = [
 
 const E2EE_PROFILE_SECURITY_RANK = new Map([
   ["loom-e2ee-x25519-xchacha20-v1", 100],
-  ["loom-e2ee-x25519-xchacha20-v2", 200]
+  ["loom-e2ee-x25519-xchacha20-v2", 200],
+  ["loom-e2ee-mls-1", 300]
 ]);
 
 const CONTENT_FILTER_URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
@@ -1637,7 +1677,8 @@ function buildIdentityRegistrationDocument({
   type = "human",
   displayName = null,
   signingKeys = [],
-  encryptionKeys = []
+  encryptionKeys = [],
+  agentInfo = null
 }) {
   const document = {
     loom: "1.1",
@@ -1650,6 +1691,10 @@ function buildIdentityRegistrationDocument({
   const normalizedEncryptionKeys = normalizeIdentityEncryptionKeys(encryptionKeys);
   if (normalizedEncryptionKeys.length > 0) {
     document.encryption_keys = normalizedEncryptionKeys;
+  }
+
+  if (agentInfo && typeof agentInfo === "object" && String(type || "human") === "agent") {
+    document.agent_info = agentInfo;
   }
 
   return document;
@@ -1685,7 +1730,10 @@ function toThreadSummary(thread) {
     cap_epoch: thread.cap_epoch,
     encryption: thread.encryption,
     pending_parent_count: pendingParentCount,
-    has_pending_parents: pendingParentCount > 0
+    has_pending_parents: pendingParentCount > 0,
+    snapshot: thread.snapshot || null,
+    context_budgets: thread.context_budgets || null,
+    workflow: thread.workflow || null
   };
 }
 
@@ -2173,6 +2221,14 @@ export class LoomStore {
       max_envelopes_per_thread: Math.max(0, parseNonNegativeInteger(options.threadMaxEnvelopesPerThread, 10000)),
       max_pending_parents: Math.max(0, parseNonNegativeInteger(options.threadMaxPendingParents, 500))
     };
+    this.loopProtection = {
+      max_hop_count: Math.max(1, Math.min(parsePositiveInteger(options.loopMaxHopCount, 20), 255)),
+      max_agent_envelopes_per_thread_window: Math.max(1, parsePositiveInteger(options.loopAgentWindowMax, 50)),
+      agent_window_ms: Math.max(1000, parsePositiveInteger(options.loopAgentWindowMs, 60000))
+    };
+    this.mcpClientEnabled = options.mcpClientEnabled !== false;
+    this.mcpToolRegistry = null;
+    this._mcpServiceKeys = null;
     this.identityEnvelopeUsageByDay = new Map();
     this.identityBlobUsageByDay = new Map();
     this.identityBlobTotalBytes = new Map();
@@ -2260,6 +2316,17 @@ export class LoomStore {
     this.inboundContentFilterConfigUpdatedBy = "system";
     this.inboundContentFilterConfigCanary = null;
     this.inboundContentFilterConfigRollback = null;
+
+    // ── Protocol module configuration ──────────────────────────────────────
+    this.retentionPolicies = normalizeRetentionPolicies(
+      Array.isArray(options.retentionPolicies) ? options.retentionPolicies : DEFAULT_RETENTION_POLICIES
+    );
+    this.channelRules = normalizeChannelRules(options.channelRules || []);
+    this.autoresponderRules = new Map(); // keyed by identity URI
+    this.autoresponderSentHistory = new Map(); // keyed by identity URI → Map(sender → timestamp)
+    this.eventLog = createEventLog(
+      Math.max(60000, parsePositiveInteger(options.eventLogRetentionMs, 7 * 24 * 60 * 60 * 1000))
+    );
 
     this.initializeSystemSigningKeys();
 
@@ -2907,6 +2974,23 @@ export class LoomStore {
 
     this.identities = new Map(localIdentityEntries.map((item) => [item.id, item]));
     this.remoteIdentities = new Map(remoteIdentityEntries.map((item) => [item.id, item]));
+
+    // Normalize agent_info on all identities
+    for (const identity of this.identities.values()) {
+      if (identity.agent_info !== undefined && identity.agent_info !== null) {
+        identity.agent_info = normalizeAgentInfo(identity.agent_info);
+      } else {
+        identity.agent_info = null;
+      }
+    }
+    for (const identity of this.remoteIdentities.values()) {
+      if (identity.agent_info !== undefined && identity.agent_info !== null) {
+        identity.agent_info = normalizeAgentInfo(identity.agent_info);
+      } else {
+        identity.agent_info = null;
+      }
+    }
+
     this.rebuildIdentityKeyIndexes();
 
     for (const [identityUri, identityDoc] of this.remoteIdentities.entries()) {
@@ -2919,6 +3003,24 @@ export class LoomStore {
     for (const thread of this.threadsById.values()) {
       if (!thread.mailbox_state || typeof thread.mailbox_state !== "object") {
         thread.mailbox_state = {};
+      }
+      if (thread.snapshot && typeof thread.snapshot !== "object") {
+        thread.snapshot = null;
+      }
+      if (thread.context_budgets && typeof thread.context_budgets !== "object") {
+        thread.context_budgets = {};
+      }
+      if (thread.encryption && typeof thread.encryption === "object") {
+        if (thread.encryption.mls_state && typeof thread.encryption.mls_state === "object") {
+          thread.encryption.mls_state = deserializeMlsGroupState(thread.encryption.mls_state);
+        } else {
+          thread.encryption.mls_state = null;
+        }
+      }
+      if (thread.workflow !== undefined && thread.workflow !== null) {
+        if (typeof thread.workflow !== "object" || Array.isArray(thread.workflow)) {
+          thread.workflow = null;
+        }
       }
       if (Number.isFinite(Number(thread.pending_parent_count))) {
         thread.pending_parent_count = Math.max(0, Number(thread.pending_parent_count || 0));
@@ -3140,6 +3242,36 @@ export class LoomStore {
     );
     this.cleanupFederationNonces();
     this.rebuildIdentityQuotaIndexes();
+
+    // ── Protocol module state restoration ────────────────────────────────
+    if (Array.isArray(state.channel_rules)) {
+      this.channelRules = normalizeChannelRules(state.channel_rules);
+    }
+    if (Array.isArray(state.retention_policies)) {
+      this.retentionPolicies = normalizeRetentionPolicies(state.retention_policies);
+    }
+    if (Array.isArray(state.autoresponder_rules)) {
+      this.autoresponderRules = new Map();
+      for (const entry of state.autoresponder_rules) {
+        if (entry?.identity && entry?.rule) {
+          this.autoresponderRules.set(entry.identity, entry.rule);
+        }
+      }
+    }
+    if (Array.isArray(state.autoresponder_sent_history)) {
+      this.autoresponderSentHistory = new Map();
+      for (const entry of state.autoresponder_sent_history) {
+        if (entry?.identity && Array.isArray(entry.history)) {
+          const history = new Map();
+          for (const h of entry.history) {
+            if (h?.sender && h?.timestamp) {
+              history.set(h.sender, h.timestamp);
+            }
+          }
+          this.autoresponderSentHistory.set(entry.identity, history);
+        }
+      }
+    }
   }
 
   buildAuditHashInput(entry) {
@@ -3415,7 +3547,14 @@ export class LoomStore {
       webhooks: Array.from(this.webhooksById.values()),
       webhook_outbox: Array.from(this.webhookOutboxById.values()),
       email_message_index: Array.from(this.emailMessageIndexById.values()),
-      federation_nonces: Array.from(this.federationNonceCache.entries())
+      federation_nonces: Array.from(this.federationNonceCache.entries()),
+      channel_rules: this.channelRules,
+      retention_policies: this.retentionPolicies,
+      autoresponder_rules: Array.from(this.autoresponderRules.entries()).map(([k, v]) => ({ identity: k, rule: v })),
+      autoresponder_sent_history: Array.from(this.autoresponderSentHistory.entries()).map(([k, v]) => ({
+        identity: k,
+        history: Array.from(v.entries()).map(([sender, ts]) => ({ sender, timestamp: ts }))
+      }))
     };
   }
 
@@ -9718,7 +9857,19 @@ export class LoomStore {
       strict: true
     });
 
-    const envelopes = canonicalThreadOrder(thread.envelope_ids.map((id) => this.envelopesById.get(id)));
+    let envelopeIds = thread.envelope_ids;
+
+    if (options.after_snapshot && thread.snapshot) {
+      const cutoffIndex = thread.snapshot.cutoff_index;
+      const snapshotEnvelopeId = thread.snapshot.envelope_id;
+      const postCutoffIds = envelopeIds.slice(cutoffIndex + 1);
+      if (!postCutoffIds.includes(snapshotEnvelopeId)) {
+        postCutoffIds.unshift(snapshotEnvelopeId);
+      }
+      envelopeIds = postCutoffIds;
+    }
+
+    const envelopes = canonicalThreadOrder(envelopeIds.map((id) => this.envelopesById.get(id)));
     const allowThreadReadCapability = Boolean(readToken);
     return envelopes.map((envelope) =>
       this.buildEnvelopeRecipientView(envelope, normalizedActor, {
@@ -10758,7 +10909,8 @@ export class LoomStore {
       type: identityDoc.type || "human",
       displayName: identityDoc.display_name || normalizedIdentity,
       signingKeys: normalizedSigningKeys,
-      encryptionKeys: normalizedEncryptionKeys
+      encryptionKeys: normalizedEncryptionKeys,
+      agentInfo: identityDoc.agent_info || null
     });
     const documentHash = hashIdentityRegistrationDocument(registrationDocument);
     const message = buildIdentityRegistrationProofMessage({
@@ -10990,12 +11142,33 @@ export class LoomStore {
         : new Date(nowMs() + this.remoteIdentityTtlMs).toISOString()
       : null;
 
+    // agent_info — only for agent-type identities
+    let normalizedAgentInfo = null;
+    const identityType = String(identityDoc.type || "human");
+    if (identityDoc.agent_info !== undefined && identityDoc.agent_info !== null) {
+      if (identityType !== "agent") {
+        throw new LoomError("ENVELOPE_INVALID", "agent_info is only allowed for agent-type identities", 400, {
+          field: "agent_info",
+          identity_type: identityType
+        });
+      }
+      const agentInfoErrors = validateAgentInfo(identityDoc.agent_info);
+      if (agentInfoErrors.length > 0) {
+        throw new LoomError("ENVELOPE_INVALID", `Invalid agent_info: ${agentInfoErrors.map((e) => `${e.field}: ${e.reason}`).join("; ")}`, 400, {
+          field: "agent_info",
+          validation_errors: agentInfoErrors
+        });
+      }
+      normalizedAgentInfo = normalizeAgentInfo(identityDoc.agent_info);
+    }
+
     const stored = {
       id: normalizedIdentity,
       type: identityDoc.type || "human",
       display_name: identityDoc.display_name || normalizedIdentity,
       signing_keys: normalizedSigningKeys,
       encryption_keys: normalizedEncryptionKeys,
+      agent_info: normalizedAgentInfo,
       created_at: existingIdentity?.created_at || identityDoc.created_at || nowIso(),
       updated_at: nowIso(),
       identity_source: options.importedRemote === true ? "remote" : "local",
@@ -11222,11 +11395,36 @@ export class LoomStore {
       nextEncryptionKeys = normalizedEncryptionKeys;
     }
 
+    // agent_info update — only for agent-type identities
+    let nextAgentInfo = identity.agent_info || null;
+    if (Object.prototype.hasOwnProperty.call(payload, "agent_info")) {
+      if (payload.agent_info === null) {
+        nextAgentInfo = null;
+      } else {
+        const identityType = String(identity.type || "human");
+        if (identityType !== "agent") {
+          throw new LoomError("ENVELOPE_INVALID", "agent_info is only allowed for agent-type identities", 400, {
+            field: "agent_info",
+            identity_type: identityType
+          });
+        }
+        const agentInfoErrors = validateAgentInfo(payload.agent_info);
+        if (agentInfoErrors.length > 0) {
+          throw new LoomError("ENVELOPE_INVALID", `Invalid agent_info: ${agentInfoErrors.map((e) => `${e.field}: ${e.reason}`).join("; ")}`, 400, {
+            field: "agent_info",
+            validation_errors: agentInfoErrors
+          });
+        }
+        nextAgentInfo = normalizeAgentInfo(payload.agent_info);
+      }
+    }
+
     const updated = {
       ...identity,
       display_name: nextDisplayName,
       signing_keys: nextSigningKeys,
       encryption_keys: nextEncryptionKeys,
+      agent_info: nextAgentInfo,
       updated_at: nowIso(),
       identity_source: "local",
       imported_remote: false,
@@ -11460,7 +11658,8 @@ export class LoomStore {
       type: identityDocument?.type || "human",
       displayName: identityDocument?.display_name || identityDocument?.id,
       signingKeys: Array.isArray(identityDocument?.signing_keys) ? identityDocument.signing_keys : [],
-      encryptionKeys: resolveIdentityEncryptionKeysInput(identityDocument)
+      encryptionKeys: resolveIdentityEncryptionKeysInput(identityDocument),
+      agentInfo: identityDocument?.agent_info || null
     });
     const canonicalPayload = canonicalizeJson(canonicalIdentity);
     const valid = verifyUtf8MessageSignature(signingKey.public_key_pem, canonicalPayload, value);
@@ -11858,6 +12057,17 @@ export class LoomStore {
       throw new LoomError("ENVELOPE_INVALID", "Blob payload must be an object", 400, {
         field: "blob"
       });
+    }
+
+    // Protocol-level validation (non-fatal: store handles required fields)
+    if (payload.size_bytes && payload.filename && payload.mime_type) {
+      const blobErrors = validateBlobInitiation(payload);
+      if (blobErrors.length > 0) {
+        throw new LoomError("ENVELOPE_INVALID", blobErrors[0].reason, 400, {
+          field: blobErrors[0].field,
+          errors: blobErrors
+        });
+      }
     }
 
     const threadId = payload.thread_id || null;
@@ -12837,11 +13047,99 @@ export class LoomStore {
   }
 
   ingestEnvelope(envelope, context = {}) {
-    return ingestEnvelopeCore.call(this, envelope, {
+    const storedEnvelope = ingestEnvelopeCore.call(this, envelope, {
       ...context,
       replayMode: context.replayMode || this.replayMode,
-      threadLimits: context.threadLimits || this.threadLimits
+      threadLimits: context.threadLimits || this.threadLimits,
+      loopProtection: context.loopProtection || this.loopProtection
     });
+
+    if (this.mcpClientEnabled && !context._mcpClientResponse) {
+      this._processIngestedMcpToolRequest(storedEnvelope);
+    }
+
+    // ── Post-ingestion: event log ──────────────────────────────────────────
+    this._emitEnvelopeEvent(storedEnvelope);
+
+    // ── Post-ingestion: channel rules ──────────────────────────────────────
+    this._applyChannelRules(storedEnvelope);
+
+    // ── Post-ingestion: autoresponder ──────────────────────────────────────
+    if (!context._autoReply) {
+      this._processAutoresponder(storedEnvelope);
+    }
+
+    return storedEnvelope;
+  }
+
+  ensureMcpServiceIdentity() {
+    if (this._mcpServiceKeys) {
+      return this._mcpServiceKeys;
+    }
+    const keys = generateSigningKeyPair();
+    const serviceIdentity = `loom://mcp-service@${this.nodeId}`;
+    const serviceKeyId = "k_sign_mcp_service_1";
+
+    if (!this.identities.has(serviceIdentity) && !this.remoteIdentities.has(serviceIdentity)) {
+      this.registerIdentity({
+        id: serviceIdentity,
+        display_name: "MCP Service",
+        type: "service",
+        signing_keys: [{ key_id: serviceKeyId, public_key_pem: keys.publicKeyPem }]
+      });
+    }
+
+    this._mcpServiceKeys = {
+      serviceIdentity,
+      serviceKeyId,
+      privateKeyPem: keys.privateKeyPem,
+      publicKeyPem: keys.publicKeyPem
+    };
+    return this._mcpServiceKeys;
+  }
+
+  getMcpToolRegistry() {
+    if (!this.mcpToolRegistry) {
+      this.mcpToolRegistry = createMcpToolRegistry(this);
+    }
+    return this.mcpToolRegistry;
+  }
+
+  _processIngestedMcpToolRequest(storedEnvelope) {
+    if (!isMcpToolRequestEnvelope(storedEnvelope)) {
+      return null;
+    }
+
+    try {
+      const serviceKeys = this.ensureMcpServiceIdentity();
+      const result = processMcpToolRequest(this, storedEnvelope, {
+        mcpToolRegistry: this.getMcpToolRegistry(),
+        serviceIdentity: serviceKeys.serviceIdentity,
+        serviceKeyId: serviceKeys.serviceKeyId,
+        servicePrivateKeyPem: serviceKeys.privateKeyPem
+      });
+
+      if (result.processed) {
+        this.persistAndAudit("mcp.client.tool_executed", {
+          request_envelope_id: storedEnvelope.id,
+          response_envelope_id: result.response_envelope_id,
+          thread_id: storedEnvelope.thread_id,
+          tool_name: storedEnvelope.content?.structured?.parameters?.tool_name,
+          requester: storedEnvelope.from?.identity,
+          is_error: result.is_error || false
+        });
+      }
+
+      return result;
+    } catch (error) {
+      this.persistAndAudit("mcp.client.tool_execution_failed", {
+        request_envelope_id: storedEnvelope.id,
+        thread_id: storedEnvelope.thread_id,
+        error_code: error?.code || "INTERNAL_ERROR",
+        error_message: error?.message || "Unknown error"
+      });
+      return null;
+    }
   }
 
   getEnvelope(envelopeId) {
@@ -13524,6 +13822,13 @@ export class LoomStore {
         trust_anchor_epoch: this.federationTrustLocalEpoch,
         e2ee_profiles: listSupportedE2eeProfileCapabilities()
       },
+      mcp: {
+        supported: true,
+        protocol_version: "2024-11-05",
+        transports: ["sse", "stdio"],
+        tools_url: normalizedDomain ? `https://${normalizedDomain}/v1/mcp/tools` : null,
+        sse_url: normalizedDomain ? `https://${normalizedDomain}/v1/mcp/sse` : null
+      },
       generated_at: nowIso(),
       request_id: randomUUID()
     };
@@ -13554,7 +13859,8 @@ export class LoomStore {
       type: payload.type || "human",
       displayName: payload.display_name || payload.id,
       signingKeys: payload.signing_keys,
-      encryptionKeys: payload.encryption_keys
+      encryptionKeys: payload.encryption_keys,
+      agentInfo: payload.agent_info || null
     });
     const nodeSignature = signUtf8Message(
       this.federationSigningPrivateKeyPem,
@@ -13905,5 +14211,451 @@ export class LoomStore {
         blobs: blobRetention
       }
     };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Protocol Module Integrations
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // ── Receipts (Section 20.8) ──────────────────────────────────────────────
+
+  _ensureSystemServiceIdentity() {
+    const serviceIdentity = `loom://system@${this.nodeId}`;
+    if (!this.identities.has(serviceIdentity)) {
+      // Register with a non-reserved key ID for the identity
+      const serviceKeyId = "k_sign_system_svc_1";
+      if (!this.publicKeysById.has(serviceKeyId)) {
+        this.publicKeysById.set(serviceKeyId, this.systemSigningPublicKeyPem);
+        this.keyOwnerById.set(serviceKeyId, serviceIdentity);
+      }
+      this.identities.set(serviceIdentity, {
+        id: serviceIdentity,
+        display_name: "System Service",
+        type: "service",
+        created_at: nowIso(),
+        signing_keys: [{ key_id: serviceKeyId, public_key_pem: this.systemSigningPublicKeyPem }]
+      });
+    }
+    return serviceIdentity;
+  }
+
+  _signSystemEnvelope(envelope) {
+    const serviceIdentity = this._ensureSystemServiceIdentity();
+    const serviceKeyId = "k_sign_system_svc_1";
+    envelope.from = {
+      ...envelope.from,
+      identity: serviceIdentity,
+      key_id: serviceKeyId,
+      type: "service"
+    };
+    return signEnvelope(envelope, this.systemSigningPrivateKeyPem, serviceKeyId);
+  }
+
+  _ensureServiceParticipant(threadId) {
+    const serviceIdentity = this._ensureSystemServiceIdentity();
+    const thread = this.threadsById.get(threadId);
+    if (thread && !this.isActiveParticipant(thread, serviceIdentity)) {
+      thread.participants.push({
+        identity: serviceIdentity,
+        role: "participant",
+        joined_at: nowIso(),
+        left_at: null
+      });
+    }
+    return serviceIdentity;
+  }
+
+  generateDeliveryReceipt(originalEnvelope) {
+    this._ensureServiceParticipant(originalEnvelope.thread_id);
+    const receipt = buildDeliveryReceipt(originalEnvelope, {
+      fromIdentity: `loom://system@${this.nodeId}`,
+      nodeId: this.nodeId
+    });
+    return this.ingestEnvelope(this._signSystemEnvelope(receipt), { _autoReply: true });
+  }
+
+  generateReadReceipt(originalEnvelope, { fromIdentity, deviceId = null, userConfirmed = true }) {
+    this._ensureServiceParticipant(originalEnvelope.thread_id);
+    const receipt = buildReadReceipt(originalEnvelope, { fromIdentity, deviceId, userConfirmed });
+    return this.ingestEnvelope(this._signSystemEnvelope(receipt), { _autoReply: true });
+  }
+
+  generateFailureReceipt(originalEnvelope, { reason, details = null, retryAfter = null }) {
+    this._ensureServiceParticipant(originalEnvelope.thread_id);
+    const receipt = buildFailureReceipt(originalEnvelope, {
+      fromIdentity: `loom://system@${this.nodeId}`,
+      reason,
+      details,
+      retryAfter
+    });
+    return this.ingestEnvelope(this._signSystemEnvelope(receipt), { _autoReply: true });
+  }
+
+  // ── Deletion & Content Erasure (Section 25.2) ───────────────────────────
+
+  deleteEnvelopeContent(envelopeId, actorIdentity) {
+    const envelope = this.envelopesById.get(envelopeId);
+    if (!envelope) {
+      throw new LoomError("ENVELOPE_NOT_FOUND", `Envelope not found: ${envelopeId}`, 404, {
+        envelope_id: envelopeId
+      });
+    }
+
+    const thread = this.threadsById.get(envelope.thread_id);
+    const check = canDeleteEnvelope(envelope, thread);
+    if (!check.allowed) {
+      throw new LoomError("DELETION_BLOCKED", check.reason, 403, {
+        envelope_id: envelopeId,
+        reason: check.reason
+      });
+    }
+
+    const erased = eraseEnvelopeContent(envelope);
+    this.envelopesById.set(envelopeId, erased);
+    this.persistAndAudit("envelope.content_erased", {
+      envelope_id: envelopeId,
+      thread_id: envelope.thread_id,
+      actor: actorIdentity
+    });
+
+    return erased;
+  }
+
+  cryptoShredThread(threadId, keyEpoch, actorIdentity) {
+    const thread = this.threadsById.get(threadId);
+    if (!thread) {
+      throw new LoomError("THREAD_NOT_FOUND", `Thread not found: ${threadId}`, 404, {
+        thread_id: threadId
+      });
+    }
+
+    if (isLegalHoldActive(thread.labels)) {
+      throw new LoomError("DELETION_BLOCKED", "LEGAL_HOLD_ACTIVE", 403, {
+        thread_id: threadId
+      });
+    }
+
+    const record = buildCryptoShredRecord(threadId, keyEpoch);
+
+    // Erase all envelope content in the thread
+    for (const envId of thread.envelope_ids || []) {
+      const envelope = this.envelopesById.get(envId);
+      if (envelope && !envelope.meta?.deleted) {
+        this.envelopesById.set(envId, eraseEnvelopeContent(envelope));
+      }
+    }
+
+    this.persistAndAudit("thread.crypto_shred", {
+      thread_id: threadId,
+      key_epoch: keyEpoch,
+      actor: actorIdentity
+    });
+
+    return record;
+  }
+
+  // ── Retention Enforcement (Section 25.4) ─────────────────────────────────
+
+  enforceRetentionPolicies(now = Date.now()) {
+    const expired = collectExpiredEnvelopes(
+      Array.from(this.envelopesById.values()),
+      this.threadsById,
+      this.retentionPolicies,
+      now
+    );
+
+    let erased = 0;
+    for (const envelopeId of expired) {
+      const envelope = this.envelopesById.get(envelopeId);
+      if (envelope && !envelope.meta?.deleted) {
+        this.envelopesById.set(envelopeId, eraseEnvelopeContent(envelope));
+        erased++;
+      }
+    }
+
+    if (erased > 0) {
+      this.persistAndAudit("retention.enforced", {
+        expired_count: expired.length,
+        erased_count: erased
+      });
+    }
+
+    return { expired_count: expired.length, erased_count: erased };
+  }
+
+  // ── Channel Rules (Section 20.4) ─────────────────────────────────────────
+
+  _applyChannelRules(storedEnvelope) {
+    if (this.channelRules.length === 0) return;
+
+    const thread = this.threadsById.get(storedEnvelope.thread_id);
+    if (!thread) return;
+
+    const actions = evaluateRules(storedEnvelope, this.channelRules, thread.labels || []);
+    if (actions.length === 0) return;
+
+    const result = applyRuleActions(actions);
+
+    // Apply label changes to the thread
+    if (result.labels_to_add.length > 0 || result.labels_to_remove.length > 0) {
+      const currentLabels = new Set(thread.labels || []);
+      for (const label of result.labels_to_add) {
+        currentLabels.add(label);
+      }
+      for (const label of result.labels_to_remove) {
+        currentLabels.delete(label);
+      }
+      thread.labels = Array.from(currentLabels);
+    }
+
+    // Store routing metadata on the envelope
+    if (result.quarantine) {
+      storedEnvelope.meta = storedEnvelope.meta || {};
+      storedEnvelope.meta.quarantined = true;
+      storedEnvelope.meta.quarantined_at = nowIso();
+    }
+
+    if (result.route_to || result.delegate_to || result.escalate) {
+      storedEnvelope.meta = storedEnvelope.meta || {};
+      storedEnvelope.meta.channel_rule_actions = {
+        route_to: result.route_to,
+        delegate_to: result.delegate_to,
+        escalate: result.escalate
+      };
+    }
+  }
+
+  setChannelRules(rules) {
+    this.channelRules = normalizeChannelRules(rules);
+    this.persistAndAudit("channel_rules.updated", {
+      rule_count: this.channelRules.length
+    });
+  }
+
+  // ── Autoresponder (Section 20.5) ─────────────────────────────────────────
+
+  setAutoresponderRule(identityUri, rule) {
+    if (rule === null || rule === undefined) {
+      this.autoresponderRules.delete(identityUri);
+      this.persistAndAudit("autoresponder.removed", { identity: identityUri });
+      return;
+    }
+
+    const errors = validateAutoresponderRule(rule);
+    if (errors.length > 0) {
+      throw new LoomError("AUTORESPONDER_INVALID", errors[0].reason, 400, { errors });
+    }
+
+    this.autoresponderRules.set(identityUri, rule);
+    this.persistAndAudit("autoresponder.set", {
+      identity: identityUri,
+      schedule_start: rule.schedule_start || null,
+      schedule_end: rule.schedule_end || null
+    });
+  }
+
+  _processAutoresponder(storedEnvelope) {
+    // Only process message-type envelopes
+    if (storedEnvelope.type !== "message") return;
+
+    // Check each recipient for autoresponder rules
+    const recipients = storedEnvelope.to || [];
+    for (const recipient of recipients) {
+      const identity = recipient.identity;
+      const rule = this.autoresponderRules.get(identity);
+      if (!rule) continue;
+
+      const sentHistory = this.autoresponderSentHistory.get(identity) || new Map();
+      const decision = shouldAutoRespond(storedEnvelope, rule, sentHistory);
+      if (!decision.respond) continue;
+
+      this._ensureServiceParticipant(storedEnvelope.thread_id);
+      const autoReply = buildAutoReplyEnvelope(storedEnvelope, rule, identity);
+      this.ingestEnvelope(this._signSystemEnvelope(autoReply), { _autoReply: true });
+
+      // Track sent history
+      if (!this.autoresponderSentHistory.has(identity)) {
+        this.autoresponderSentHistory.set(identity, new Map());
+      }
+      this.autoresponderSentHistory.get(identity).set(
+        storedEnvelope.from?.identity,
+        new Date().toISOString()
+      );
+    }
+  }
+
+  // ── Distribution / Team Routing (Section 20.3) ──────────────────────────
+
+  setIdentityRoutingPolicy(identityUri, policy) {
+    const identity = this.identities.get(identityUri);
+    if (!identity) {
+      throw new LoomError("IDENTITY_NOT_FOUND", `Identity not found: ${identityUri}`, 404, {
+        identity: identityUri
+      });
+    }
+
+    identity.routing_policy = normalizeRoutingPolicy(policy);
+    this.persistAndAudit("identity.routing_policy_set", {
+      identity: identityUri,
+      routing_policy: identity.routing_policy
+    });
+
+    return identity.routing_policy;
+  }
+
+  resolveDistributionRecipients(envelope) {
+    const recipients = envelope.to || [];
+    const expandedRecipients = [];
+
+    for (const recipient of recipients) {
+      const identity = this.identities.get(recipient.identity);
+      if (identity?.routing_policy && Array.isArray(identity.members) && identity.members.length > 0) {
+        // This is a team/distribution identity — expand
+        const policy = normalizeRoutingPolicy(identity.routing_policy);
+
+        if (requiresModeration(policy)) {
+          // Moderated: keep original recipient, mark for moderation
+          expandedRecipients.push({ ...recipient, _moderation_pending: true });
+          continue;
+        }
+
+        const resolved = resolveTeamRecipients(identity, policy);
+        for (const member of resolved) {
+          const memberIdentity = typeof member === "object" ? member.identity || member : member;
+          expandedRecipients.push({
+            identity: memberIdentity,
+            role: recipient.role,
+            _expanded_from: recipient.identity
+          });
+        }
+      } else {
+        expandedRecipients.push(recipient);
+      }
+    }
+
+    return expandedRecipients;
+  }
+
+  // ── Search Validation (Section 16.6) ─────────────────────────────────────
+
+  validateAndSearchEnvelopes(filters, actorIdentity) {
+    const validationErrors = validateSearchQuery(filters || {});
+    if (validationErrors.length > 0) {
+      throw new LoomError("SEARCH_INVALID", validationErrors[0].reason, 400, {
+        errors: validationErrors
+      });
+    }
+    return this.searchEnvelopes(filters, actorIdentity);
+  }
+
+  // ── Import / Export (Section 26.2) ───────────────────────────────────────
+
+  exportMailbox(options = {}) {
+    const state = {
+      threads: Array.from(this.threadsById.values()),
+      envelopes: Array.from(this.envelopesById.values()),
+      blobs: Array.from(this.blobsById.values())
+    };
+
+    const exportPkg = buildExportPackage(state, options);
+
+    this.persistAndAudit("mailbox.exported", {
+      thread_count: exportPkg.thread_count,
+      envelope_count: exportPkg.envelope_count,
+      identity_filter: options.identityFilter || null
+    });
+
+    return exportPkg;
+  }
+
+  importMailbox(payload, actorIdentity) {
+    const errors = validateImportPayload(payload);
+    if (errors.length > 0) {
+      throw new LoomError("IMPORT_INVALID", errors[0].reason, 400, { errors });
+    }
+
+    const importedEnvelopes = prepareImportEnvelopes(payload.envelopes || []);
+    const importedThreads = prepareImportThreads(payload.threads || []);
+
+    let envelopeCount = 0;
+    let threadCount = 0;
+
+    // Import threads
+    for (const thread of importedThreads) {
+      if (!thread.id) continue;
+      if (!this.threadsById.has(thread.id)) {
+        this.threadsById.set(thread.id, {
+          ...thread,
+          mailbox_state: thread.mailbox_state || {},
+          pending_parent_count: 0
+        });
+        threadCount++;
+      }
+    }
+
+    // Import envelopes
+    for (const envelope of importedEnvelopes) {
+      if (!envelope.id) continue;
+      if (!this.envelopesById.has(envelope.id)) {
+        this.envelopesById.set(envelope.id, envelope);
+        // Add to thread envelope_ids if thread exists
+        const thread = this.threadsById.get(envelope.thread_id);
+        if (thread) {
+          if (!Array.isArray(thread.envelope_ids)) thread.envelope_ids = [];
+          if (!thread.envelope_ids.includes(envelope.id)) {
+            thread.envelope_ids.push(envelope.id);
+          }
+        }
+        envelopeCount++;
+      }
+    }
+
+    this.persistAndAudit("mailbox.imported", {
+      thread_count: threadCount,
+      envelope_count: envelopeCount,
+      actor: actorIdentity
+    });
+
+    return { thread_count: threadCount, envelope_count: envelopeCount };
+  }
+
+  // ── Blob Validation (Section 19) ─────────────────────────────────────────
+
+  validateBlobPayload(payload) {
+    return validateBlobInitiation(payload);
+  }
+
+  // ── Event Log (WebSocket support — Section 17) ──────────────────────────
+
+  _emitEnvelopeEvent(storedEnvelope) {
+    const eventType = storedEnvelope.type === "receipt"
+      ? WS_EVENT_TYPES.RECEIPT_DELIVERED
+      : WS_EVENT_TYPES.ENVELOPE_NEW;
+
+    appendEvent(this.eventLog, {
+      type: eventType,
+      payload: {
+        envelope_id: storedEnvelope.id,
+        thread_id: storedEnvelope.thread_id,
+        from: storedEnvelope.from?.identity || null,
+        type: storedEnvelope.type,
+        intent: storedEnvelope.content?.structured?.intent || null
+      }
+    });
+  }
+
+  getEventsSince(cursor) {
+    pruneEventLog(this.eventLog);
+    return getEventsSince(this.eventLog, cursor);
+  }
+
+  getEventLog() {
+    return this.eventLog;
+  }
+
+  // ── Rate Limit Headers (Section 18.4) ───────────────────────────────────
+
+  buildRateLimitResponseHeaders(rateLimitResult) {
+    return buildRateLimitHeaders(rateLimitResult);
   }
 }

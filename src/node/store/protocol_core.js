@@ -7,7 +7,25 @@ import { LoomError } from "../../protocol/errors.js";
 import { isIdentity } from "../../protocol/ids.js";
 import { canonicalThreadOrder, validateThreadDag } from "../../protocol/thread.js";
 import { assertThreadLimitsOrThrow } from "../../protocol/thread_limits.js";
+import {
+  DEFAULT_LOOP_LIMITS,
+  computeConversationHash,
+  detectPingPongPattern,
+  assertAgentThreadRateOrThrow
+} from "../../protocol/loop_protection.js";
 import { resolveE2eeProfile, validateEncryptedContentShape, validateEncryptionEpochParameters } from "../../protocol/e2ee.js";
+import { validateMlsMetadata, validateMlsWelcome, validateMlsCommit } from "../../protocol/mls.js";
+import { validateSnapshotParameters, validateContextWindowBudget } from "../../protocol/context_window.js";
+import {
+  isWorkflowOrchestrationIntent,
+  WORKFLOW_INTENTS,
+  WORKFLOW_INTENT_VALIDATORS,
+  buildInitialWorkflowState,
+  applyStepComplete,
+  applyWorkflowComplete,
+  applyWorkflowFailed
+} from "../../protocol/workflow.js";
+import { validateIntentParameters } from "../../protocol/intents.js";
 
 function nowIso() {
   return new Date().toISOString();
@@ -32,7 +50,9 @@ const THREAD_OP_TO_GRANT = {
   "encryption.epoch@v1": "admin",
   "encryption.rotate@v1": "admin",
   "capability.revoked@v1": "admin",
-  "capability.spent@v1": "admin"
+  "capability.spent@v1": "admin",
+  "thread.snapshot@v1": "admin",
+  "thread.context_budget@v1": "admin"
 };
 
 function ensureSenderReplayStateMap(thread) {
@@ -322,38 +342,46 @@ export function enforceThreadEnvelopeEncryptionPolicyCore(thread, envelope, isNe
           }
         );
       }
+      const resolvedProfile = resolveE2eeProfile(profileId);
+      const isMlsProfile = resolvedProfile?.requires_mls_metadata === true;
+
       const encryptedContentErrors = validateEncryptedContentShape(envelope.content, {
         verifyPayloadCiphertextStructure: true,
-        verifyWrappedKeyPayloadStructure: true,
-        enforceReplayMetadata: true,
+        verifyWrappedKeyPayloadStructure: !isMlsProfile,
+        enforceReplayMetadata: !isMlsProfile,
         resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
           this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
       });
 
-      const initialEpochErrors = validateEncryptionEpochParameters(
-        {
-          profile: profileId,
-          epoch,
-          wrapped_keys: envelope?.content?.wrapped_keys
-        },
-        {
-          requiredRecipients: initialParticipants,
-          verifyWrappedKeyPayloadStructure: true,
-          resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
-            this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
-        }
-      );
+      let initialEpochErrors = [];
+      if (!isMlsProfile) {
+        initialEpochErrors = validateEncryptionEpochParameters(
+          {
+            profile: profileId,
+            epoch,
+            wrapped_keys: envelope?.content?.wrapped_keys
+          },
+          {
+            requiredRecipients: initialParticipants,
+            verifyWrappedKeyPayloadStructure: true,
+            resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
+              this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
+          }
+        );
+      }
       const encryptionErrors = [...encryptedContentErrors, ...initialEpochErrors];
-      const bridgeWrappedRecipient = Array.isArray(envelope?.content?.wrapped_keys)
-        ? envelope.content.wrapped_keys.find((entry) =>
-            String(entry?.to || "").trim().startsWith("bridge://")
-          )
-        : null;
-      if (bridgeWrappedRecipient) {
-        encryptionErrors.push({
-          field: "content.wrapped_keys",
-          reason: "bridge recipients are not allowed in encrypted key distribution"
-        });
+      if (!isMlsProfile) {
+        const bridgeWrappedRecipient = Array.isArray(envelope?.content?.wrapped_keys)
+          ? envelope.content.wrapped_keys.find((entry) =>
+              String(entry?.to || "").trim().startsWith("bridge://")
+            )
+          : null;
+        if (bridgeWrappedRecipient) {
+          encryptionErrors.push({
+            field: "content.wrapped_keys",
+            reason: "bridge recipients are not allowed in encrypted key distribution"
+          });
+        }
       }
       if (encryptionErrors.length > 0) {
         throw new LoomError("ENVELOPE_INVALID", "Encrypted thread bootstrap key distribution is invalid", 400, {
@@ -366,14 +394,17 @@ export function enforceThreadEnvelopeEncryptionPolicyCore(thread, envelope, isNe
         key_epoch: epoch,
         sender_replay: ensureSenderReplayStateMap(thread)
       };
-      recordSenderReplayStateOrThrow(thread, envelope, profileId, epoch, {
-        replayMode: context.replayMode || this.replayMode || "strict",
-        assertProfileMigrationPolicy: (fromProfile, toProfile, migrationContext) => {
-          if (typeof this.assertE2eeProfileMigrationPolicy === "function") {
-            this.assertE2eeProfileMigrationPolicy(fromProfile, toProfile, migrationContext);
+      // MLS profiles handle replay via generation counters, not sender replay state
+      if (!isMlsProfile) {
+        recordSenderReplayStateOrThrow(thread, envelope, profileId, epoch, {
+          replayMode: context.replayMode || this.replayMode || "strict",
+          assertProfileMigrationPolicy: (fromProfile, toProfile, migrationContext) => {
+            if (typeof this.assertE2eeProfileMigrationPolicy === "function") {
+              this.assertE2eeProfileMigrationPolicy(fromProfile, toProfile, migrationContext);
+            }
           }
-        }
-      });
+        });
+      }
     }
     return;
   }
@@ -437,27 +468,33 @@ export function enforceThreadEnvelopeEncryptionPolicyCore(thread, envelope, isNe
     });
   }
 
-  const wrappedKeyErrors = validateEncryptedContentShape(envelope.content, {
-    verifyPayloadCiphertextStructure: true,
-    verifyWrappedKeyPayloadStructure: true,
-    enforceReplayMetadata: true,
+  const resolvedThreadProfile = resolveE2eeProfile(threadProfileId);
+  const isThreadMls = resolvedThreadProfile?.requires_mls_metadata === true;
+
+  const contentErrors = validateEncryptedContentShape(envelope.content, {
+    verifyPayloadCiphertextStructure: !isThreadMls,
+    verifyWrappedKeyPayloadStructure: !isThreadMls,
+    enforceReplayMetadata: !isThreadMls,
     resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
       this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
   });
-  if (wrappedKeyErrors.length > 0) {
-    throw new LoomError("ENVELOPE_INVALID", "Encrypted envelope wrapped key payload is invalid", 400, {
-      errors: wrappedKeyErrors
+  if (contentErrors.length > 0) {
+    throw new LoomError("ENVELOPE_INVALID", "Encrypted envelope content is invalid", 400, {
+      errors: contentErrors
     });
   }
 
-  recordSenderReplayStateOrThrow(thread, envelope, threadProfileId, epoch, {
-    replayMode: context.replayMode || this.replayMode || "strict",
-    assertProfileMigrationPolicy: (fromProfile, toProfile, migrationContext) => {
-      if (typeof this.assertE2eeProfileMigrationPolicy === "function") {
-        this.assertE2eeProfileMigrationPolicy(fromProfile, toProfile, migrationContext);
+  // MLS profiles handle replay via generation counters, not sender replay state
+  if (!isThreadMls) {
+    recordSenderReplayStateOrThrow(thread, envelope, threadProfileId, epoch, {
+      replayMode: context.replayMode || this.replayMode || "strict",
+      assertProfileMigrationPolicy: (fromProfile, toProfile, migrationContext) => {
+        if (typeof this.assertE2eeProfileMigrationPolicy === "function") {
+          this.assertE2eeProfileMigrationPolicy(fromProfile, toProfile, migrationContext);
+        }
       }
-    }
-  });
+    });
+  }
 }
 
 export function prepareThreadOperationCore(thread, envelope, actorIdentity, context = {}) {
@@ -723,25 +760,56 @@ export function prepareThreadOperationCore(thread, envelope, actorIdentity, cont
           );
         }
 
-        const epochParameterErrors = validateEncryptionEpochParameters(parameters, {
-          requiredRecipients: activeParticipants,
-          verifyWrappedKeyPayloadStructure: true,
-          resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
-            this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
-        });
-        const bridgeWrappedRecipient = Array.isArray(parameters.wrapped_keys)
-          ? parameters.wrapped_keys.find((entry) => String(entry?.to || "").trim().startsWith("bridge://"))
-          : null;
-        if (bridgeWrappedRecipient) {
-          epochParameterErrors.push({
-            field: "content.structured.parameters.wrapped_keys",
-            reason: "bridge recipients are not allowed in encrypted key distribution"
+        const nextProfileResolved = resolveE2eeProfile(nextProfileId);
+        const isNextMls = nextProfileResolved?.requires_mls_metadata === true;
+
+        if (isNextMls) {
+          // MLS path: validate mls_welcome instead of wrapped_keys
+          const welcome = parameters.mls_welcome;
+          if (!welcome || typeof welcome !== "object") {
+            throw new LoomError("ENVELOPE_INVALID", "encryption.epoch with MLS profile requires parameters.mls_welcome", 400, {
+              thread_id: thread.id
+            });
+          }
+          const welcomeErrors = validateMlsWelcome(welcome);
+          // Verify all active participants have group_secrets entries
+          const secretRecipients = new Set(
+            Array.isArray(welcome.group_secrets) ? welcome.group_secrets.map((gs) => gs.to) : []
+          );
+          for (const participant of activeParticipants) {
+            if (!secretRecipients.has(participant)) {
+              welcomeErrors.push({
+                field: "content.structured.parameters.mls_welcome.group_secrets",
+                reason: `Missing group secret for participant: ${participant}`
+              });
+            }
+          }
+          if (welcomeErrors.length > 0) {
+            throw new LoomError("ENVELOPE_INVALID", "encryption.epoch MLS welcome parameters are invalid", 400, {
+              errors: welcomeErrors
+            });
+          }
+        } else {
+          const epochParameterErrors = validateEncryptionEpochParameters(parameters, {
+            requiredRecipients: activeParticipants,
+            verifyWrappedKeyPayloadStructure: true,
+            resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
+              this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
           });
-        }
-        if (epochParameterErrors.length > 0) {
-          throw new LoomError("ENVELOPE_INVALID", "encryption.epoch parameters are invalid", 400, {
-            errors: epochParameterErrors
-          });
+          const bridgeWrappedRecipient = Array.isArray(parameters.wrapped_keys)
+            ? parameters.wrapped_keys.find((entry) => String(entry?.to || "").trim().startsWith("bridge://"))
+            : null;
+          if (bridgeWrappedRecipient) {
+            epochParameterErrors.push({
+              field: "content.structured.parameters.wrapped_keys",
+              reason: "bridge recipients are not allowed in encrypted key distribution"
+            });
+          }
+          if (epochParameterErrors.length > 0) {
+            throw new LoomError("ENVELOPE_INVALID", "encryption.epoch parameters are invalid", 400, {
+              errors: epochParameterErrors
+            });
+          }
         }
 
         const currentProfileId = resolveE2eeProfile(thread.encryption.profile)?.id || thread.encryption.profile;
@@ -782,6 +850,15 @@ export function prepareThreadOperationCore(thread, envelope, actorIdentity, cont
         thread.encryption.enabled = true;
         thread.encryption.profile = nextProfileId;
         thread.encryption.key_epoch = nextEpoch;
+        if (isNextMls) {
+          thread.encryption.mls_state = {
+            group_id: thread.id,
+            epoch: nextEpoch,
+            tree: parameters.mls_welcome.tree || [],
+            tree_hash: parameters.mls_welcome.tree_hash || null,
+            retained_epoch_limit: parameters.mls_welcome.retained_epoch_limit || 3
+          };
+        }
         break;
       }
 
@@ -829,35 +906,143 @@ export function prepareThreadOperationCore(thread, envelope, actorIdentity, cont
           });
         }
 
-        const rotateErrors = validateEncryptionEpochParameters(
-          {
-            profile: currentProfileId,
-            epoch: requestedEpoch,
-            wrapped_keys: parameters.wrapped_keys
-          },
-          {
-            requiredRecipients: activeParticipants,
-            verifyWrappedKeyPayloadStructure: true,
-            resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
-              this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
+        const resolvedRotateProfile = resolveE2eeProfile(currentProfileId);
+        const isRotateMls = resolvedRotateProfile?.requires_mls_metadata === true;
+
+        if (isRotateMls) {
+          // MLS path: validate mls_commit instead of wrapped_keys
+          const commit = parameters.mls_commit;
+          if (!commit || typeof commit !== "object") {
+            throw new LoomError("ENVELOPE_INVALID", "encryption.rotate with MLS profile requires parameters.mls_commit", 400, {
+              thread_id: thread.id
+            });
           }
-        );
-        const bridgeWrappedRecipient = Array.isArray(parameters.wrapped_keys)
-          ? parameters.wrapped_keys.find((entry) => String(entry?.to || "").trim().startsWith("bridge://"))
-          : null;
-        if (bridgeWrappedRecipient) {
-          rotateErrors.push({
-            field: "content.structured.parameters.wrapped_keys",
-            reason: "bridge recipients are not allowed in encrypted key distribution"
-          });
-        }
-        if (rotateErrors.length > 0) {
-          throw new LoomError("ENVELOPE_INVALID", "encryption.rotate parameters are invalid", 400, {
-            errors: rotateErrors
-          });
+          const commitErrors = validateMlsCommit(commit);
+          if (commitErrors.length > 0) {
+            throw new LoomError("ENVELOPE_INVALID", "encryption.rotate MLS commit parameters are invalid", 400, {
+              errors: commitErrors
+            });
+          }
+          // Update MLS state with new tree info from commit
+          const mlsState = thread.encryption.mls_state || {};
+          if (Array.isArray(mlsState.tree) && typeof commit.sender_leaf_index === "number") {
+            const leafIndex = commit.sender_leaf_index;
+            if (leafIndex >= 0 && leafIndex < mlsState.tree.length && mlsState.tree[leafIndex]) {
+              mlsState.tree[leafIndex] = {
+                ...mlsState.tree[leafIndex],
+                public_key: commit.new_leaf_public_key || mlsState.tree[leafIndex].public_key,
+                generation: (mlsState.tree[leafIndex].generation || 0) + 1
+              };
+            }
+          }
+          mlsState.epoch = requestedEpoch;
+          mlsState.tree_hash = commit.tree_hash || mlsState.tree_hash;
+          thread.encryption.mls_state = mlsState;
+        } else {
+          const rotateErrors = validateEncryptionEpochParameters(
+            {
+              profile: currentProfileId,
+              epoch: requestedEpoch,
+              wrapped_keys: parameters.wrapped_keys
+            },
+            {
+              requiredRecipients: activeParticipants,
+              verifyWrappedKeyPayloadStructure: true,
+              resolveRecipientEncryptionKey: (recipientIdentity, keyId) =>
+                this.resolveIdentityEncryptionKey(recipientIdentity, keyId)
+            }
+          );
+          const bridgeWrappedRecipient = Array.isArray(parameters.wrapped_keys)
+            ? parameters.wrapped_keys.find((entry) => String(entry?.to || "").trim().startsWith("bridge://"))
+            : null;
+          if (bridgeWrappedRecipient) {
+            rotateErrors.push({
+              field: "content.structured.parameters.wrapped_keys",
+              reason: "bridge recipients are not allowed in encrypted key distribution"
+            });
+          }
+          if (rotateErrors.length > 0) {
+            throw new LoomError("ENVELOPE_INVALID", "encryption.rotate parameters are invalid", 400, {
+              errors: rotateErrors
+            });
+          }
         }
 
         thread.encryption.key_epoch = requestedEpoch;
+        break;
+      }
+
+      case "thread.snapshot@v1": {
+        if (thread.state !== "active" && thread.state !== "resolved") {
+          throw new LoomError("STATE_TRANSITION_INVALID", `Cannot snapshot thread in ${thread.state} state`, 409, {
+            thread_id: thread.id,
+            current_state: thread.state
+          });
+        }
+
+        const snapshotErrors = validateSnapshotParameters(parameters);
+        if (snapshotErrors.length > 0) {
+          throw new LoomError("ENVELOPE_INVALID", "thread.snapshot@v1 parameters are invalid", 400, {
+            errors: snapshotErrors
+          });
+        }
+
+        const cutoffIndex = thread.envelope_ids.indexOf(parameters.cutoff_envelope_id);
+        if (cutoffIndex === -1) {
+          throw new LoomError("ENVELOPE_INVALID", "cutoff_envelope_id not found in thread", 400, {
+            field: "content.structured.parameters.cutoff_envelope_id",
+            cutoff_envelope_id: parameters.cutoff_envelope_id
+          });
+        }
+
+        thread.snapshot = {
+          envelope_id: envelope.id,
+          cutoff_envelope_id: parameters.cutoff_envelope_id,
+          cutoff_index: cutoffIndex,
+          summary_text: parameters.summary_text.trim(),
+          created_at: envelope.created_at
+        };
+        break;
+      }
+
+      case "thread.context_budget@v1": {
+        if (!parameters || typeof parameters !== "object") {
+          throw new LoomError("ENVELOPE_INVALID", "thread.context_budget@v1 requires parameters", 400, {
+            field: "content.structured.parameters"
+          });
+        }
+
+        const budgetIdentity = parameters.identity;
+        if (!budgetIdentity || typeof budgetIdentity !== "string") {
+          throw new LoomError("ENVELOPE_INVALID", "thread.context_budget@v1 requires parameters.identity", 400, {
+            field: "content.structured.parameters.identity"
+          });
+        }
+
+        const budgetParticipant = thread.participants.find(
+          (p) => p.identity === budgetIdentity
+        );
+        if (!budgetParticipant) {
+          throw new LoomError("ENVELOPE_INVALID", "identity is not a participant in this thread", 400, {
+            field: "content.structured.parameters.identity",
+            identity: budgetIdentity
+          });
+        }
+
+        const budgetErrors = validateContextWindowBudget(parameters.context_window_budget);
+        if (budgetErrors.length > 0) {
+          throw new LoomError("ENVELOPE_INVALID", "thread.context_budget@v1 parameters are invalid", 400, {
+            errors: budgetErrors
+          });
+        }
+
+        if (!thread.context_budgets || typeof thread.context_budgets !== "object") {
+          thread.context_budgets = {};
+        }
+        thread.context_budgets[budgetIdentity] = {
+          token_limit: parameters.context_window_budget.token_limit,
+          updated_at: envelope.created_at
+        };
         break;
       }
 
@@ -1105,7 +1290,8 @@ export function ingestEnvelopeCore(envelope, context = {}) {
       },
       event_seq_counter: 0,
       envelope_ids: [],
-      pending_parent_count: 0
+      pending_parent_count: 0,
+      requires_human_escalation: false
     };
 
   const threadSnapshot = !isNewThread ? structuredClone(thread) : null;
@@ -1113,6 +1299,66 @@ export function ingestEnvelopeCore(envelope, context = {}) {
   if (!isNewThread) {
     assertThreadLimitsOrThrow(thread.envelope_ids?.length || 0, context.threadLimits, thread.pending_parent_count || 0);
   }
+
+  // ── Loop protection ─────────────────────────────────────────────────────────
+  const loopLimits = context.loopProtection || this.loopProtection || DEFAULT_LOOP_LIMITS;
+  const maxHopCount = loopLimits.max_hop_count ?? DEFAULT_LOOP_LIMITS.max_hop_count;
+  const isAgentSender = authoritativeSenderType === "agent";
+  let loopEscalationTriggered = false;
+
+  // 1. Hop count enforcement
+  if (envelope.hop_count != null && envelope.hop_count >= maxHopCount) {
+    throw new LoomError("LOOP_DETECTED", "hop_count exceeds maximum", 429, {
+      hop_count: envelope.hop_count,
+      max_hop_count: maxHopCount
+    });
+  }
+
+  if (!isNewThread) {
+    // 2. Human escalation gate — block agent senders on escalated threads
+    if (thread.requires_human_escalation && isAgentSender) {
+      throw new LoomError("HUMAN_ESCALATION_REQUIRED", "Thread requires human participation before agents may continue", 403, {
+        thread_id: threadId
+      });
+    }
+
+    // 3. Human sender resets escalation flag
+    if (thread.requires_human_escalation && !isAgentSender) {
+      thread.requires_human_escalation = false;
+    }
+
+    // 4. Agent per-thread rate limiting
+    if (isAgentSender) {
+      assertAgentThreadRateOrThrow(
+        thread.envelope_ids,
+        this.envelopesById,
+        fromIdentity,
+        nowMs(),
+        loopLimits
+      );
+    }
+
+    // 5. Ping-pong pattern detection
+    if (isAgentSender) {
+      const recipientIdentities = Array.isArray(envelope.to) ? envelope.to.map((r) => String(r.identity || "").trim()) : [];
+      const intentStr = String(envelope.content?.structured?.intent || "").trim();
+      const pingPong = detectPingPongPattern(
+        thread.envelope_ids,
+        this.envelopesById,
+        fromIdentity,
+        recipientIdentities,
+        intentStr
+      );
+      if (pingPong.detected) {
+        thread.requires_human_escalation = true;
+        loopEscalationTriggered = true;
+        if (typeof this.ensureThreadLabel === "function") {
+          this.ensureThreadLabel(threadId, "sys.escalation");
+        }
+      }
+    }
+  }
+  // ── End loop protection ──────────────────────────────────────────────────────
 
   this.enforceThreadEnvelopeEncryptionPolicy(thread, envelope, isNewThread, context);
 
@@ -1125,6 +1371,12 @@ export function ingestEnvelopeCore(envelope, context = {}) {
   }
   thread.event_seq_counter += 1;
 
+  // Compute loop detection metadata (stored in meta only — top-level fields are signature-covered)
+  const recipientIdentitiesForHash = Array.isArray(envelope.to) ? envelope.to.map((r) => String(r.identity || "").trim()) : [];
+  const intentForHash = String(envelope.content?.structured?.intent || "").trim();
+  const conversationHash = computeConversationHash(fromIdentity, recipientIdentitiesForHash, intentForHash);
+  const effectiveHopCount = isAgentSender ? (envelope.hop_count || 0) + 1 : (envelope.hop_count || 0);
+
   const storedEnvelope = {
     ...envelope,
     meta: {
@@ -1133,7 +1385,12 @@ export function ingestEnvelopeCore(envelope, context = {}) {
       received_at: nowIso(),
       event_seq: thread.event_seq_counter,
       origin_event_seq: envelope.meta?.origin_event_seq ?? thread.event_seq_counter,
-      pending_parent: pendingParent
+      pending_parent: pendingParent,
+      loop_detection: {
+        hop_count: effectiveHopCount,
+        conversation_hash: conversationHash,
+        escalation_triggered: loopEscalationTriggered
+      }
     }
   };
 
@@ -1195,6 +1452,23 @@ export function ingestEnvelopeCore(envelope, context = {}) {
     throw error;
   }
 
+  // ── Workflow orchestration state tracking ──────────────────────────────────
+  if (storedEnvelope.type === "workflow") {
+    const workflowResult = processWorkflowEnvelopeCore(thread, storedEnvelope);
+    if (workflowResult.processed) {
+      storedEnvelope.meta.workflow_warnings = workflowResult.warnings || [];
+    }
+  }
+
+  // ── Intent parameter validation (non-fatal warnings) ─────────────────────
+  const envelopeIntent = storedEnvelope.content?.structured?.intent;
+  if (envelopeIntent && storedEnvelope.type !== "thread_op") {
+    const intentErrors = validateIntentParameters(envelopeIntent, storedEnvelope.content?.structured?.parameters);
+    if (intentErrors.length > 0) {
+      storedEnvelope.meta.intent_validation_warnings = intentErrors.map((e) => `${e.field}: ${e.reason}`);
+    }
+  }
+
   const resolvedPendingParents = this.resolvePendingParentsForThread(thread, storedEnvelope.id);
   const deliveryWrappers = this.ensureDeliveryWrappersForEnvelope(storedEnvelope);
   this.trackEnvelopeDailyQuota(storedEnvelope.from?.identity, storedEnvelope.created_at);
@@ -1210,6 +1484,92 @@ export function ingestEnvelopeCore(envelope, context = {}) {
   });
 
   return storedEnvelope;
+}
+
+// ─── Workflow Orchestration State Tracking ──────────────────────────────────
+
+function processWorkflowEnvelopeCore(thread, envelope) {
+  const intent = envelope.content?.structured?.intent;
+
+  // Only process recognized workflow orchestration intents — let MCP and others pass through
+  if (!isWorkflowOrchestrationIntent(intent)) {
+    return { processed: false };
+  }
+
+  const parameters = envelope.content?.structured?.parameters;
+
+  // Validate parameters using the intent-specific validator
+  const validator = WORKFLOW_INTENT_VALIDATORS[intent];
+  if (validator) {
+    const validationErrors = validator(parameters);
+    if (validationErrors.length > 0) {
+      return {
+        processed: true,
+        warnings: validationErrors.map((e) => `${e.field}: ${e.reason}`)
+      };
+    }
+  }
+
+  // Apply state transitions
+  switch (intent) {
+    case WORKFLOW_INTENTS.EXECUTE: {
+      thread.workflow = buildInitialWorkflowState(parameters);
+      break;
+    }
+
+    case WORKFLOW_INTENTS.STEP_COMPLETE: {
+      if (!thread.workflow || thread.workflow.status !== "running") {
+        return {
+          processed: true,
+          warnings: ["workflow state is not running — step_complete ignored"]
+        };
+      }
+      if (thread.workflow.workflow_id !== parameters.workflow_id) {
+        return {
+          processed: true,
+          warnings: [`workflow_id mismatch: expected ${thread.workflow.workflow_id}, got ${parameters.workflow_id}`]
+        };
+      }
+      thread.workflow = applyStepComplete(thread.workflow, parameters);
+      break;
+    }
+
+    case WORKFLOW_INTENTS.COMPLETE: {
+      if (!thread.workflow || thread.workflow.status !== "running") {
+        return {
+          processed: true,
+          warnings: ["workflow state is not running — complete ignored"]
+        };
+      }
+      if (thread.workflow.workflow_id !== parameters.workflow_id) {
+        return {
+          processed: true,
+          warnings: [`workflow_id mismatch: expected ${thread.workflow.workflow_id}, got ${parameters.workflow_id}`]
+        };
+      }
+      thread.workflow = applyWorkflowComplete(thread.workflow, parameters);
+      break;
+    }
+
+    case WORKFLOW_INTENTS.FAILED: {
+      if (!thread.workflow || thread.workflow.status !== "running") {
+        return {
+          processed: true,
+          warnings: ["workflow state is not running — failed ignored"]
+        };
+      }
+      if (thread.workflow.workflow_id !== parameters.workflow_id) {
+        return {
+          processed: true,
+          warnings: [`workflow_id mismatch: expected ${thread.workflow.workflow_id}, got ${parameters.workflow_id}`]
+        };
+      }
+      thread.workflow = applyWorkflowFailed(thread.workflow, parameters);
+      break;
+    }
+  }
+
+  return { processed: true, warnings: [] };
 }
 
 export function getThreadEnvelopesCore(threadId) {
