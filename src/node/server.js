@@ -5,9 +5,17 @@ import { readFileSync } from "node:fs";
 import { BlockList, isIP } from "node:net";
 
 import { toErrorResponse, LoomError } from "../protocol/errors.js";
+import { buildRateLimitHeaders } from "../protocol/rate_limit.js";
+import { validateSearchQuery } from "../protocol/search.js";
+import {
+  WS_EVENT_TYPES,
+  validateSubscribeMessage,
+  validateAckMessage
+} from "../protocol/websocket.js";
 import { LoomStore } from "./store.js";
 import { renderDashboardHtml } from "./ui.js";
 import { parseBoolean, parsePositiveNumber, parseHostAllowlist } from "./env.js";
+import { createMcpToolRegistry, createMcpSseSession, handleMcpRequest } from "./mcp_server.js";
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -1988,8 +1996,30 @@ export function createLoomServer(options = {}) {
   }
   store.messageRetentionDays = messageRetentionDays;
   store.blobRetentionDays = blobRetentionDays;
+
+  // Loop protection env var overrides
+  const loopMaxHopCount = Math.floor(parsePositiveNumber(
+    options.loopMaxHopCount ?? process.env.LOOM_LOOP_MAX_HOP_COUNT,
+    store.loopProtection.max_hop_count
+  ));
+  const loopAgentWindowMax = Math.floor(parsePositiveNumber(
+    options.loopAgentWindowMax ?? process.env.LOOM_LOOP_AGENT_WINDOW_MAX,
+    store.loopProtection.max_agent_envelopes_per_thread_window
+  ));
+  const loopAgentWindowMs = Math.floor(parsePositiveNumber(
+    options.loopAgentWindowMs ?? process.env.LOOM_LOOP_AGENT_WINDOW_MS,
+    store.loopProtection.agent_window_ms
+  ));
+  store.loopProtection = {
+    max_hop_count: Math.max(1, Math.min(loopMaxHopCount, 255)),
+    max_agent_envelopes_per_thread_window: Math.max(1, loopAgentWindowMax),
+    agent_window_ms: Math.max(1000, loopAgentWindowMs)
+  };
   const runtimeStatusProvider = typeof options.runtimeStatusProvider === "function" ? options.runtimeStatusProvider : null;
   const emailRelay = options.emailRelay || null;
+
+  const mcpToolRegistry = createMcpToolRegistry(store, { domain });
+  const mcpSseSessions = new Map();
 
   const requestHandler = async (req, res) => {
     res.setHeader("x-content-type-options", "nosniff");
@@ -3012,20 +3042,74 @@ export function createLoomServer(options = {}) {
       if (methodIs(req, "GET") && path === "/v1/search") {
         const actorIdentity = requireActorIdentity(req, store);
         const url = requestUrl(req);
-        const result = store.searchEnvelopes(
-          {
-            q: url.searchParams.get("q") || "",
-            from: url.searchParams.get("from"),
-            type: url.searchParams.get("type"),
-            intent: url.searchParams.get("intent"),
-            thread_id: url.searchParams.get("thread_id"),
-            after: url.searchParams.get("after"),
-            before: url.searchParams.get("before"),
-            limit: url.searchParams.get("limit")
-          },
-          actorIdentity
-        );
+        const filters = {
+          q: url.searchParams.get("q") || ""
+        };
+        if (url.searchParams.get("from")) filters.from = url.searchParams.get("from");
+        if (url.searchParams.get("type")) filters.type = url.searchParams.get("type");
+        if (url.searchParams.get("intent")) filters.intent = url.searchParams.get("intent");
+        if (url.searchParams.get("thread_id")) filters.thread_id = url.searchParams.get("thread_id");
+        if (url.searchParams.get("after")) filters.after = url.searchParams.get("after");
+        if (url.searchParams.get("before")) filters.before = url.searchParams.get("before");
+        if (url.searchParams.get("limit")) filters.limit = Number(url.searchParams.get("limit"));
+        // Protocol-level search query validation
+        const searchErrors = validateSearchQuery(filters);
+        if (searchErrors.length > 0) {
+          throw new LoomError("SEARCH_INVALID", searchErrors[0].reason, 400, {
+            errors: searchErrors
+          });
+        }
+        const result = store.searchEnvelopes(filters, actorIdentity);
         sendJson(res, 200, result);
+        return;
+      }
+
+      // ── Events API (Section 17) ────────────────────────────────────────
+      if (methodIs(req, "GET") && path === "/v1/events") {
+        const actorIdentity = requireActorIdentity(req, store);
+        const url = requestUrl(req);
+        const cursor = url.searchParams.get("cursor") || null;
+        const events = store.getEventsSince(cursor);
+        sendJson(res, 200, { events });
+        return;
+      }
+
+      // ── Export/Import API (Section 26.2) ───────────────────────────────
+      if (methodIs(req, "GET") && path === "/v1/export") {
+        const actorIdentity = requireActorIdentity(req, store);
+        const url = requestUrl(req);
+        const threadIds = url.searchParams.get("thread_ids")
+          ? url.searchParams.get("thread_ids").split(",").map((s) => s.trim()).filter(Boolean)
+          : null;
+        const identityFilter = url.searchParams.get("identity") || null;
+        const includeBlobs = url.searchParams.get("include_blobs") === "true";
+        const exportPkg = store.exportMailbox({ threadIds, identityFilter, includeBlobs });
+        sendJson(res, 200, exportPkg);
+        return;
+      }
+
+      if (methodIs(req, "POST") && path === "/v1/import") {
+        const actorIdentity = requireActorIdentity(req, store);
+        const body = await readJson(req, maxBodyBytes * 10); // larger limit for imports
+        const result = store.importMailbox(body, actorIdentity);
+        sendJson(res, 200, result);
+        return;
+      }
+
+      // ── Retention enforcement endpoint ─────────────────────────────────
+      if (methodIs(req, "POST") && path === "/v1/admin/retention/enforce") {
+        requireAdminToken(req, adminToken);
+        const result = store.enforceRetentionPolicies();
+        sendJson(res, 200, result);
+        return;
+      }
+
+      // ── Content deletion endpoint (Section 25.2) ──────────────────────
+      if (methodIs(req, "DELETE") && path.startsWith("/v1/envelopes/") && path.endsWith("/content")) {
+        const actorIdentity = requireActorIdentity(req, store);
+        const envelopeId = path.slice("/v1/envelopes/".length, -"/content".length);
+        const erased = store.deleteEnvelopeContent(envelopeId, actorIdentity);
+        sendJson(res, 200, { ok: true, envelope_id: envelopeId, deleted: true });
         return;
       }
 
@@ -3242,6 +3326,50 @@ export function createLoomServer(options = {}) {
         return;
       }
 
+      // ─── MCP Routes ─────────────────────────────────────────────────
+      if (methodIs(req, "GET") && path === "/v1/mcp/tools") {
+        const toolList = mcpToolRegistry.listTools();
+        sendJson(res, 200, { tools: toolList });
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/mcp/sse") {
+        const actorIdentity = requireActorIdentity(req, store);
+        const session = createMcpSseSession({
+          registry: mcpToolRegistry,
+          sessionContext: {
+            actorIdentity,
+            capabilityPresentationToken: getCapabilityPresentationToken(req)
+          }
+        });
+        mcpSseSessions.set(session.sessionId, session);
+        req.on("close", () => {
+          mcpSseSessions.delete(session.sessionId);
+        });
+        session.handleSse(req, res);
+        return;
+      }
+
+      if (methodIs(req, "POST") && path === "/v1/mcp/message") {
+        const actorIdentity = requireActorIdentity(req, store);
+        const url = requestUrl(req);
+        const sessionId = url.searchParams.get("session_id");
+        const session = sessionId ? mcpSseSessions.get(sessionId) : null;
+        const body = await readJson(req, maxBodyBytes);
+
+        if (session) {
+          const response = session.handleMessage(body);
+          sendJson(res, 202, { status: "accepted" });
+        } else {
+          const response = handleMcpRequest(body, mcpToolRegistry, {
+            actorIdentity,
+            capabilityPresentationToken: getCapabilityPresentationToken(req)
+          });
+          sendJson(res, 200, response || { jsonrpc: "2.0", id: null, result: {} });
+        }
+        return;
+      }
+
         throw new LoomError("ENVELOPE_NOT_FOUND", "Route not found", 404, {
           method: req.method,
           path
@@ -3249,6 +3377,19 @@ export function createLoomServer(options = {}) {
       } catch (error) {
         const { status, body } = toErrorResponse(error, reqId);
         errorCode = body.error.code;
+
+        // Add rate limit headers on 429 responses
+        if (status === 429 && error?.details) {
+          const rlHeaders = buildRateLimitHeaders({
+            limit: error.details.limit || 0,
+            remaining: 0,
+            reset: new Date(Date.now() + (error.details.retry_after_ms || 60000)).toISOString()
+          });
+          for (const [key, value] of Object.entries(rlHeaders)) {
+            res.setHeader(key, value);
+          }
+        }
+
         sendJson(res, status, body);
       }
     };
