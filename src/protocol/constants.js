@@ -10,7 +10,8 @@ export const ID_PREFIX = {
   event: "evt_",
   signingKey: "k_sign_",
   encryptionKey: "k_enc_",
-  nodeSigningKey: "k_node_sign_"
+  nodeSigningKey: "k_node_sign_",
+  mcpRequest: "mcp_req_"
 };
 
 export const ENVELOPE_TYPES = new Set([

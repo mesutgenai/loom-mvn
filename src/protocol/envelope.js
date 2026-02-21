@@ -15,6 +15,9 @@ import {
   isThreadId
 } from "./ids.js";
 import { validateEncryptedContentShape } from "./e2ee.js";
+import { validateMcpExecutionTrace } from "./mcp.js";
+import { validateHopCount } from "./loop_protection.js";
+import { validateContextVector } from "./context_window.js";
 
 function pushError(errors, field, reason) {
   errors.push({ field, reason });
@@ -173,7 +176,7 @@ const INTENT_PREFIXES_BY_TYPE = {
   handoff: ["handoff."],
   data: ["data."],
   receipt: ["receipt."],
-  workflow: ["workflow."],
+  workflow: ["workflow.", "mcp."],
   thread_op: ["thread.", "capability.", "encryption."]
 };
 
@@ -301,10 +304,29 @@ export function validateEnvelopeShape(envelope) {
     pushError(errors, "priority", "must be low|normal|high|urgent");
   }
 
+  const hopErrors = validateHopCount(envelope.hop_count);
+  for (const he of hopErrors) {
+    pushError(errors, he.field, he.reason);
+  }
+
   validateContent(envelope.content, errors);
   validateTypeIntentConsistency(envelope, errors);
   validateAttachments(envelope.attachments, errors);
   validateSignature(envelope.signature, errors);
+
+  if (envelope.meta?.mcp_execution_trace != null) {
+    const traceErrors = validateMcpExecutionTrace(envelope.meta.mcp_execution_trace);
+    for (const traceError of traceErrors) {
+      pushError(errors, traceError.field, traceError.reason);
+    }
+  }
+
+  if (envelope.meta?.context_vector != null) {
+    const cvErrors = validateContextVector(envelope.meta.context_vector);
+    for (const cvError of cvErrors) {
+      pushError(errors, cvError.field, cvError.reason);
+    }
+  }
 
   return errors;
 }

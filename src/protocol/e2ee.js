@@ -13,6 +13,12 @@ import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { canonicalizeJson } from "./canonical.js";
 import { fromBase64Url, toBase64Url } from "./crypto.js";
 import { isIdentity } from "./ids.js";
+import {
+  validateMlsMetadata,
+  validateMlsWelcome,
+  encryptMlsPayload,
+  decryptMlsPayload
+} from "./mls.js";
 
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const WRAPPED_KEY_ID_PATTERN = /^k_enc_[A-Za-z0-9][A-Za-z0-9._:-]{1,126}$/;
@@ -82,8 +88,7 @@ const E2EE_PROFILES = [
   },
   {
     id: "loom-e2ee-mls-1",
-    aliases: [],
-    status: "reserved",
+    aliases: ["loom-mls-1"],
     key_agreement: "MLS-TreeKEM",
     cipher: "AES-128-GCM",
     kdf: "HKDF-SHA-256",
@@ -92,16 +97,17 @@ const E2EE_PROFILES = [
     payload_aad_type: E2EE_PAYLOAD_AAD_TYPE,
     attachment_aad_type: E2EE_ATTACHMENT_AAD_TYPE,
     wrapped_key_aad_type: null,
-    payload_ciphertext_package_version: null,
+    payload_ciphertext_package_version: 2,
     wrapped_key_ciphertext_package_version: null,
     replay_counter_required: false,
     profile_commitment_required: false,
     requires_wrapped_keys: false,
+    requires_mls_metadata: true,
     security_properties: {
       forward_secrecy: true,
       post_compromise_security: true,
       confidentiality: "mls_grade",
-      description: "MLS (RFC 9420) based profile. Reserved for future implementation."
+      description: "MLS (RFC 9420) based profile with forward secrecy and post-compromise security."
     }
   }
 ];
@@ -1104,34 +1110,42 @@ export function validateEncryptedContentShape(content, options = {}) {
     pushError("content.epoch", "must be a non-negative integer when encrypted");
   }
 
+  // MLS profiles do not use replay_counter or profile_commitment
+  const isMlsProfile = profile?.requires_mls_metadata === true;
+
   const hasReplayCounter = Object.prototype.hasOwnProperty.call(content || {}, "replay_counter");
-  if (!hasReplayCounter && enforceReplayMetadata) {
-    pushError("content.replay_counter", "is required when encrypted");
-  } else if (hasReplayCounter && (!Number.isInteger(content?.replay_counter) || content.replay_counter < 0)) {
-    pushError("content.replay_counter", "must be a non-negative integer when encrypted");
+  if (!isMlsProfile) {
+    if (!hasReplayCounter && enforceReplayMetadata) {
+      pushError("content.replay_counter", "is required when encrypted");
+    } else if (hasReplayCounter && (!Number.isInteger(content?.replay_counter) || content.replay_counter < 0)) {
+      pushError("content.replay_counter", "must be a non-negative integer when encrypted");
+    }
   }
 
   const hasProfileCommitment = Object.prototype.hasOwnProperty.call(content || {}, "profile_commitment");
   const profileCommitmentValue =
     content?.profile_commitment == null ? "" : String(content.profile_commitment).trim();
-  if (!hasProfileCommitment && enforceReplayMetadata) {
-    pushError("content.profile_commitment", "is required when encrypted");
-  } else if (hasProfileCommitment) {
-    if (!profileCommitmentValue) {
-      pushError("content.profile_commitment", "must be a non-empty base64url string when encrypted");
-    } else if (!isBase64UrlValue(profileCommitmentValue)) {
-      pushError("content.profile_commitment", "must be a non-empty base64url string when encrypted");
-    } else if (profile && Number.isInteger(content?.epoch) && content.epoch >= 0) {
-      const expectedProfileCommitment = computeE2eeProfileCommitment(profile.id, content.epoch);
-      if (profileCommitmentValue !== expectedProfileCommitment) {
-        pushError("content.profile_commitment", "must match profile/epoch cryptographic commitment");
+  if (!isMlsProfile) {
+    if (!hasProfileCommitment && enforceReplayMetadata) {
+      pushError("content.profile_commitment", "is required when encrypted");
+    } else if (hasProfileCommitment) {
+      if (!profileCommitmentValue) {
+        pushError("content.profile_commitment", "must be a non-empty base64url string when encrypted");
+      } else if (!isBase64UrlValue(profileCommitmentValue)) {
+        pushError("content.profile_commitment", "must be a non-empty base64url string when encrypted");
+      } else if (profile && Number.isInteger(content?.epoch) && content.epoch >= 0) {
+        const expectedProfileCommitment = computeE2eeProfileCommitment(profile.id, content.epoch);
+        if (profileCommitmentValue !== expectedProfileCommitment) {
+          pushError("content.profile_commitment", "must match profile/epoch cryptographic commitment");
+        }
       }
     }
   }
 
   if (!isBase64UrlValue(content?.ciphertext)) {
     pushError("content.ciphertext", "must be a base64url string when encrypted");
-  } else if (options.verifyPayloadCiphertextStructure === true) {
+  } else if (options.verifyPayloadCiphertextStructure === true && !isMlsProfile) {
+    // MLS uses a different ciphertext package format (version 2), skip v1 structure check
     try {
       parseE2eeCiphertextPackage(content.ciphertext);
     } catch (error) {
@@ -1145,6 +1159,15 @@ export function validateEncryptedContentShape(content, options = {}) {
 
   if (content?.structured != null) {
     pushError("content.structured", "must be omitted when content.encrypted=true");
+  }
+
+  // MLS profile: validate mls_metadata instead of wrapped_keys
+  if (isMlsProfile) {
+    const mlsMetadataErrors = validateMlsMetadata(content?.mls_metadata);
+    for (const mlsError of mlsMetadataErrors) {
+      pushError(mlsError.field, mlsError.reason);
+    }
+    return errors;
   }
 
   const wrappedKeys = content?.wrapped_keys;
@@ -1195,6 +1218,40 @@ export function validateEncryptionEpochParameters(parameters, options = {}) {
     );
   }
 
+  // MLS profile: validate mls_welcome instead of wrapped_keys
+  if (profile?.requires_mls_metadata) {
+    const mlsWelcome = parameters?.mls_welcome;
+    if (!mlsWelcome || typeof mlsWelcome !== "object") {
+      pushError(
+        "content.structured.parameters.mls_welcome",
+        "required for MLS profile encryption.epoch@v1"
+      );
+      return errors;
+    }
+    const welcomeErrors = validateMlsWelcome(mlsWelcome);
+    for (const welcomeError of welcomeErrors) {
+      pushError(welcomeError.field, welcomeError.reason);
+    }
+    // Verify all required recipients have group_secrets entries
+    const requiredRecipients = Array.from(
+      new Set((Array.isArray(options.requiredRecipients) ? options.requiredRecipients : []).map((value) => String(value || "").trim()).filter(Boolean))
+    );
+    const seenRecipients = new Set(
+      (Array.isArray(mlsWelcome.group_secrets) ? mlsWelcome.group_secrets : [])
+        .map((gs) => String(gs?.to || "").trim())
+        .filter(Boolean)
+    );
+    for (const requiredRecipient of requiredRecipients) {
+      if (!seenRecipients.has(requiredRecipient)) {
+        pushError(
+          "mls_welcome.group_secrets",
+          `missing group secret for active participant ${requiredRecipient}`
+        );
+      }
+    }
+    return errors;
+  }
+
   const wrappedKeys = parameters?.wrapped_keys;
   if (!Array.isArray(wrappedKeys) || wrappedKeys.length === 0) {
     pushError(
@@ -1230,4 +1287,18 @@ export function validateEncryptionEpochParameters(parameters, options = {}) {
   }
 
   return errors;
+}
+
+// ─── MLS Encrypt/Decrypt Wrappers ──────────────────────────────────────────
+
+export function encryptMlsE2eePayload({ groupState, senderLeafIndex, plaintext }) {
+  return encryptMlsPayload({ groupState, senderLeafIndex, plaintext });
+}
+
+export function decryptMlsE2eePayload({ content, groupState }) {
+  return decryptMlsPayload({
+    groupState,
+    ciphertext: content.ciphertext,
+    mlsMetadata: content.mls_metadata
+  });
 }
