@@ -13,6 +13,7 @@ import {
   detectPingPongPattern,
   assertAgentThreadRateOrThrow
 } from "../../protocol/loop_protection.js";
+import { analyzeEnvelopeForInjection } from "../../protocol/prompt_injection.js";
 import { resolveE2eeProfile, validateEncryptedContentShape, validateEncryptionEpochParameters } from "../../protocol/e2ee.js";
 import { validateMlsMetadata, validateMlsWelcome, validateMlsCommit } from "../../protocol/mls.js";
 import { validateSnapshotParameters, validateContextWindowBudget } from "../../protocol/context_window.js";
@@ -1197,6 +1198,11 @@ export function ingestEnvelopeCore(envelope, context = {}) {
 
   const authoritativeSenderType = this.resolveAuthoritativeEnvelopeSenderType(envelope);
 
+  // Agent trust enforcement — check before spending further resources
+  if (authoritativeSenderType === "agent") {
+    this.assertAgentTrustForIngestion(fromIdentity, authoritativeSenderType);
+  }
+
   this.enforceThreadRecipientFanout(envelope);
 
   if (this.envelopesById.has(envelope.id)) {
@@ -1355,10 +1361,48 @@ export function ingestEnvelopeCore(envelope, context = {}) {
         if (typeof this.ensureThreadLabel === "function") {
           this.ensureThreadLabel(threadId, "sys.escalation");
         }
+        // Record agent trust event for loop escalation
+        if (typeof this.recordAgentTrustEvent === "function") {
+          this.recordAgentTrustEvent(fromIdentity, "loop_escalation", {
+            thread_id: threadId,
+            ping_pong_senders: pingPong.senders
+          });
+        }
       }
     }
   }
   // ── End loop protection ──────────────────────────────────────────────────────
+
+  // ── Prompt injection analysis ─────────────────────────────────────────────
+  let injectionAnalysis = null;
+  let injectionEscalationTriggered = false;
+
+  if (!envelope.content?.encrypted) {
+    injectionAnalysis = analyzeEnvelopeForInjection(envelope, {
+      senderType: authoritativeSenderType
+    });
+
+    if (injectionAnalysis.signal_count > 0 && isAgentSender && !isNewThread) {
+      const injectionEscalationThreshold = context.injectionEscalationThreshold ?? 3;
+      if (injectionAnalysis.signal_count >= injectionEscalationThreshold) {
+        thread.requires_human_escalation = true;
+        injectionEscalationTriggered = true;
+        if (typeof this.ensureThreadLabel === "function") {
+          this.ensureThreadLabel(threadId, "sys.escalation");
+          this.ensureThreadLabel(threadId, "sys.injection");
+        }
+        // Record agent trust event for injection detection
+        if (typeof this.recordAgentTrustEvent === "function") {
+          this.recordAgentTrustEvent(fromIdentity, "injection_detected", {
+            thread_id: threadId,
+            signal_count: injectionAnalysis.signal_count,
+            categories: injectionAnalysis.categories_detected
+          });
+        }
+      }
+    }
+  }
+  // ── End prompt injection analysis ─────────────────────────────────────────
 
   this.enforceThreadEnvelopeEncryptionPolicy(thread, envelope, isNewThread, context);
 
@@ -1390,7 +1434,18 @@ export function ingestEnvelopeCore(envelope, context = {}) {
         hop_count: effectiveHopCount,
         conversation_hash: conversationHash,
         escalation_triggered: loopEscalationTriggered
-      }
+      },
+      injection_analysis: injectionAnalysis ? {
+        signal_count: injectionAnalysis.signal_count,
+        categories_detected: injectionAnalysis.categories_detected,
+        signals: injectionAnalysis.signals.map((s) => ({
+          category: s.category,
+          code: s.code,
+          field: s.field,
+          matched: s.matched ? String(s.matched).slice(0, 80) : null
+        })),
+        escalation_triggered: injectionEscalationTriggered
+      } : null
     }
   };
 

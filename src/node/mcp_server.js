@@ -6,6 +6,13 @@ import {
   MCP_PROTOCOL_VERSION
 } from "../protocol/mcp.js";
 import { LoomError } from "../protocol/errors.js";
+import {
+  classifyTool,
+  assertArgumentSizeOrThrow,
+  assertResultSizeOrThrow,
+  assertToolPermissionOrThrow,
+  DEFAULT_MCP_SANDBOX_POLICY
+} from "../protocol/mcp_sandbox.js";
 import { LOOM_RELEASE_VERSION } from "../protocol/constants.js";
 import { generateUlid } from "../protocol/ulid.js";
 
@@ -13,6 +20,10 @@ import { generateUlid } from "../protocol/ulid.js";
 
 export function createMcpToolRegistry(store, options = {}) {
   const tools = new Map();
+  const sandboxPolicy = {
+    ...DEFAULT_MCP_SANDBOX_POLICY,
+    ...(options.sandboxPolicy || {})
+  };
 
   tools.set("loom_send_envelope", {
     name: "loom_send_envelope",
@@ -218,7 +229,45 @@ export function createMcpToolRegistry(store, options = {}) {
           tool_name: name
         });
       }
-      return tool.handler(args || {}, context || {});
+
+      // 1. Permission check
+      const sessionPermissions = context?.sessionPermissions || {};
+      assertToolPermissionOrThrow(name, sessionPermissions);
+
+      // 2. Argument size check
+      const argCheck = assertArgumentSizeOrThrow(args, sandboxPolicy.max_argument_bytes);
+
+      // 3. Execute with timing
+      const startMs = Date.now();
+      const result = tool.handler(args || {}, context || {});
+      const durationMs = Date.now() - startMs;
+
+      // 4. Post-execution timeout check
+      if (sandboxPolicy.enforce_timeout && durationMs > sandboxPolicy.execution_timeout_ms) {
+        throw new LoomError("DELIVERY_TIMEOUT",
+          `Tool '${name}' exceeded execution timeout: ${durationMs}ms > ${sandboxPolicy.execution_timeout_ms}ms`,
+          504, {
+            tool_name: name,
+            duration_ms: durationMs,
+            timeout_ms: sandboxPolicy.execution_timeout_ms
+          });
+      }
+
+      // 5. Result size check
+      const resultCheck = assertResultSizeOrThrow(result, sandboxPolicy.max_result_bytes);
+
+      // 6. Attach execution metrics to context
+      if (context && typeof context === "object") {
+        context._executionMetrics = {
+          tool_name: name,
+          classification: classifyTool(name),
+          duration_ms: durationMs,
+          argument_bytes: argCheck.byte_count,
+          result_bytes: resultCheck.byte_count
+        };
+      }
+
+      return result;
     },
 
     hasTool(name) {
@@ -227,6 +276,10 @@ export function createMcpToolRegistry(store, options = {}) {
 
     getToolNames() {
       return Array.from(tools.keys());
+    },
+
+    getSandboxPolicy() {
+      return { ...sandboxPolicy };
     }
   };
 }

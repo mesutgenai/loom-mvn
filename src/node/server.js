@@ -3,6 +3,7 @@ import { createSecureServer } from "node:http2";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { BlockList, isIP } from "node:net";
+import { gzipSync, gunzipSync, brotliCompressSync, brotliDecompressSync, deflateSync, inflateSync, constants as zlibConstants } from "node:zlib";
 
 import { toErrorResponse, LoomError } from "../protocol/errors.js";
 import { buildRateLimitHeaders } from "../protocol/rate_limit.js";
@@ -16,6 +17,8 @@ import { LoomStore } from "./store.js";
 import { renderDashboardHtml } from "./ui.js";
 import { parseBoolean, parsePositiveNumber, parseHostAllowlist } from "./env.js";
 import { createMcpToolRegistry, createMcpSseSession, handleMcpRequest } from "./mcp_server.js";
+import { negotiateEncoding, shouldCompress, buildCompressionHeaders, DEFAULT_COMPRESSION_POLICY } from "../protocol/compression.js";
+import { createSearchIndex } from "../protocol/search_index.js";
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -241,9 +244,28 @@ function storeIdempotentResult(store, context, status, body) {
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
+  const bodyBytes = Buffer.byteLength(body);
+
+  const ctx = res._compressionCtx;
+  if (ctx && ctx.policy.enabled && shouldCompress("application/json", bodyBytes, ctx.policy)) {
+    const encoding = negotiateEncoding(ctx.acceptEncoding, ctx.policy);
+    if (encoding !== "identity") {
+      const compressed = compressBuffer(Buffer.from(body), encoding, ctx.policy.level);
+      const headers = buildCompressionHeaders(encoding);
+      res.writeHead(status, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": compressed.length.toString(),
+        ...headers
+      });
+      res.end(compressed);
+      return;
+    }
+  }
+
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(body).toString()
+    "content-length": bodyBytes.toString(),
+    ...(ctx ? { vary: "accept-encoding" } : {})
   });
   res.end(body);
 }
@@ -262,6 +284,34 @@ function sendText(res, status, text, contentType = "text/plain; version=0.0.4; c
     "content-length": Buffer.byteLength(text).toString()
   });
   res.end(text);
+}
+
+function compressBuffer(buffer, encoding, level = 6) {
+  switch (encoding) {
+    case "gzip":
+      return gzipSync(buffer, { level });
+    case "br":
+      return brotliCompressSync(buffer, {
+        params: { [zlibConstants.BROTLI_PARAM_QUALITY]: Math.min(level, 11) }
+      });
+    case "deflate":
+      return deflateSync(buffer, { level });
+    default:
+      return buffer;
+  }
+}
+
+function decompressBuffer(buffer, encoding) {
+  switch (encoding) {
+    case "gzip":
+      return gunzipSync(buffer);
+    case "br":
+      return brotliDecompressSync(buffer);
+    case "deflate":
+      return inflateSync(buffer);
+    default:
+      return buffer;
+  }
 }
 
 async function readJson(req, maxBodyBytes) {
@@ -297,7 +347,24 @@ async function readRawBody(req, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
     return "";
   }
 
-  return Buffer.concat(chunks).toString("utf-8");
+  let buffer = Buffer.concat(chunks);
+
+  // Decompress if content-encoding header is present
+  const contentEncoding = req.headers["content-encoding"];
+  if (contentEncoding) {
+    const encoding = contentEncoding.trim().toLowerCase();
+    if (encoding === "gzip" || encoding === "br" || encoding === "deflate") {
+      try {
+        buffer = decompressBuffer(buffer, encoding);
+      } catch {
+        throw new LoomError("ENVELOPE_INVALID", `Failed to decompress ${encoding} content`, 400, {
+          field: "content-encoding"
+        });
+      }
+    }
+  }
+
+  return buffer.toString("utf-8");
 }
 
 function requestPath(req) {
@@ -1878,6 +1945,15 @@ export function createLoomServer(options = {}) {
       )
     )
   );
+  const inboundContentFilterInjectionThreshold = Math.max(
+    1,
+    Math.floor(
+      parsePositiveNumber(
+        options.inboundContentFilterInjectionThreshold ?? process.env.LOOM_INBOUND_CONTENT_FILTER_INJECTION_THRESHOLD,
+        store.inboundContentFilterInjectionThreshold
+      )
+    )
+  );
   const inboundContentFilterProfileDefault = normalizeInboundContentFilterProfile(
     options.inboundContentFilterProfileDefault ?? process.env.LOOM_INBOUND_CONTENT_FILTER_PROFILE_DEFAULT,
     store.inboundContentFilterProfileDefault
@@ -1960,6 +2036,7 @@ export function createLoomServer(options = {}) {
   store.inboundContentFilterPhishThreshold = inboundContentFilterPhishThreshold;
   store.inboundContentFilterQuarantineThreshold = inboundContentFilterQuarantineThreshold;
   store.inboundContentFilterRejectThreshold = inboundContentFilterRejectThreshold;
+  store.inboundContentFilterInjectionThreshold = inboundContentFilterInjectionThreshold;
   store.inboundContentFilterProfileDefault = inboundContentFilterProfileDefault;
   store.inboundContentFilterProfileBridge = inboundContentFilterProfileBridge;
   store.inboundContentFilterProfileFederation = inboundContentFilterProfileFederation;
@@ -2015,13 +2092,164 @@ export function createLoomServer(options = {}) {
     max_agent_envelopes_per_thread_window: Math.max(1, loopAgentWindowMax),
     agent_window_ms: Math.max(1000, loopAgentWindowMs)
   };
+  // MCP sandbox env var overrides
+  const mcpMaxArgumentBytes = Math.max(1024, Math.floor(parsePositiveNumber(
+    options.mcpMaxArgumentBytes ?? process.env.LOOM_MCP_MAX_ARGUMENT_BYTES,
+    store.mcpSandboxPolicy.max_argument_bytes
+  )));
+  const mcpMaxResultBytes = Math.max(1024, Math.floor(parsePositiveNumber(
+    options.mcpMaxResultBytes ?? process.env.LOOM_MCP_MAX_RESULT_BYTES,
+    store.mcpSandboxPolicy.max_result_bytes
+  )));
+  const mcpExecutionTimeoutMs = Math.max(100, Math.floor(parsePositiveNumber(
+    options.mcpExecutionTimeoutMs ?? process.env.LOOM_MCP_EXECUTION_TIMEOUT_MS,
+    store.mcpSandboxPolicy.execution_timeout_ms
+  )));
+  const mcpRateLimitPerActor = Math.max(1, Math.floor(parsePositiveNumber(
+    options.mcpRateLimitPerActor ?? process.env.LOOM_MCP_RATE_LIMIT_PER_ACTOR,
+    store.mcpSandboxPolicy.rate_limit_per_actor
+  )));
+  const mcpRateLimitWindowMs = Math.max(1000, Math.floor(parsePositiveNumber(
+    options.mcpRateLimitWindowMs ?? process.env.LOOM_MCP_RATE_LIMIT_WINDOW_MS,
+    store.mcpSandboxPolicy.rate_limit_window_ms
+  )));
+  const mcpAllowWriteTools = parseBoolean(
+    options.mcpAllowWriteTools ?? process.env.LOOM_MCP_ALLOW_WRITE_TOOLS,
+    true
+  );
+  const mcpEnforceTimeout = parseBoolean(
+    options.mcpEnforceTimeout ?? process.env.LOOM_MCP_ENFORCE_TIMEOUT,
+    true
+  );
+  store.mcpSandboxPolicy = {
+    max_argument_bytes: mcpMaxArgumentBytes,
+    max_result_bytes: mcpMaxResultBytes,
+    execution_timeout_ms: mcpExecutionTimeoutMs,
+    rate_limit_per_actor: mcpRateLimitPerActor,
+    rate_limit_window_ms: mcpRateLimitWindowMs,
+    allow_write_tools: mcpAllowWriteTools,
+    enforce_timeout: mcpEnforceTimeout
+  };
+
+  // Agent trust env var overrides
+  const agentTrustEnabled = parseBoolean(
+    options.agentTrustEnabled ?? process.env.LOOM_AGENT_TRUST_ENABLED,
+    true
+  );
+  store.agentTrustEnabled = agentTrustEnabled;
+  store.agentTrustPolicy = {
+    decay_window_ms: Math.max(60000, Math.floor(parsePositiveNumber(
+      options.agentTrustDecayWindowMs ?? process.env.LOOM_AGENT_TRUST_DECAY_WINDOW_MS,
+      store.agentTrustPolicy.decay_window_ms
+    ))),
+    warning_threshold: Math.max(1, Math.floor(parsePositiveNumber(
+      options.agentTrustWarningThreshold ?? process.env.LOOM_AGENT_TRUST_WARNING,
+      store.agentTrustPolicy.warning_threshold
+    ))),
+    quarantine_threshold: Math.max(2, Math.floor(parsePositiveNumber(
+      options.agentTrustQuarantineThreshold ?? process.env.LOOM_AGENT_TRUST_QUARANTINE,
+      store.agentTrustPolicy.quarantine_threshold
+    ))),
+    block_threshold: Math.max(3, Math.floor(parsePositiveNumber(
+      options.agentTrustBlockThreshold ?? process.env.LOOM_AGENT_TRUST_BLOCK,
+      store.agentTrustPolicy.block_threshold
+    ))),
+    max_events_per_agent: Math.max(10, Math.floor(parsePositiveNumber(
+      options.agentTrustMaxEventsPerAgent ?? process.env.LOOM_AGENT_TRUST_MAX_EVENTS,
+      store.agentTrustPolicy.max_events_per_agent
+    ))),
+    good_behavior_decay: store.agentTrustPolicy.good_behavior_decay
+  };
+
+  // MIME policy env vars
+  const mimePolicyMode = options.mimePolicyMode ?? process.env.LOOM_MIME_POLICY_MODE ?? undefined;
+  if (mimePolicyMode) {
+    const mimeAllowedCategories = parseStringList(
+      options.mimeAllowedCategories ?? process.env.LOOM_MIME_ALLOWED_CATEGORIES
+    );
+    const mimeDeniedTypes = parseStringList(
+      options.mimeDeniedTypes ?? process.env.LOOM_MIME_DENIED_TYPES
+    );
+    const mimeRequireRegistered = parseBoolean(
+      options.mimeRequireRegistered ?? process.env.LOOM_MIME_REQUIRE_REGISTERED,
+      false
+    );
+    store.mimePolicy = {
+      ...store.mimePolicy,
+      mode: mimePolicyMode,
+      ...(mimeAllowedCategories.length > 0 ? { allowed_categories: mimeAllowedCategories } : {}),
+      ...(mimeDeniedTypes.length > 0 ? { denied_types: mimeDeniedTypes } : {}),
+      require_registered: mimeRequireRegistered
+    };
+  }
+
+  // Compression policy env vars
+  const compressionPolicy = {
+    ...DEFAULT_COMPRESSION_POLICY,
+    enabled: parseBoolean(
+      options.compressionEnabled ?? process.env.LOOM_COMPRESSION_ENABLED,
+      DEFAULT_COMPRESSION_POLICY.enabled
+    ),
+    min_size_bytes: Math.max(0, Math.floor(parsePositiveNumber(
+      options.compressionMinSize ?? process.env.LOOM_COMPRESSION_MIN_SIZE,
+      DEFAULT_COMPRESSION_POLICY.min_size_bytes
+    ))),
+    preferred_encoding: (options.compressionEncoding ?? process.env.LOOM_COMPRESSION_ENCODING ?? DEFAULT_COMPRESSION_POLICY.preferred_encoding).toLowerCase(),
+    level: Math.max(1, Math.min(11, Math.floor(parsePositiveNumber(
+      options.compressionLevel ?? process.env.LOOM_COMPRESSION_LEVEL,
+      DEFAULT_COMPRESSION_POLICY.level
+    ))))
+  };
+  store.compressionPolicy = compressionPolicy;
+
+  // Key rotation policy env vars
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const HOUR_MS = 60 * 60 * 1000;
+  const keyRotationMaxAgeDays = parsePositiveNumber(
+    options.keyRotationMaxAgeDays ?? process.env.LOOM_KEY_ROTATION_MAX_AGE_DAYS, 90
+  );
+  const keyRotationGracePeriodDays = parsePositiveNumber(
+    options.keyRotationGracePeriodDays ?? process.env.LOOM_KEY_ROTATION_GRACE_PERIOD_DAYS, 7
+  );
+  const keyRotationOverlapHours = parsePositiveNumber(
+    options.keyRotationOverlapHours ?? process.env.LOOM_KEY_ROTATION_OVERLAP_HOURS, 24
+  );
+  const keyRotationAutoRotate = parseBoolean(
+    options.keyRotationAutoRotate ?? process.env.LOOM_KEY_ROTATION_AUTO_ROTATE, false
+  );
+  store.keyRotationPolicy = {
+    max_key_age_ms: keyRotationMaxAgeDays * DAY_MS,
+    grace_period_ms: keyRotationGracePeriodDays * DAY_MS,
+    overlap_window_ms: keyRotationOverlapHours * HOUR_MS,
+    min_key_age_ms: HOUR_MS,
+    auto_rotate: keyRotationAutoRotate
+  };
+
+  // Search index env vars
+  const searchIndexEnabled = parseBoolean(
+    options.searchIndexEnabled ?? process.env.LOOM_SEARCH_INDEX_ENABLED, true
+  );
+  const searchIndexMaxEntries = Math.max(1000, Math.floor(parsePositiveNumber(
+    options.searchIndexMaxEntries ?? process.env.LOOM_SEARCH_INDEX_MAX_ENTRIES, 100000
+  )));
+  store.searchIndexEnabled = searchIndexEnabled;
+  if (searchIndexEnabled && !store.searchIndex) {
+    store.searchIndex = createSearchIndex({ max_entries: searchIndexMaxEntries });
+  }
+
   const runtimeStatusProvider = typeof options.runtimeStatusProvider === "function" ? options.runtimeStatusProvider : null;
   const emailRelay = options.emailRelay || null;
 
-  const mcpToolRegistry = createMcpToolRegistry(store, { domain });
+  const mcpToolRegistry = createMcpToolRegistry(store, { domain, sandboxPolicy: store.mcpSandboxPolicy });
   const mcpSseSessions = new Map();
 
   const requestHandler = async (req, res) => {
+    // Attach compression context for transparent sendJson compression
+    res._compressionCtx = {
+      acceptEncoding: req.headers["accept-encoding"] || "",
+      policy: compressionPolicy
+    };
+
     res.setHeader("x-content-type-options", "nosniff");
     res.setHeader("x-frame-options", "DENY");
     res.setHeader("cache-control", "no-store");
@@ -2444,6 +2672,47 @@ export function createLoomServer(options = {}) {
         return;
       }
 
+      // ── Agent Card Routes ─────────────────────────────────────────────────
+      if (methodIs(req, "GET") && path === "/v1/agents") {
+        const cards = store.listAgentCards();
+        sendJson(res, 200, { agents: cards, count: cards.length });
+        return;
+      }
+
+      if (methodIs(req, "GET") && path.startsWith("/v1/agents/")) {
+        const encodedUri = path.slice("/v1/agents/".length);
+        const agentUri = decodeURIComponent(encodedUri);
+        const card = store.getAgentCard(agentUri);
+        if (!card) {
+          throw new LoomError("IDENTITY_NOT_FOUND", `Agent not found: ${agentUri}`, 404, {
+            identity: agentUri
+          });
+        }
+        sendJson(res, 200, card);
+        return;
+      }
+
+      // ── Agent Trust Admin Routes ───────────────────────────────────────────
+      if (methodIs(req, "GET") && path === "/v1/admin/agent-trust") {
+        requireAdminToken(req, adminToken);
+        const cards = store.listAgentCards();
+        const summaries = cards.map((entry) => ({
+          identity: entry.identity,
+          trust: store.getAgentTrustScore(entry.identity)
+        }));
+        sendJson(res, 200, { agents: summaries, count: summaries.length });
+        return;
+      }
+
+      if (methodIs(req, "GET") && path.startsWith("/v1/admin/agent-trust/")) {
+        requireAdminToken(req, adminToken);
+        const encodedUri = path.slice("/v1/admin/agent-trust/".length);
+        const agentUri = decodeURIComponent(encodedUri);
+        const trustScore = store.getAgentTrustScore(agentUri);
+        sendJson(res, 200, trustScore);
+        return;
+      }
+
       if (methodIs(req, "POST") && path === "/v1/auth/challenge") {
         const body = await readJson(req, maxBodyBytes);
         const challenge = store.createAuthChallenge(body);
@@ -2647,6 +2916,54 @@ export function createLoomServer(options = {}) {
 
       if (methodIs(req, "GET") && path === "/v1/protocol/capabilities") {
         sendJson(res, 200, store.getProtocolCapabilities(domain));
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/protocol/compliance") {
+        sendJson(res, 200, store.getComplianceScore());
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/admin/compliance/audit") {
+        requireAdminToken(req, adminToken);
+        sendJson(res, 200, store.runComplianceAudit());
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/mime/registry") {
+        sendJson(res, 200, store.getMimeRegistry());
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/admin/nist/summary") {
+        requireAdminToken(req, adminToken);
+        sendJson(res, 200, store.getNistComplianceSummary());
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/admin/key-rotation/status") {
+        requireAdminToken(req, adminToken);
+        sendJson(res, 200, store.assessKeyRotationStatus());
+        return;
+      }
+
+      if (methodIs(req, "POST") && path === "/v1/admin/key-rotation/rotate") {
+        requireAdminToken(req, adminToken);
+        const body = await readJson(req, maxBodyBytes);
+        const result = store.executeKeyRotation({ force: body?.force === true });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/admin/key-rotation/history") {
+        requireAdminToken(req, adminToken);
+        sendJson(res, 200, { history: store.getKeyRotationHistory() });
+        return;
+      }
+
+      if (methodIs(req, "GET") && path === "/v1/admin/search-index/status") {
+        requireAdminToken(req, adminToken);
+        sendJson(res, 200, store.getSearchIndexStatus());
         return;
       }
 
@@ -3339,7 +3656,8 @@ export function createLoomServer(options = {}) {
           registry: mcpToolRegistry,
           sessionContext: {
             actorIdentity,
-            capabilityPresentationToken: getCapabilityPresentationToken(req)
+            capabilityPresentationToken: getCapabilityPresentationToken(req),
+            sessionPermissions: { allow_write_tools: store.mcpSandboxPolicy.allow_write_tools }
           }
         });
         mcpSseSessions.set(session.sessionId, session);
@@ -3363,7 +3681,8 @@ export function createLoomServer(options = {}) {
         } else {
           const response = handleMcpRequest(body, mcpToolRegistry, {
             actorIdentity,
-            capabilityPresentationToken: getCapabilityPresentationToken(req)
+            capabilityPresentationToken: getCapabilityPresentationToken(req),
+            sessionPermissions: { allow_write_tools: store.mcpSandboxPolicy.allow_write_tools }
           });
           sendJson(res, 200, response || { jsonrpc: "2.0", id: null, result: {} });
         }

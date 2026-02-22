@@ -751,3 +751,94 @@ test("mcp: getProtocolCapabilities mcp urls are null without domain", () => {
   assert.equal(caps.mcp.tools_url, null);
   assert.equal(caps.mcp.sse_url, null);
 });
+
+// ─── MCP Server Sandbox Enforcement ─────────────────────────────────────────
+
+test("sandbox: callTool enforces argument size limit", () => {
+  const { store } = setupStore();
+  const registry = createMcpToolRegistry(store, {
+    sandboxPolicy: { max_argument_bytes: 64 }
+  });
+  assert.throws(
+    () => registry.callTool("loom_list_threads", { data: "x".repeat(200) }, {}),
+    (err) => err.code === "PAYLOAD_TOO_LARGE" && err.status === 413
+  );
+});
+
+test("sandbox: callTool allows small arguments within limit", () => {
+  const { store } = setupStore();
+  const registry = createMcpToolRegistry(store, {
+    sandboxPolicy: { max_argument_bytes: 256 * 1024 }
+  });
+  const result = registry.callTool("loom_list_threads", { limit: 5 }, {});
+  assert.ok(result.content);
+});
+
+test("sandbox: callTool denies write tool in read-only session", () => {
+  const { store, aliceKeys } = setupStore();
+  const registry = createMcpToolRegistry(store);
+  assert.throws(
+    () => registry.callTool("loom_send_envelope", { envelope: {} }, {
+      sessionPermissions: { allow_write_tools: false },
+      actorIdentity: "loom://alice@node.test"
+    }),
+    (err) => err.code === "CAPABILITY_DENIED" && err.status === 403
+  );
+});
+
+test("sandbox: callTool allows read tool in read-only session", () => {
+  const { store } = setupStore();
+  const registry = createMcpToolRegistry(store);
+  const result = registry.callTool("loom_list_threads", {}, {
+    sessionPermissions: { allow_write_tools: false }
+  });
+  assert.ok(result.content);
+});
+
+test("sandbox: callTool denies unknown tool via permission check", () => {
+  const { store } = setupStore();
+  const registry = createMcpToolRegistry(store);
+  // "evil_tool" doesn't exist in the tool map, so it throws ENVELOPE_INVALID first
+  assert.throws(
+    () => registry.callTool("evil_tool", {}, {}),
+    (err) => err.code === "ENVELOPE_INVALID"
+  );
+});
+
+test("sandbox: callTool captures execution metrics in context", () => {
+  const { store } = setupStore();
+  const registry = createMcpToolRegistry(store);
+  const context = {};
+  registry.callTool("loom_list_threads", {}, context);
+  assert.ok(context._executionMetrics);
+  assert.equal(context._executionMetrics.tool_name, "loom_list_threads");
+  assert.equal(context._executionMetrics.classification, "read");
+  assert.equal(typeof context._executionMetrics.duration_ms, "number");
+  assert.equal(typeof context._executionMetrics.argument_bytes, "number");
+  assert.equal(typeof context._executionMetrics.result_bytes, "number");
+});
+
+test("sandbox: getSandboxPolicy returns effective policy", () => {
+  const { store } = setupStore();
+  const registry = createMcpToolRegistry(store, {
+    sandboxPolicy: { max_argument_bytes: 4096, execution_timeout_ms: 1000 }
+  });
+  const policy = registry.getSandboxPolicy();
+  assert.equal(policy.max_argument_bytes, 4096);
+  assert.equal(policy.execution_timeout_ms, 1000);
+  assert.equal(policy.max_result_bytes, 1024 * 1024); // default preserved
+});
+
+test("sandbox: handleMcpRequest returns JSON-RPC error for oversized arguments", () => {
+  const { store } = setupStore();
+  const registry = createMcpToolRegistry(store, {
+    sandboxPolicy: { max_argument_bytes: 32 }
+  });
+  const response = handleMcpRequest(
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "loom_list_threads", arguments: { data: "x".repeat(200) } } },
+    registry,
+    {}
+  );
+  assert.ok(response.error);
+  assert.equal(response.error.code, -32603); // INTERNAL_ERROR
+});

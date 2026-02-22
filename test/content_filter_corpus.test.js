@@ -89,3 +89,75 @@ test("content filter corpus: agent malicious traffic is still blocked", () => {
   assert.equal(status.rejected, expectedRejects);
   assert.equal(status.quarantined, expectedQuarantines);
 });
+
+test("content filter corpus: injection benign traffic avoids false positives", () => {
+  const store = makeAgentStore();
+  const corpus = loadCorpus("injection-benign-v1.json");
+  let evaluated = 0;
+
+  for (const vector of corpus.vectors) {
+    const evaluation = store.evaluateInboundContentPolicy(
+      {
+        subject: vector.subject,
+        text: vector.text,
+        html: vector.html || "",
+        attachments: Array.isArray(vector.attachments) ? vector.attachments : []
+      },
+      {
+        source: "federation",
+        actor: "loom://ops@remote.example",
+        node_id: "remote.example"
+      }
+    );
+
+    evaluated += 1;
+    assert.equal(evaluation.profile, "agent", vector.id);
+    assert.equal(evaluation.action, vector.expected_action || "allow", `${vector.id} action`);
+    assert.equal(evaluation.labels.includes("sys.quarantine"), false, `${vector.id} quarantine`);
+    assert.equal(evaluation.labels.includes("sys.injection"), false, `${vector.id} injection label`);
+    assert.equal(evaluation.injection_score, 0, `${vector.id} injection_score`);
+  }
+
+  const status = store.getInboundContentFilterStatus();
+  assert.equal(status.rejected, 0);
+  assert.equal(status.quarantined, 0);
+  assert.equal(status.evaluated, evaluated);
+});
+
+test("content filter corpus: injection malicious traffic is detected", () => {
+  const store = makeAgentStore();
+  const corpus = loadCorpus("injection-malicious-v1.json");
+  let expectedRejects = 0;
+  let expectedQuarantines = 0;
+
+  for (const vector of corpus.vectors) {
+    if (vector.expected_action === "reject") {
+      expectedRejects += 1;
+    } else if (vector.expected_action === "quarantine") {
+      expectedQuarantines += 1;
+    }
+
+    const evaluation = store.evaluateInboundContentPolicy(
+      {
+        subject: vector.subject,
+        text: vector.text,
+        html: vector.html || "",
+        attachments: Array.isArray(vector.attachments) ? vector.attachments : []
+      },
+      {
+        source: "federation",
+        actor: "loom://attacker@remote.example",
+        node_id: "remote.example"
+      }
+    );
+
+    assert.equal(evaluation.profile, "agent", vector.id);
+    assert.equal(evaluation.action, vector.expected_action, `${vector.id} action`);
+    assert.ok(evaluation.injection_score > 0, `${vector.id} injection_score`);
+    assert.ok(evaluation.detected_categories.includes("injection"), `${vector.id} has injection category`);
+  }
+
+  const status = store.getInboundContentFilterStatus();
+  assert.equal(status.rejected, expectedRejects);
+  assert.equal(status.quarantined, expectedQuarantines);
+});

@@ -8,7 +8,8 @@ import { LoomStore } from "../src/node/store.js";
 import {
   isMcpToolRequestEnvelope,
   buildMcpResponseEnvelope,
-  processMcpToolRequest
+  processMcpToolRequest,
+  createMcpToolRateLimiter
 } from "../src/node/mcp_client.js";
 import { createMcpToolRegistry } from "../src/node/mcp_server.js";
 
@@ -821,4 +822,158 @@ test("e2e: auto-execution error for nonexistent tool produces error response in 
   );
   assert.equal(responses.length, 1);
   assert.equal(responses[0].content.structured.parameters.is_error, true);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MCP Client Sandbox Enforcement
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test("sandbox: processMcpToolRequest enforces argument size limit", () => {
+  const { store, aliceKeys } = setupStore();
+  const { threadId, seedId } = signAndIngestSeed(store, aliceKeys);
+  const options = makeProcessorOptions(store, {
+    sandboxPolicy: { max_argument_bytes: 32 }
+  });
+
+  const env = makeToolRequestEnvelope({
+    thread_id: threadId,
+    parent_id: seedId,
+    parameters: { tool_name: "loom_list_threads", request_id: `mcp_req_${generateUlid()}`, arguments: { data: "x".repeat(200) } }
+  });
+
+  const result = processMcpToolRequest(store, env, options);
+  assert.equal(result.processed, true);
+  assert.equal(result.is_error, true);
+
+  const respEnv = store.getEnvelope(result.response_envelope_id);
+  assert.ok(respEnv.content.structured.parameters.error_message.includes("size limit"));
+});
+
+test("sandbox: processMcpToolRequest enforces rate limit", () => {
+  const { store, aliceKeys } = setupStore();
+  const { threadId, seedId } = signAndIngestSeed(store, aliceKeys);
+  const rateLimiter = createMcpToolRateLimiter(2, 60000);
+  const options = makeProcessorOptions(store, { mcpRateLimiter: rateLimiter });
+
+  // First two calls should succeed
+  for (let i = 0; i < 2; i++) {
+    const env = makeToolRequestEnvelope({
+      thread_id: threadId,
+      parent_id: seedId,
+      parameters: { tool_name: "loom_list_threads", request_id: `mcp_req_${generateUlid()}`, arguments: {} }
+    });
+    const result = processMcpToolRequest(store, env, options);
+    assert.equal(result.processed, true);
+    assert.equal(result.is_error, false);
+  }
+
+  // Third call should be rate limited
+  const env = makeToolRequestEnvelope({
+    thread_id: threadId,
+    parent_id: seedId,
+    parameters: { tool_name: "loom_list_threads", request_id: `mcp_req_${generateUlid()}`, arguments: {} }
+  });
+  const result = processMcpToolRequest(store, env, options);
+  assert.equal(result.processed, true);
+  assert.equal(result.is_error, true);
+
+  const respEnv = store.getEnvelope(result.response_envelope_id);
+  assert.ok(respEnv.content.structured.parameters.error_message.includes("Rate limit"));
+});
+
+test("sandbox: processMcpToolRequest returns error envelope (not exception) on sandbox violation", () => {
+  const { store, aliceKeys } = setupStore();
+  const { threadId, seedId } = signAndIngestSeed(store, aliceKeys);
+  const options = makeProcessorOptions(store, {
+    sandboxPolicy: { max_argument_bytes: 16 }
+  });
+
+  const env = makeToolRequestEnvelope({
+    thread_id: threadId,
+    parent_id: seedId,
+    parameters: { tool_name: "loom_list_threads", request_id: `mcp_req_${generateUlid()}`, arguments: { big: "x".repeat(100) } }
+  });
+
+  // Should not throw — should return error response
+  const result = processMcpToolRequest(store, env, options);
+  assert.equal(result.processed, true);
+  assert.equal(result.is_error, true);
+  assert.ok(result.response_envelope_id);
+});
+
+test("sandbox: processMcpToolRequest passes sandbox metrics in execution trace", () => {
+  const { store, aliceKeys } = setupStore();
+  const { threadId, seedId } = signAndIngestSeed(store, aliceKeys);
+  const options = makeProcessorOptions(store, {
+    sandboxPolicy: { execution_timeout_ms: 10000 }
+  });
+
+  const env = makeToolRequestEnvelope({
+    thread_id: threadId,
+    parent_id: seedId,
+    parameters: { tool_name: "loom_list_threads", request_id: `mcp_req_${generateUlid()}`, arguments: {} }
+  });
+
+  const result = processMcpToolRequest(store, env, options);
+  const respEnv = store.getEnvelope(result.response_envelope_id);
+  const trace = respEnv.meta.mcp_execution_trace.steps[0];
+  assert.ok(trace.sandbox);
+  assert.equal(typeof trace.sandbox.argument_bytes, "number");
+  assert.equal(trace.sandbox.timeout_ms, 10000);
+  assert.equal(trace.sandbox.timed_out, false);
+});
+
+test("sandbox: onSandboxViolation callback is called on arg size violation", () => {
+  const { store, aliceKeys } = setupStore();
+  const { threadId, seedId } = signAndIngestSeed(store, aliceKeys);
+  const violations = [];
+  const options = makeProcessorOptions(store, {
+    sandboxPolicy: { max_argument_bytes: 16 },
+    onSandboxViolation: (v) => violations.push(v)
+  });
+
+  const env = makeToolRequestEnvelope({
+    thread_id: threadId,
+    parent_id: seedId,
+    parameters: { tool_name: "loom_list_threads", request_id: `mcp_req_${generateUlid()}`, arguments: { big: "x".repeat(100) } }
+  });
+
+  processMcpToolRequest(store, env, options);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].type, "argument_size_exceeded");
+  assert.equal(violations[0].tool_name, "loom_list_threads");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// createMcpToolRateLimiter
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test("createMcpToolRateLimiter: creates limiter with defaults", () => {
+  const limiter = createMcpToolRateLimiter();
+  const result = limiter.check("loom://alice@test");
+  assert.equal(result.allowed, true);
+  assert.equal(result.limit, 60);
+  assert.equal(result.remaining, 60);
+  assert.equal(result.window_ms, 60000);
+});
+
+test("createMcpToolRateLimiter: tracks per-actor independently", () => {
+  const limiter = createMcpToolRateLimiter(2, 60000);
+  limiter.record("loom://alice@test");
+  limiter.record("loom://alice@test");
+  // Alice exhausted
+  assert.equal(limiter.check("loom://alice@test").allowed, false);
+  // Bob still has capacity
+  assert.equal(limiter.check("loom://bob@test").allowed, true);
+  assert.equal(limiter.check("loom://bob@test").remaining, 2);
+});
+
+test("createMcpToolRateLimiter: check returns accurate remaining count", () => {
+  const limiter = createMcpToolRateLimiter(5, 60000);
+  limiter.record("actor1");
+  limiter.record("actor1");
+  limiter.record("actor1");
+  const result = limiter.check("actor1");
+  assert.equal(result.allowed, true);
+  assert.equal(result.remaining, 2);
 });

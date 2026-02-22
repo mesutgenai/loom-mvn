@@ -28,6 +28,7 @@ import {
 } from "../protocol/crypto.js";
 import { LoomError } from "../protocol/errors.js";
 import { canonicalizeEnvelope, canonicalizeJson } from "../protocol/canonical.js";
+import { analyzeEnvelopeForInjection } from "../protocol/prompt_injection.js";
 import { canonicalThreadOrder, validateThreadDag } from "../protocol/thread.js";
 import { isIdentity, normalizeLoomIdentity } from "../protocol/ids.js";
 import { generateUlid } from "../protocol/ulid.js";
@@ -44,6 +45,14 @@ import {
 } from "../protocol/trust.js";
 import { deserializeMlsGroupState } from "../protocol/mls_codec.js";
 import { validateAgentInfo, normalizeAgentInfo } from "../protocol/agent_info.js";
+import { validateAgentCard, normalizeAgentCard } from "../protocol/agent_card.js";
+import {
+  computeAgentTrustScore,
+  classifyAgentTrust,
+  assertAgentTrustOrThrow,
+  AGENT_TRUST_EVENT_TYPES,
+  AGENT_TRUST_LEVELS
+} from "../protocol/agent_trust.js";
 import { buildDeliveryReceipt, buildReadReceipt, buildFailureReceipt, shouldSuppressAutoReply } from "../protocol/receipts.js";
 import {
   DEFAULT_RETENTION_POLICIES,
@@ -71,6 +80,11 @@ import {
   IMPORT_LABEL
 } from "../protocol/import_export.js";
 import { validateBlobInitiation } from "../protocol/blob.js";
+import { normalizeMimeType, isDangerousMimeType, isAllowedBlobMimeType, DEFAULT_MIME_POLICY, TEXT_MIME_TYPES, IMAGE_MIME_TYPES, DOCUMENT_MIME_TYPES, AUDIO_MIME_TYPES, VIDEO_MIME_TYPES, DANGEROUS_MIME_TYPES } from "../protocol/mime_registry.js";
+import { runComplianceAudit as _runComplianceAudit, computeComplianceScore, classifyComplianceLevel, listComplianceChecks } from "../protocol/atp_compliance.js";
+import { computeNistCoverage, listNistMappings, listZeroTrustMappings, getNistMappingsByFamily, NIST_FRAMEWORK_REF, NIST_FAMILIES } from "../protocol/nist_mapping.js";
+import { DEFAULT_ROTATION_POLICY, normalizeRotationPolicy, assessKeyRotationNeeds, generateRotationPlan, buildRotationAuditEntry, KEY_ROTATION_AUDIT_EVENTS } from "../protocol/key_rotation.js";
+import { createSearchIndex, indexEnvelope as indexEnvelopeInSearch, removeEnvelope as removeEnvelopeFromSearch, queryIndex, getIndexStats, rebuildIndex, clearIndex } from "../protocol/search_index.js";
 import {
   createEventLog,
   appendEvent,
@@ -80,7 +94,7 @@ import {
 } from "../protocol/websocket.js";
 import { buildRateLimitHeaders } from "../protocol/rate_limit.js";
 import { parseBoolean } from "./env.js";
-import { processMcpToolRequest, isMcpToolRequestEnvelope } from "./mcp_client.js";
+import { processMcpToolRequest, isMcpToolRequestEnvelope, createMcpToolRateLimiter } from "./mcp_client.js";
 import { createMcpToolRegistry } from "./mcp_server.js";
 import {
   enforceThreadEnvelopeEncryptionPolicyCore,
@@ -245,7 +259,8 @@ const INBOUND_CONTENT_FILTER_PROFILE_CONFIG = Object.freeze({
       spam: -1,
       phish: -1,
       quarantine: -1,
-      reject: -1
+      reject: -1,
+      injection: -1
     }),
     weights: Object.freeze({
       keyword_spam: 1,
@@ -259,7 +274,13 @@ const INBOUND_CONTENT_FILTER_PROFILE_CONFIG = Object.freeze({
       attachment_archive_lure: 1,
       auth_dmarc_not_pass: 2,
       auth_dkim_not_pass: 1,
-      auth_spf_not_pass: 1
+      auth_spf_not_pass: 1,
+      injection_instruction_override: 3,
+      injection_exfil_url: 4,
+      injection_persona_hijack: 2,
+      injection_tool_manipulation: 3,
+      injection_delimiter_attack: 2,
+      injection_multi_category: 3
     }),
     clusters: Object.freeze({
       spam_keyword_min: 3,
@@ -273,7 +294,8 @@ const INBOUND_CONTENT_FILTER_PROFILE_CONFIG = Object.freeze({
       spam: 0,
       phish: 0,
       quarantine: 0,
-      reject: 0
+      reject: 0,
+      injection: 0
     }),
     weights: Object.freeze({
       keyword_spam: 1,
@@ -287,7 +309,13 @@ const INBOUND_CONTENT_FILTER_PROFILE_CONFIG = Object.freeze({
       attachment_archive_lure: 1,
       auth_dmarc_not_pass: 2,
       auth_dkim_not_pass: 1,
-      auth_spf_not_pass: 1
+      auth_spf_not_pass: 1,
+      injection_instruction_override: 2,
+      injection_exfil_url: 3,
+      injection_persona_hijack: 2,
+      injection_tool_manipulation: 2,
+      injection_delimiter_attack: 1,
+      injection_multi_category: 2
     }),
     clusters: Object.freeze({
       spam_keyword_min: 4,
@@ -301,7 +329,8 @@ const INBOUND_CONTENT_FILTER_PROFILE_CONFIG = Object.freeze({
       spam: 2,
       phish: 1,
       quarantine: 2,
-      reject: 2
+      reject: 2,
+      injection: -1
     }),
     weights: Object.freeze({
       keyword_spam: 0,
@@ -315,7 +344,13 @@ const INBOUND_CONTENT_FILTER_PROFILE_CONFIG = Object.freeze({
       attachment_archive_lure: 1,
       auth_dmarc_not_pass: 2,
       auth_dkim_not_pass: 1,
-      auth_spf_not_pass: 1
+      auth_spf_not_pass: 1,
+      injection_instruction_override: 4,
+      injection_exfil_url: 5,
+      injection_persona_hijack: 3,
+      injection_tool_manipulation: 4,
+      injection_delimiter_attack: 3,
+      injection_multi_category: 4
     }),
     clusters: Object.freeze({
       spam_keyword_min: 5,
@@ -2058,6 +2093,10 @@ export class LoomStore {
       this.inboundContentFilterQuarantineThreshold + 1,
       parsePositiveInteger(options.inboundContentFilterRejectThreshold, 7)
     );
+    this.inboundContentFilterInjectionThreshold = Math.max(
+      1,
+      parsePositiveInteger(options.inboundContentFilterInjectionThreshold, 3)
+    );
     this.inboundContentFilterProfileDefault = normalizeInboundContentFilterProfile(
       options.inboundContentFilterProfileDefault,
       "balanced"
@@ -2227,8 +2266,35 @@ export class LoomStore {
       agent_window_ms: Math.max(1000, parsePositiveInteger(options.loopAgentWindowMs, 60000))
     };
     this.mcpClientEnabled = options.mcpClientEnabled !== false;
+    this.mcpSandboxPolicy = {
+      max_argument_bytes: Math.max(1024, parsePositiveInteger(options.mcpMaxArgumentBytes, 256 * 1024)),
+      max_result_bytes: Math.max(1024, parsePositiveInteger(options.mcpMaxResultBytes, 1024 * 1024)),
+      execution_timeout_ms: Math.max(100, parsePositiveInteger(options.mcpExecutionTimeoutMs, 5000)),
+      rate_limit_per_actor: Math.max(1, parsePositiveInteger(options.mcpRateLimitPerActor, 60)),
+      rate_limit_window_ms: Math.max(1000, parsePositiveInteger(options.mcpRateLimitWindowMs, 60000)),
+      allow_write_tools: options.mcpAllowWriteTools !== false,
+      enforce_timeout: options.mcpEnforceTimeout !== false
+    };
     this.mcpToolRegistry = null;
+    this._mcpToolRateLimiter = null;
     this._mcpServiceKeys = null;
+    // Agent trust scoring
+    this.agentTrustEnabled = options.agentTrustEnabled !== false;
+    this.agentTrustPolicy = {
+      decay_window_ms: Math.max(60000, parsePositiveInteger(options.agentTrustDecayWindowMs, 86_400_000)),
+      warning_threshold: Math.max(1, parsePositiveInteger(options.agentTrustWarningThreshold, 10)),
+      quarantine_threshold: Math.max(2, parsePositiveInteger(options.agentTrustQuarantineThreshold, 25)),
+      block_threshold: Math.max(3, parsePositiveInteger(options.agentTrustBlockThreshold, 50)),
+      max_events_per_agent: Math.max(10, parsePositiveInteger(options.agentTrustMaxEventsPerAgent, 200)),
+      good_behavior_decay: options.agentTrustGoodBehaviorDecay !== false
+    };
+    this.agentTrustEvents = new Map();
+    this.mimePolicy = { ...DEFAULT_MIME_POLICY, ...(options.mimePolicy || {}) };
+    this.compressionPolicy = options.compressionPolicy || null;
+    this.keyRotationPolicy = normalizeRotationPolicy(options.keyRotationPolicy || null);
+    this.keyRotationHistory = [];
+    this.searchIndexEnabled = options.searchIndexEnabled !== false;
+    this.searchIndex = this.searchIndexEnabled ? createSearchIndex({ max_entries: parsePositiveInteger(options.searchIndexMaxEntries, 100000) }) : null;
     this.identityEnvelopeUsageByDay = new Map();
     this.identityBlobUsageByDay = new Map();
     this.identityBlobTotalBytes = new Map();
@@ -2949,6 +3015,14 @@ export class LoomStore {
     }
     this.ensureInboundContentFilterStatsShape();
 
+    // Restore key rotation policy and history
+    if (state.key_rotation_policy && typeof state.key_rotation_policy === "object") {
+      this.keyRotationPolicy = normalizeRotationPolicy(state.key_rotation_policy);
+    }
+    if (Array.isArray(state.key_rotation_history)) {
+      this.keyRotationHistory = state.key_rotation_history;
+    }
+
     const localIdentityEntries = [];
     const remoteIdentityEntries = [];
     for (const identityDoc of state.identities || []) {
@@ -2999,6 +3073,12 @@ export class LoomStore {
       }
     }
     this.envelopesById = new Map((state.envelopes || []).map((item) => [item.id, item]));
+
+    // Rebuild search index from loaded envelopes
+    if (this.searchIndexEnabled && this.searchIndex) {
+      rebuildIndex(this.searchIndex, Array.from(this.envelopesById.values()));
+    }
+
     this.threadsById = new Map((state.threads || []).map((item) => [item.id, item]));
     for (const thread of this.threadsById.values()) {
       if (!thread.mailbox_state || typeof thread.mailbox_state !== "object") {
@@ -3554,7 +3634,9 @@ export class LoomStore {
       autoresponder_sent_history: Array.from(this.autoresponderSentHistory.entries()).map(([k, v]) => ({
         identity: k,
         history: Array.from(v.entries()).map(([sender, ts]) => ({ sender, timestamp: ts }))
-      }))
+      })),
+      key_rotation_policy: this.keyRotationPolicy,
+      key_rotation_history: this.keyRotationHistory
     };
   }
 
@@ -7279,6 +7361,15 @@ export class LoomStore {
             node_id: verifiedNode.node_id
           }
         );
+        if (contentEvaluation.action === "reject" || contentEvaluation.action === "quarantine") {
+          // Record trust event for agent senders flagged by content filter
+          if (envelope?.from?.type === "agent" && envelope?.from?.identity) {
+            this.recordAgentTrustEvent(envelope.from.identity, "content_filter_flag", {
+              action: contentEvaluation.action,
+              score: contentEvaluation.score
+            });
+          }
+        }
         if (contentEvaluation.action === "reject") {
           await this.recordFederationInboundFailure(
             verifiedNode.node_id,
@@ -7318,6 +7409,7 @@ export class LoomStore {
                 spam_score: contentEvaluation.spam_score,
                 phish_score: contentEvaluation.phish_score,
                 malware_score: contentEvaluation.malware_score,
+                injection_score: contentEvaluation.injection_score,
                 detected_categories: contentEvaluation.detected_categories,
                 signal_codes: contentEvaluation.signals.map((signal) => signal.code),
                 evaluated_at: nowIso()
@@ -8466,11 +8558,13 @@ export class LoomStore {
       quarantineThreshold + 1,
       this.inboundContentFilterRejectThreshold + delta(deltas.reject)
     );
+    const injectionThreshold = Math.max(1, this.inboundContentFilterInjectionThreshold + delta(deltas.injection));
     return {
       spam: spamThreshold,
       phish: phishThreshold,
       quarantine: quarantineThreshold,
-      reject: rejectThreshold
+      reject: rejectThreshold,
+      injection: injectionThreshold
     };
   }
 
@@ -8627,6 +8721,7 @@ export class LoomStore {
       spam_score: 0,
       phish_score: 0,
       malware_score: 0,
+      injection_score: 0,
       signals: []
     };
 
@@ -8652,6 +8747,8 @@ export class LoomStore {
         result.phish_score += normalizedWeight;
       } else if (normalizedCategory === "malware") {
         result.malware_score += normalizedWeight;
+      } else if (normalizedCategory === "injection") {
+        result.injection_score += normalizedWeight;
       }
       result.signals.push({
         category: normalizedCategory,
@@ -8756,7 +8853,7 @@ export class LoomStore {
       if (dotSegments.length >= 3 && CONTENT_FILTER_MALWARE_EXTENSIONS.has(dotSegments[dotSegments.length - 1])) {
         addSignal("malware", "attachment.double_extension", 4, filename);
       }
-      if (mimeType && CONTENT_FILTER_MALWARE_MIME_SNIPPETS.some((snippet) => mimeType.includes(snippet))) {
+      if (mimeType && isDangerousMimeType(mimeType)) {
         addSignal("malware", "attachment.risky_mime", 4, mimeType);
       }
     }
@@ -8778,21 +8875,53 @@ export class LoomStore {
       }
     }
 
-    result.score = result.spam_score + result.phish_score + result.malware_score;
+    // ── Prompt injection detection ──────────────────────────────────────────────
+    const injectionEnvelope = {
+      content: {
+        human: combinedText ? { text: combinedText } : undefined,
+        structured: payload?.structured_parameters
+          ? { parameters: payload.structured_parameters }
+          : undefined
+      },
+      from: { type: context?.sender_type || "human" }
+    };
+    const injectionAnalysis = analyzeEnvelopeForInjection(injectionEnvelope, {
+      senderType: context?.sender_type || "human"
+    });
+    for (const signal of injectionAnalysis.signals) {
+      const weightKey = signal.code.replace(".", "_");
+      const weight = profileWeights[weightKey] || profileWeights.injection_instruction_override || 2;
+      addSignal("injection", signal.code, weight, signal.matched);
+    }
+    if (injectionAnalysis.categories_detected.length >= 3) {
+      addSignal(
+        "injection",
+        "injection.multi_category",
+        profileWeights.injection_multi_category || 2,
+        `categories=${injectionAnalysis.categories_detected.length}`
+      );
+    }
+
+    result.score = result.spam_score + result.phish_score + result.malware_score + result.injection_score;
     if (result.spam_score >= thresholds.spam) {
       result.labels.push("sys.spam");
+    }
+    if (result.injection_score >= thresholds.injection) {
+      result.labels.push("sys.injection");
     }
 
     if (this.inboundContentFilterRejectMalware && result.malware_score > 0) {
       result.action = "reject";
     } else if (
       result.score >= thresholds.reject ||
-      result.phish_score >= thresholds.phish + 2
+      result.phish_score >= thresholds.phish + 2 ||
+      result.injection_score >= thresholds.injection + 3
     ) {
       result.action = "reject";
     } else if (
       result.malware_score > 0 ||
       result.phish_score >= thresholds.phish ||
+      result.injection_score >= thresholds.injection ||
       result.score >= thresholds.quarantine
     ) {
       result.action = "quarantine";
@@ -8838,6 +8967,7 @@ export class LoomStore {
         spam_score: result.spam_score,
         phish_score: result.phish_score,
         malware_score: result.malware_score,
+        injection_score: result.injection_score,
         profile: result.profile,
         thresholds: result.thresholds,
         labels: result.labels,
@@ -8845,6 +8975,17 @@ export class LoomStore {
         actor: context?.actor || null,
         node_id: context?.node_id || null
       });
+    }
+
+    // Record agent trust events for injection detection
+    if (result.injection_score >= thresholds.injection && context?.actor) {
+      const actorIdentity = this.resolveIdentity(context.actor);
+      if (actorIdentity && actorIdentity.type === "agent") {
+        this.recordAgentTrustEvent(context.actor, "injection_detected", {
+          injection_score: result.injection_score,
+          source
+        });
+      }
     }
 
     return result;
@@ -9142,6 +9283,7 @@ export class LoomStore {
             spam_score: contentEvaluation.spam_score,
             phish_score: contentEvaluation.phish_score,
             malware_score: contentEvaluation.malware_score,
+            injection_score: contentEvaluation.injection_score,
             detected_categories: contentEvaluation.detected_categories,
             signal_codes: contentEvaluation.signals.map((signal) => signal.code),
             evaluated_at: nowIso()
@@ -11142,10 +11284,30 @@ export class LoomStore {
         : new Date(nowMs() + this.remoteIdentityTtlMs).toISOString()
       : null;
 
-    // agent_info — only for agent-type identities
+    // agent_info / agent_card — only for agent-type identities
     let normalizedAgentInfo = null;
     const identityType = String(identityDoc.type || "human");
-    if (identityDoc.agent_info !== undefined && identityDoc.agent_info !== null) {
+
+    // agent_card takes precedence over agent_info when both are present
+    const hasAgentCard = identityDoc.agent_card !== undefined && identityDoc.agent_card !== null;
+    const hasAgentInfo = identityDoc.agent_info !== undefined && identityDoc.agent_info !== null;
+
+    if (hasAgentCard) {
+      if (identityType !== "agent") {
+        throw new LoomError("ENVELOPE_INVALID", "agent_card is only allowed for agent-type identities", 400, {
+          field: "agent_card",
+          identity_type: identityType
+        });
+      }
+      const cardErrors = validateAgentCard(identityDoc.agent_card);
+      if (cardErrors.length > 0) {
+        throw new LoomError("ENVELOPE_INVALID", `Invalid agent_card: ${cardErrors.map((e) => `${e.field}: ${e.reason}`).join("; ")}`, 400, {
+          field: "agent_card",
+          validation_errors: cardErrors
+        });
+      }
+      normalizedAgentInfo = normalizeAgentCard(identityDoc.agent_card);
+    } else if (hasAgentInfo) {
       if (identityType !== "agent") {
         throw new LoomError("ENVELOPE_INVALID", "agent_info is only allowed for agent-type identities", 400, {
           field: "agent_info",
@@ -12066,6 +12228,18 @@ export class LoomStore {
         throw new LoomError("ENVELOPE_INVALID", blobErrors[0].reason, 400, {
           field: blobErrors[0].field,
           errors: blobErrors
+        });
+      }
+    }
+
+    // MIME type policy check
+    const normalizedMime = normalizeMimeType(payload.mime_type);
+    if (normalizedMime) {
+      const mimeCheck = isAllowedBlobMimeType(normalizedMime, this.mimePolicy);
+      if (!mimeCheck.allowed) {
+        throw new LoomError("MIME_TYPE_DENIED", mimeCheck.reason, 415, {
+          field: "mime_type",
+          mime_type: normalizedMime
         });
       }
     }
@@ -13069,6 +13243,11 @@ export class LoomStore {
       this._processAutoresponder(storedEnvelope);
     }
 
+    // ── Post-ingestion: search index ────────────────────────────────────
+    if (this.searchIndexEnabled && this.searchIndex) {
+      indexEnvelopeInSearch(this.searchIndex, storedEnvelope);
+    }
+
     return storedEnvelope;
   }
 
@@ -13100,9 +13279,21 @@ export class LoomStore {
 
   getMcpToolRegistry() {
     if (!this.mcpToolRegistry) {
-      this.mcpToolRegistry = createMcpToolRegistry(this);
+      this.mcpToolRegistry = createMcpToolRegistry(this, {
+        sandboxPolicy: this.mcpSandboxPolicy
+      });
     }
     return this.mcpToolRegistry;
+  }
+
+  _getMcpToolRateLimiter() {
+    if (!this._mcpToolRateLimiter) {
+      this._mcpToolRateLimiter = createMcpToolRateLimiter(
+        this.mcpSandboxPolicy.rate_limit_per_actor,
+        this.mcpSandboxPolicy.rate_limit_window_ms
+      );
+    }
+    return this._mcpToolRateLimiter;
   }
 
   _processIngestedMcpToolRequest(storedEnvelope) {
@@ -13116,7 +13307,29 @@ export class LoomStore {
         mcpToolRegistry: this.getMcpToolRegistry(),
         serviceIdentity: serviceKeys.serviceIdentity,
         serviceKeyId: serviceKeys.serviceKeyId,
-        servicePrivateKeyPem: serviceKeys.privateKeyPem
+        servicePrivateKeyPem: serviceKeys.privateKeyPem,
+        sandboxPolicy: this.mcpSandboxPolicy,
+        mcpRateLimiter: this._getMcpToolRateLimiter(),
+        onSandboxViolation: (violation) => {
+          this.persistAndAudit("mcp.sandbox.violation", {
+            type: violation.type,
+            tool_name: violation.tool_name,
+            actor: violation.actor,
+            request_id: violation.request_id,
+            thread_id: storedEnvelope.thread_id,
+            details: violation.details || {}
+          });
+          // Record trust event for agent actors
+          if (violation.actor && storedEnvelope.from?.type === "agent") {
+            const eventType = violation.type === "rate_limit_exceeded"
+              ? "rate_limit_hit"
+              : "sandbox_violation";
+            this.recordAgentTrustEvent(violation.actor, eventType, {
+              tool_name: violation.tool_name,
+              violation_type: violation.type
+            });
+          }
+        }
       });
 
       if (result.processed) {
@@ -13140,6 +13353,278 @@ export class LoomStore {
       });
       return null;
     }
+  }
+
+  // ── Agent Trust ──────────────────────────────────────────────────────────
+
+  recordAgentTrustEvent(agentIdentity, eventType, details = {}) {
+    if (!agentIdentity || !eventType) {
+      return;
+    }
+    if (AGENT_TRUST_EVENT_TYPES[eventType] === undefined) {
+      return;
+    }
+
+    const key = String(agentIdentity);
+    if (!this.agentTrustEvents.has(key)) {
+      this.agentTrustEvents.set(key, []);
+    }
+
+    const events = this.agentTrustEvents.get(key);
+    events.push({
+      type: eventType,
+      timestamp: Date.now(),
+      details
+    });
+
+    // Enforce ring buffer
+    if (events.length > this.agentTrustPolicy.max_events_per_agent) {
+      events.splice(0, events.length - this.agentTrustPolicy.max_events_per_agent);
+    }
+
+    this.persistAndAudit("agent.trust.event", {
+      identity: agentIdentity,
+      event_type: eventType,
+      details
+    });
+  }
+
+  getAgentTrustScore(agentIdentity) {
+    const key = String(agentIdentity || "");
+    const events = this.agentTrustEvents.get(key) || [];
+    const scoreResult = computeAgentTrustScore(events, this.agentTrustPolicy, Date.now());
+    const level = classifyAgentTrust(scoreResult.score, this.agentTrustPolicy);
+    return {
+      identity: agentIdentity,
+      score: scoreResult.score,
+      level,
+      event_count: scoreResult.event_count,
+      active_event_count: scoreResult.active_event_count,
+      decayed_count: scoreResult.decayed_count,
+      oldest_event: scoreResult.oldest_event,
+      newest_event: scoreResult.newest_event
+    };
+  }
+
+  assertAgentTrustForIngestion(senderIdentity, senderType) {
+    if (!this.agentTrustEnabled) {
+      return;
+    }
+    if (senderType !== "agent") {
+      return;
+    }
+
+    const key = String(senderIdentity || "");
+    const events = this.agentTrustEvents.get(key) || [];
+    const scoreResult = computeAgentTrustScore(events, this.agentTrustPolicy, Date.now());
+
+    assertAgentTrustOrThrow(scoreResult.score, this.agentTrustPolicy);
+  }
+
+  // ── Agent Cards ─────────────────────────────────────────────────────────
+
+  listAgentCards() {
+    const cards = [];
+    for (const [id, identity] of this.identities) {
+      if (identity.type === "agent" && identity.agent_info) {
+        cards.push({
+          identity: id,
+          card: identity.agent_info
+        });
+      }
+    }
+    return cards;
+  }
+
+  getAgentCard(identityUri) {
+    const identity = this.resolveIdentity(identityUri);
+    if (!identity || identity.type !== "agent" || !identity.agent_info) {
+      return null;
+    }
+    return {
+      identity: identity.id,
+      card: identity.agent_info
+    };
+  }
+
+  // ─── MIME Registry Methods ──────────────────────────────────────────────────
+
+  getMimeRegistry() {
+    return {
+      categories: {
+        text: [...TEXT_MIME_TYPES],
+        image: [...IMAGE_MIME_TYPES],
+        document: [...DOCUMENT_MIME_TYPES],
+        audio: [...AUDIO_MIME_TYPES],
+        video: [...VIDEO_MIME_TYPES],
+        dangerous: [...DANGEROUS_MIME_TYPES]
+      },
+      policy: { ...this.mimePolicy },
+      generated_at: nowIso()
+    };
+  }
+
+  // ─── ATP Compliance Methods ────────────────────────────────────────────────
+
+  getComplianceNodeState() {
+    return {
+      loom_version: "1.1",
+      envelope_validation_enabled: true,
+      signature_verification_enabled: true,
+      capability_tokens_enabled: true,
+      federation_enabled: this.federationSigningPrivateKeyPem != null,
+      thread_dag_validation_enabled: true,
+      idempotency_enabled: true,
+      rate_limiting_enabled: true,
+      replay_protection_enabled: true,
+      e2ee_enabled: listSupportedE2eeProfiles().length > 0,
+      e2ee_profile_count: listSupportedE2eeProfiles().length,
+      content_format_validation_enabled: this.mimePolicy != null,
+      mime_policy_mode: this.mimePolicy?.mode || "permissive",
+      content_filter_enabled: this.inboundContentFilterEnabled,
+      loop_protection_enabled: this.loopProtection.max_hop_count > 0,
+      loop_max_hop_count: this.loopProtection.max_hop_count,
+      agent_trust_enabled: this.agentTrustEnabled,
+      retention_policies_configured: this.messageRetentionDays > 0 || this.retentionPolicies.length > 0,
+      audit_log_enabled: this.auditFile != null,
+      audit_hmac_enabled: this.auditHmacKey != null,
+      mcp_sandbox_enabled: this.mcpSandboxPolicy.enforce_timeout !== false,
+      prompt_injection_detection_enabled: this.inboundContentFilterEnabled,
+      federation_trust_anchor_count: this.federationTrustAnchorBindings.size,
+      state_encryption_at_rest: this.requireStateEncryptionAtRest,
+      federation_signed_receipts: this.federationRequireSignedReceipts === true,
+      blob_retention_days: this.blobRetentionDays,
+      identity_proof_required: this.identityRegistrationProofRequired,
+      compression_enabled: !!(this.compressionPolicy && this.compressionPolicy.enabled)
+    };
+  }
+
+  runComplianceAudit() {
+    const nodeState = this.getComplianceNodeState();
+    return _runComplianceAudit(nodeState);
+  }
+
+  getComplianceScore() {
+    const audit = this.runComplianceAudit();
+    const score = computeComplianceScore(audit);
+    const level = classifyComplianceLevel(score);
+    return {
+      score,
+      level,
+      summary: audit.summary,
+      loom_version: audit.loom_version,
+      timestamp: audit.audit_timestamp
+    };
+  }
+
+  getNistComplianceSummary() {
+    const coverage = computeNistCoverage();
+    const audit = this.runComplianceAudit();
+    const mappings = listNistMappings();
+
+    // Cross-reference NIST mappings with compliance audit results
+    const resultsByCheckId = new Map();
+    for (const r of audit.results) {
+      resultsByCheckId.set(r.check_id, r);
+    }
+
+    const controlStatus = mappings.map((m) => {
+      const checkResult = m.compliance_check_id ? resultsByCheckId.get(m.compliance_check_id) : null;
+      return {
+        control_id: m.control_id,
+        family: m.family,
+        title: m.title,
+        loom_feature: m.loom_feature,
+        compliance_check_id: m.compliance_check_id,
+        check_status: checkResult ? (checkResult.passed ? "pass" : "fail") : "unmapped"
+      };
+    });
+
+    const familySummary = {};
+    for (const [code, name] of Object.entries(NIST_FAMILIES)) {
+      const familyControls = controlStatus.filter((c) => c.family === code);
+      const passed = familyControls.filter((c) => c.check_status === "pass").length;
+      const failed = familyControls.filter((c) => c.check_status === "fail").length;
+      const unmapped = familyControls.filter((c) => c.check_status === "unmapped").length;
+      familySummary[code] = { name, total: familyControls.length, passed, failed, unmapped };
+    }
+
+    return {
+      framework: NIST_FRAMEWORK_REF,
+      coverage,
+      family_summary: familySummary,
+      controls: controlStatus,
+      zero_trust: listZeroTrustMappings(),
+      compliance_score: computeComplianceScore(audit),
+      compliance_level: classifyComplianceLevel(computeComplianceScore(audit)),
+      compression_enabled: !!(this.compressionPolicy && this.compressionPolicy.enabled),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  assessKeyRotationStatus(now) {
+    const signingKeys = this.getLocalFederationSigningKeys();
+    return assessKeyRotationNeeds(signingKeys, this.keyRotationPolicy, now);
+  }
+
+  executeKeyRotation(options = {}) {
+    const now = options.now || Date.now();
+    const assessment = this.assessKeyRotationStatus(now);
+
+    if (!assessment.needs_rotation && !options.force) {
+      return {
+        rotated: false,
+        reason: "no rotation needed",
+        assessment
+      };
+    }
+
+    const plan = generateRotationPlan(this.getLocalFederationSigningKeys(), this.keyRotationPolicy, now);
+
+    // Generate new key pair if plan calls for it
+    let newKeyPair = null;
+    const generateAction = plan.actions.find((a) => a.type === "generate_new_key");
+    if (generateAction) {
+      newKeyPair = generateSigningKeyPair();
+      const newKeyId = `k_sign_fed_${Date.now()}`;
+
+      // Store the new key as the active federation signing key
+      this.federationSigningPrivateKeyPem = newKeyPair.privateKeyPem;
+      this.federationSigningKeyId = newKeyId;
+      this.federationTrustKeysetVersion += 1;
+
+      this.keyRotationHistory.push(buildRotationAuditEntry(
+        KEY_ROTATION_AUDIT_EVENTS.ROTATION_COMPLETED,
+        { new_key_id: newKeyId, plan_summary: plan.summary, forced: !!options.force }
+      ));
+    }
+
+    // Record assessment
+    this.keyRotationHistory.push(buildRotationAuditEntry(
+      KEY_ROTATION_AUDIT_EVENTS.ROTATION_ASSESSED,
+      { assessment_summary: assessment.summary, actions_planned: plan.actions.length }
+    ));
+
+    return {
+      rotated: !!newKeyPair,
+      plan,
+      assessment,
+      new_key_id: newKeyPair ? this.federationSigningKeyId : null
+    };
+  }
+
+  getKeyRotationHistory() {
+    return [...this.keyRotationHistory];
+  }
+
+  getSearchIndexStatus() {
+    if (!this.searchIndexEnabled || !this.searchIndex) {
+      return { enabled: false };
+    }
+    return {
+      enabled: true,
+      ...getIndexStats(this.searchIndex)
+    };
   }
 
   getEnvelope(envelopeId) {
@@ -13201,6 +13686,52 @@ export class LoomStore {
     const beforeMs = filters?.before ? parseTime(filters.before) : null;
     const limit = Math.max(1, Math.min(Number(filters?.limit || 50), 200));
 
+    // ── Indexed fast path ───────────────────────────────────────────────
+    if (this.searchIndexEnabled && this.searchIndex && this.searchIndex.entryCount > 0) {
+      const indexFilters = {};
+      if (fromFilter) indexFilters.sender = fromFilter;
+      if (typeFilter) indexFilters.type = typeFilter;
+      if (intentFilter) indexFilters.intent = intentFilter;
+      if (threadFilter) indexFilters.thread_id = threadFilter;
+      if (filters?.after) indexFilters.after = filters.after;
+      if (filters?.before) indexFilters.before = filters.before;
+      if (query.length > 0) indexFilters.q = query;
+      indexFilters.limit = 10000;
+
+      const hasAnyFilter = fromFilter || typeFilter || intentFilter || threadFilter || afterMs != null || beforeMs != null || query.length > 0;
+      if (hasAnyFilter) {
+        const queryResult = queryIndex(this.searchIndex, indexFilters);
+        const matches = [];
+        for (const envelopeId of queryResult.candidate_ids) {
+          const envelope = this.envelopesById.get(envelopeId);
+          if (!envelope) continue;
+
+          // Access control: verify actor is a participant in the envelope's thread
+          const thread = envelope.thread_id ? this.threadsById.get(envelope.thread_id) : null;
+          if (!thread || !this.isActiveParticipant(thread, actorIdentity)) continue;
+
+          const intent = envelope.content?.structured?.intent || null;
+          matches.push({
+            envelope_id: envelope.id,
+            thread_id: envelope.thread_id,
+            type: envelope.type,
+            from: envelope.from?.identity || null,
+            created_at: envelope.created_at,
+            intent,
+            excerpt: envelope.content?.encrypted
+              ? null
+              : (envelope.content?.human?.text || "").slice(0, 240)
+          });
+        }
+        matches.sort((a, b) => b.created_at.localeCompare(a.created_at));
+        return {
+          total: matches.length,
+          results: matches.slice(0, limit)
+        };
+      }
+    }
+
+    // ── Linear scan fallback ────────────────────────────────────────────
     const matches = [];
     const candidateThreads = threadFilter
       ? [this.threadsById.get(threadFilter)].filter(Boolean)
@@ -13829,6 +14360,36 @@ export class LoomStore {
         tools_url: normalizedDomain ? `https://${normalizedDomain}/v1/mcp/tools` : null,
         sse_url: normalizedDomain ? `https://${normalizedDomain}/v1/mcp/sse` : null
       },
+      agents: {
+        agent_cards_supported: true,
+        agent_card_schema_version: "1.0",
+        trust_scoring_enabled: this.agentTrustEnabled,
+        agent_discovery_url: normalizedDomain ? `https://${normalizedDomain}/v1/agents` : null
+      },
+      compliance: {
+        compliance_url: normalizedDomain ? `https://${normalizedDomain}/v1/protocol/compliance` : null,
+        mime_policy_mode: this.mimePolicy?.mode || "permissive"
+      },
+      compression: {
+        enabled: !!(this.compressionPolicy && this.compressionPolicy.enabled),
+        encodings: this.compressionPolicy?.enabled ? ["gzip", "br", "deflate"] : [],
+        min_size_bytes: this.compressionPolicy?.min_size_bytes || 1024
+      },
+      key_rotation: {
+        enabled: true,
+        policy: this.keyRotationPolicy,
+        status_url: normalizedDomain ? `https://${normalizedDomain}/v1/admin/key-rotation/status` : null
+      },
+      search_index: {
+        enabled: this.searchIndexEnabled,
+        stats: this.searchIndexEnabled && this.searchIndex ? getIndexStats(this.searchIndex) : null,
+        status_url: normalizedDomain ? `https://${normalizedDomain}/v1/admin/search-index/status` : null
+      },
+      nist_alignment: {
+        sp_800_53_coverage: computeNistCoverage(),
+        sp_800_207_zero_trust: true,
+        nist_summary_url: normalizedDomain ? `https://${normalizedDomain}/v1/admin/nist/summary` : null
+      },
       generated_at: nowIso(),
       request_id: randomUUID()
     };
@@ -13967,6 +14528,9 @@ export class LoomStore {
       }
 
       this.envelopesById.delete(envelopeId);
+      if (this.searchIndexEnabled && this.searchIndex) {
+        removeEnvelopeFromSearch(this.searchIndex, envelopeId);
+      }
       removedEnvelopeIds.add(envelopeId);
       const threadId = String(envelope?.thread_id || "").trim();
       if (threadId) {
