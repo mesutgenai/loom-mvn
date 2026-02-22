@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## v0.4.0 — 2026-02-21
 
 Security hardening, compliance, and operational modules addressing
 evaluation report gaps. Adds 10 new protocol modules, extends store
