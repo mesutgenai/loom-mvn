@@ -12,7 +12,7 @@ import {
   computeComplianceScore,
   classifyComplianceLevel,
   formatComplianceReport
-} from "../src/protocol/atp_compliance.js";
+} from "../src/protocol/protocol_compliance.js";
 
 // Full-compliance node state for testing
 const FULL_STATE = {

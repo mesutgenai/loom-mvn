@@ -4,7 +4,7 @@ This runbook is the implementation artifact for `P0-06` in `docs/PRODUCTION-READ
 
 ## Objective
 
-Ensure public inbound email bridge exposure is explicitly confirmed, guarded by strict authentication policy defaults, and protected by profile-aware content policy controls.
+Ensure public inbound email bridge exposure is explicitly confirmed, guarded by strict authentication policy defaults, protected by profile-aware content policy controls, and non-actuating by default.
 
 ## Required Environment Controls (Public Service)
 
@@ -15,6 +15,7 @@ Ensure public inbound email bridge exposure is explicitly confirmed, guarded by 
 - `LOOM_BRIDGE_EMAIL_INBOUND_REQUIRE_DMARC_PASS=true`
 - `LOOM_BRIDGE_EMAIL_INBOUND_REJECT_ON_AUTH_FAILURE=true`
 - `LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_PAYLOAD_AUTH_RESULTS=false` (recommended on public ingress to avoid trusting unsanitized payload evidence)
+- `LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION=false` (recommended default: bridged structured extraction stays non-authoritative/read-only)
 - `LOOM_ADMIN_TOKEN` configured
 - `LOOM_INBOUND_CONTENT_FILTER_ENABLED=true`
 - `LOOM_INBOUND_CONTENT_FILTER_REJECT_MALWARE=true`
@@ -24,6 +25,11 @@ Ensure public inbound email bridge exposure is explicitly confirmed, guarded by 
 Weak policy overrides require explicit acknowledgment:
 
 - `LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true`
+- `LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true` (required only when automatic bridged actuation is intentionally enabled on public service)
+
+Profile shortcut:
+
+- `LOOM_CONFIG_PROFILE=secure_public` pre-sets strict inbound bridge defaults (still requires deployment-specific secrets and network allowlists).
 
 Optional telemetry/tuning controls:
 
@@ -45,6 +51,7 @@ This validates:
 - explicit public-service confirmation for inbound bridge exposure
 - admin-token gate requirements
 - strict public inbound auth/DMARC/reject defaults (or explicit weak-policy confirmation)
+- bridged auto-actuation policy confirmation on public service
 - safe auth-failure handling (reject and/or quarantine)
 - payload auth evidence policy (`LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_PAYLOAD_AUTH_RESULTS`) posture
 
@@ -94,6 +101,7 @@ Covered cases:
 
 - public inbound bridge requires explicit confirmation
 - weak public inbound auth policy is rejected unless explicitly confirmed
+- public bridged auto-actuation is rejected unless explicitly confirmed
 - admin-token requirement is enforced on inbound bridge requests
 - auth-failure handling supports quarantine/reject controls
 - profile-aware content filter decisions are enforced and exposed in envelope/thread metadata

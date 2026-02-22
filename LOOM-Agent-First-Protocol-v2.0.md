@@ -27,6 +27,16 @@ The target is a protocol that is:
 
 ## 3. Layered Architecture
 
+### 3.1 Core vs Extension Boundary
+
+LOOM v2.0 progress is gated by a strict core cut-line:
+
+- Core: identity/addressing, canonical envelope+signature behavior, thread DAG semantics, capability baseline authorization, federation trust wrapper baseline.
+- Extensions: email bridge/gateway, MCP runtime, workflow orchestration, E2EE profiles, and compliance overlays.
+
+Reference profile: `docs/LOOM-CORE.md`.
+Registry + versioning rules: `docs/EXTENSION-REGISTRY.md`.
+
 ### Layer A: Identity and Trust Authority
 
 - Identity namespace remains `loom://local@authority`.

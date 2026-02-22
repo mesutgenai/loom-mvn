@@ -31,7 +31,7 @@ Production-ready minimum gate:
 | P0-03 | Durable persistence | Platform | DONE | `LOOM_PG_URL` in use, schema checks pass, and no production node depends on ephemeral state for core data. | `npm run check:pg`, `docs/POSTGRES-OPERATIONS.md`, `/v1/admin/persistence/schema` output |
 | P0-04 | Backup and restore drills | SRE | DONE | Backup export + restore procedure from `docs/POSTGRES-OPERATIONS.md` succeeds in staging on a recurring schedule. | `npm run drill:persistence`, `scripts/output/persistence-drills/*/summary.md`, drill report with timestamps |
 | P0-05 | Federation outbound controls | Security | DONE | Host allowlists are configured (`LOOM_FEDERATION_HOST_ALLOWLIST`, `LOOM_FEDERATION_BOOTSTRAP_HOST_ALLOWLIST`, `LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST`, `LOOM_WEBHOOK_HOST_ALLOWLIST`), trust mode is fail-closed with DNSSEC/transparency controls, and trust revalidation worker is healthy. | `npm run check:federation`, `docs/FEDERATION-CONTROLS.md`, effective env config + startup validation |
-| P0-06 | Inbound bridge hardening | Security | DONE | Public inbound bridge policy uses strict auth-result/DMARC defaults, admin-token enforcement, and profile-aware content-policy controls. | `docs/INBOUND-BRIDGE-HARDENING.md`, `npm run check:inbound-bridge`, `npm run test:inbound-bridge-hardening` |
+| P0-06 | Inbound bridge hardening | Security | DONE | Public inbound bridge policy uses strict auth-result/DMARC defaults, admin-token enforcement, profile-aware content-policy controls, and non-actuating bridged defaults unless explicitly confirmed. | `docs/INBOUND-BRIDGE-HARDENING.md`, `npm run check:inbound-bridge`, `npm run test:inbound-bridge-hardening` |
 | P0-07 | Abuse and rate-limit policy | Platform | DONE | API and federation rate limits are tuned from defaults using traffic tests and documented thresholds. | `docs/RATE-LIMIT-POLICY.md`, `npm run check:rate-limits`, `npm run probe:rate-limits`, env snapshots + probe artifacts |
 | P0-08 | Outbox worker reliability | Platform | DONE | Email/federation/webhook outbox processing runs continuously with worker identity/lease tuning and lag alarms. | `docs/OUTBOX-WORKER-RELIABILITY.md`, `npm run check:outbox-workers`, worker config snapshot + lag alert links |
 | P0-09 | Observability and alerting | SRE | DONE | `/ready`, `/metrics`, and admin health are scraped; alerts exist for readiness failures, queue lag, auth error spikes, and DB failures. | `docs/OBSERVABILITY-ALERTING.md`, `ops/alerts/loom-alert-rules.yaml`, `npm run check:observability`, dashboard + alert policy links |
@@ -82,6 +82,7 @@ curl -sS http://127.0.0.1:8787/metrics \
 ## Related Docs
 
 - `README.md` (deployment env controls and safety gates)
+- `docs/CONFIG-PROFILES.md` (secure profile defaults and reduced env surface)
 - `docs/POSTGRES-OPERATIONS.md` (backup/restore and schema operations)
 - `docs/SECRETS-KEY-ROTATION.md` (secret handling and rotation policy)
 - `docs/FEDERATION-CONTROLS.md` (allowlist and federation-node transport policy checks)
@@ -101,5 +102,6 @@ curl -sS http://127.0.0.1:8787/metrics \
 - `docs/COMPLIANCE-CONTROLS.md` (audit export, retention policy, and compliance control mapping)
 - `docs/IMAP-COMPATIBILITY-MATRIX.md` (wire IMAP compatibility target and command/extension coverage)
 - `docs/CONFORMANCE.md` (protocol conformance surface)
+- `docs/EXTENSION-REGISTRY.md` (extension ids, lifecycle, and versioning rules)
 - `docs/RELEASE-POLICY.md` (release cadence and security SLAs)
 - `SECURITY.md` (vulnerability reporting and response targets)

@@ -40,6 +40,13 @@ import {
   resolveE2eeProfile
 } from "../protocol/e2ee.js";
 import {
+  PROTOCOL_PROFILE_FULL,
+  PROTOCOL_PROFILE_CORE,
+  normalizeProtocolProfile,
+  listProtocolProfiles,
+  buildProtocolExtensionSnapshot
+} from "../protocol/extension_registry.js";
+import {
   parseLoomIdentityAuthority,
   parseTrustAnchorBindings
 } from "../protocol/trust.js";
@@ -81,7 +88,12 @@ import {
 } from "../protocol/import_export.js";
 import { validateBlobInitiation } from "../protocol/blob.js";
 import { normalizeMimeType, isDangerousMimeType, isAllowedBlobMimeType, DEFAULT_MIME_POLICY, TEXT_MIME_TYPES, IMAGE_MIME_TYPES, DOCUMENT_MIME_TYPES, AUDIO_MIME_TYPES, VIDEO_MIME_TYPES, DANGEROUS_MIME_TYPES } from "../protocol/mime_registry.js";
-import { runComplianceAudit as _runComplianceAudit, computeComplianceScore, classifyComplianceLevel, listComplianceChecks } from "../protocol/atp_compliance.js";
+import {
+  runComplianceAudit as _runComplianceAudit,
+  computeComplianceScore,
+  classifyComplianceLevel,
+  listComplianceChecks
+} from "../protocol/protocol_compliance.js";
 import { computeNistCoverage, listNistMappings, listZeroTrustMappings, getNistMappingsByFamily, NIST_FRAMEWORK_REF, NIST_FAMILIES } from "../protocol/nist_mapping.js";
 import { DEFAULT_ROTATION_POLICY, normalizeRotationPolicy, assessKeyRotationNeeds, generateRotationPlan, buildRotationAuditEntry, KEY_ROTATION_AUDIT_EVENTS } from "../protocol/key_rotation.js";
 import { createSearchIndex, indexEnvelope as indexEnvelopeInSearch, removeEnvelope as removeEnvelopeFromSearch, queryIndex, getIndexStats, rebuildIndex, clearIndex } from "../protocol/search_index.js";
@@ -2021,6 +2033,23 @@ function assertTransition(thread, allowedFrom, nextState) {
 export class LoomStore {
   constructor(options = {}) {
     this.nodeId = options.nodeId || "loom-node.local";
+    this.protocolProfile = normalizeProtocolProfile(
+      options.protocolProfile ?? PROTOCOL_PROFILE_FULL,
+      PROTOCOL_PROFILE_FULL
+    );
+    this.coreProtocolProfile = this.protocolProfile === PROTOCOL_PROFILE_CORE;
+    this.emailBridgeExtensionEnabled =
+      options.emailBridgeExtensionEnabled !== false && !this.coreProtocolProfile;
+    this.legacyGatewayExtensionEnabled =
+      options.legacyGatewayExtensionEnabled !== false && !this.coreProtocolProfile;
+    this.mcpRuntimeExtensionEnabled =
+      options.mcpRuntimeExtensionEnabled !== false && !this.coreProtocolProfile;
+    this.workflowExtensionEnabled =
+      options.workflowExtensionEnabled !== false && !this.coreProtocolProfile;
+    this.e2eeExtensionEnabled =
+      options.e2eeExtensionEnabled !== false && !this.coreProtocolProfile;
+    this.complianceExtensionEnabled =
+      options.complianceExtensionEnabled !== false && !this.coreProtocolProfile;
     this.systemSigningKeyId = options.systemSigningKeyId || "k_sign_system_1";
     this.systemSigningPrivateKeyPem = options.systemSigningPrivateKeyPem || null;
     this.systemSigningPublicKeyPem = options.systemSigningPublicKeyPem || null;
@@ -2072,6 +2101,7 @@ export class LoomStore {
     this.bridgeInboundRejectOnAuthFailure = options.bridgeInboundRejectOnAuthFailure === true;
     this.bridgeInboundQuarantineOnAuthFailure = options.bridgeInboundQuarantineOnAuthFailure !== false;
     this.bridgeInboundAllowPayloadAuthResults = options.bridgeInboundAllowPayloadAuthResults !== false;
+    this.bridgeInboundAllowAutomaticActuation = options.bridgeInboundAllowAutomaticActuation === true;
     this.bridgeInboundHeaderAllowlist = normalizeBridgeInboundHeaderAllowlist(
       options.bridgeInboundHeaderAllowlist
     );
@@ -2265,7 +2295,7 @@ export class LoomStore {
       max_agent_envelopes_per_thread_window: Math.max(1, parsePositiveInteger(options.loopAgentWindowMax, 50)),
       agent_window_ms: Math.max(1000, parsePositiveInteger(options.loopAgentWindowMs, 60000))
     };
-    this.mcpClientEnabled = options.mcpClientEnabled !== false;
+    this.mcpClientEnabled = options.mcpClientEnabled !== false && this.mcpRuntimeExtensionEnabled;
     this.mcpSandboxPolicy = {
       max_argument_bytes: Math.max(1024, parsePositiveInteger(options.mcpMaxArgumentBytes, 256 * 1024)),
       max_result_bytes: Math.max(1024, parsePositiveInteger(options.mcpMaxResultBytes, 1024 * 1024)),
@@ -9238,6 +9268,8 @@ export class LoomStore {
           parameters: {
             source: "email",
             extracted: true,
+            authoritative: false,
+            trust_level: "low",
             extraction_confidence:
               typeof payload.extraction_confidence === "number" ? payload.extraction_confidence : 0.25
           }
@@ -9269,6 +9301,12 @@ export class LoomStore {
             quarantine_on_auth_failure: inboundAuthPolicy.quarantineOnAuthFailure,
             allow_payload_auth_results: inboundAuthPolicy.allowPayloadAuthResults,
             reason: authEvaluation.reason
+          },
+          structured_trust: {
+            authoritative: false,
+            trust_level: "low",
+            auto_actuation_allowed: this.bridgeInboundAllowAutomaticActuation === true,
+            reason: "bridged_content_is_non_authoritative_by_default"
           },
           extraction_confidence:
             typeof payload.extraction_confidence === "number" ? payload.extraction_confidence : 0.25
@@ -13464,7 +13502,7 @@ export class LoomStore {
     };
   }
 
-  // ─── ATP Compliance Methods ────────────────────────────────────────────────
+  // ─── Protocol Compliance Methods ───────────────────────────────────────────
 
   getComplianceNodeState() {
     return {
@@ -13495,6 +13533,7 @@ export class LoomStore {
       federation_signed_receipts: this.federationRequireSignedReceipts === true,
       blob_retention_days: this.blobRetentionDays,
       identity_proof_required: this.identityRegistrationProofRequired,
+      bridge_auto_actuation_enabled: this.bridgeInboundAllowAutomaticActuation === true,
       compression_enabled: !!(this.compressionPolicy && this.compressionPolicy.enabled)
     };
   }
@@ -14273,6 +14312,7 @@ export class LoomStore {
   getNodeDocument(domain) {
     const normalizedDomain = String(domain || "").trim() || "localhost";
     const protocolCapabilitiesUrl = `https://${normalizedDomain}/v1/protocol/capabilities`;
+    const protocolExtensionsUrl = `https://${normalizedDomain}/v1/protocol/extensions`;
     const federationKeysetUrl = `https://${normalizedDomain}/.well-known/loom-keyset.json`;
     const federationRevocationsUrl = `https://${normalizedDomain}/.well-known/loom-revocations.json`;
     const keysetDocument = this.getFederationKeysetDocument(normalizedDomain);
@@ -14321,10 +14361,15 @@ export class LoomStore {
         token: `https://${normalizedDomain}/v1/auth/token`,
         refresh: `https://${normalizedDomain}/v1/auth/refresh`
       },
-      supported_profiles: ["loom-core-1"],
+      supported_profiles:
+        this.protocolProfile === PROTOCOL_PROFILE_CORE
+          ? [PROTOCOL_PROFILE_CORE]
+          : [PROTOCOL_PROFILE_FULL, PROTOCOL_PROFILE_CORE],
       auth: {
         proof_of_key: true
       },
+      protocol_profile: this.protocolProfile,
+      protocol_extensions_url: protocolExtensionsUrl,
       generated_at: nowIso(),
       request_id: randomUUID()
     };
@@ -14334,13 +14379,47 @@ export class LoomStore {
     return this.federationTrustMode;
   }
 
-  getProtocolCapabilities(domain = null) {
+  getProtocolExtensions(domain = null) {
     const normalizedDomain = String(domain || "").trim() || null;
-    const protocolCapabilitiesUrl = normalizedDomain ? `https://${normalizedDomain}/v1/protocol/capabilities` : null;
+    const extensionsUrl = normalizedDomain ? `https://${normalizedDomain}/v1/protocol/extensions` : null;
     return {
       loom_version: "1.1",
       node_id: this.nodeId,
+      protocol_profile: this.protocolProfile,
+      protocol_profiles_supported: listProtocolProfiles(),
+      protocol_extensions_url: extensionsUrl,
+      extensions: buildProtocolExtensionSnapshot({
+        protocolProfile: this.protocolProfile,
+        runtime: {
+          email_bridge: this.emailBridgeExtensionEnabled,
+          legacy_gateway: this.legacyGatewayExtensionEnabled,
+          mcp_runtime: this.mcpRuntimeExtensionEnabled,
+          workflow: this.workflowExtensionEnabled,
+          e2ee_x25519_v1: this.e2eeExtensionEnabled,
+          e2ee_x25519_v2: this.e2eeExtensionEnabled,
+          e2ee_mls_1: this.e2eeExtensionEnabled,
+          compliance: this.complianceExtensionEnabled
+        }
+      }),
+      generated_at: nowIso(),
+      request_id: randomUUID()
+    };
+  }
+
+  getProtocolCapabilities(domain = null) {
+    const normalizedDomain = String(domain || "").trim() || null;
+    const protocolCapabilitiesUrl = normalizedDomain ? `https://${normalizedDomain}/v1/protocol/capabilities` : null;
+    const protocolExtensionsUrl = normalizedDomain ? `https://${normalizedDomain}/v1/protocol/extensions` : null;
+    const e2eeExtensionEnabled = this.e2eeExtensionEnabled === true;
+    const mcpRuntimeExtensionEnabled = this.mcpRuntimeExtensionEnabled === true;
+    const complianceExtensionEnabled = this.complianceExtensionEnabled === true;
+    return {
+      loom_version: "1.1",
+      node_id: this.nodeId,
+      protocol_profile: this.protocolProfile,
+      protocol_profiles_supported: listProtocolProfiles(),
       protocol_capabilities_url: protocolCapabilitiesUrl,
+      protocol_extensions_url: protocolExtensionsUrl,
       federation_negotiation: {
         trust_anchor_mode: this.getFederationTrustAnchorMode(),
         trust_anchor_modes_supported: Array.from(FEDERATION_TRUST_MODES).sort(),
@@ -14351,14 +14430,15 @@ export class LoomStore {
         trust_anchor_transparency_mode: this.federationTrustTransparencyMode,
         trust_anchor_require_transparency: this.federationTrustRequireTransparency,
         trust_anchor_epoch: this.federationTrustLocalEpoch,
-        e2ee_profiles: listSupportedE2eeProfileCapabilities()
+        e2ee_profiles: e2eeExtensionEnabled ? listSupportedE2eeProfileCapabilities() : []
       },
       mcp: {
-        supported: true,
-        protocol_version: "2024-11-05",
-        transports: ["sse", "stdio"],
-        tools_url: normalizedDomain ? `https://${normalizedDomain}/v1/mcp/tools` : null,
-        sse_url: normalizedDomain ? `https://${normalizedDomain}/v1/mcp/sse` : null
+        supported: mcpRuntimeExtensionEnabled,
+        protocol_version: mcpRuntimeExtensionEnabled ? "2024-11-05" : null,
+        transports: mcpRuntimeExtensionEnabled ? ["sse", "stdio"] : [],
+        tools_url:
+          normalizedDomain && mcpRuntimeExtensionEnabled ? `https://${normalizedDomain}/v1/mcp/tools` : null,
+        sse_url: normalizedDomain && mcpRuntimeExtensionEnabled ? `https://${normalizedDomain}/v1/mcp/sse` : null
       },
       agents: {
         agent_cards_supported: true,
@@ -14367,8 +14447,15 @@ export class LoomStore {
         agent_discovery_url: normalizedDomain ? `https://${normalizedDomain}/v1/agents` : null
       },
       compliance: {
-        compliance_url: normalizedDomain ? `https://${normalizedDomain}/v1/protocol/compliance` : null,
+        compliance_url:
+          normalizedDomain && complianceExtensionEnabled
+            ? `https://${normalizedDomain}/v1/protocol/compliance`
+            : null,
         mime_policy_mode: this.mimePolicy?.mode || "permissive"
+      },
+      bridge_boundary: {
+        automatic_actuation_enabled: this.bridgeInboundAllowAutomaticActuation === true,
+        non_authoritative_default: true
       },
       compression: {
         enabled: !!(this.compressionPolicy && this.compressionPolicy.enabled),

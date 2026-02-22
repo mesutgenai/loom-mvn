@@ -16,9 +16,15 @@ import {
 import { LoomStore } from "./store.js";
 import { renderDashboardHtml } from "./ui.js";
 import { parseBoolean, parsePositiveNumber, parseHostAllowlist } from "./env.js";
+import { applyConfigProfileOptionDefaults } from "./config_profile.js";
 import { createMcpToolRegistry, createMcpSseSession, handleMcpRequest } from "./mcp_server.js";
 import { negotiateEncoding, shouldCompress, buildCompressionHeaders, DEFAULT_COMPRESSION_POLICY } from "../protocol/compression.js";
 import { createSearchIndex } from "../protocol/search_index.js";
+import {
+  PROTOCOL_PROFILE_FULL,
+  PROTOCOL_PROFILE_CORE,
+  normalizeProtocolProfile
+} from "../protocol/extension_registry.js";
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -1323,6 +1329,58 @@ function formatMetricsPrometheus(
 }
 
 export function createLoomServer(options = {}) {
+  options = { ...options };
+  applyConfigProfileOptionDefaults(options, process.env);
+  const protocolProfile = normalizeProtocolProfile(
+    options.protocolProfile ??
+      process.env.LOOM_PROTOCOL_PROFILE ??
+      options.store?.protocolProfile ??
+      PROTOCOL_PROFILE_FULL,
+    PROTOCOL_PROFILE_FULL
+  );
+  const coreProtocolProfile = protocolProfile === PROTOCOL_PROFILE_CORE;
+  const emailBridgeExtensionEnabled =
+    parseBoolean(
+      options.emailBridgeExtensionEnabled ??
+        process.env.LOOM_EXTENSION_EMAIL_BRIDGE_ENABLED ??
+        options.store?.emailBridgeExtensionEnabled,
+      !coreProtocolProfile
+    ) && !coreProtocolProfile;
+  const legacyGatewayExtensionEnabled =
+    parseBoolean(
+      options.legacyGatewayExtensionEnabled ??
+        process.env.LOOM_EXTENSION_LEGACY_GATEWAY_ENABLED ??
+        options.store?.legacyGatewayExtensionEnabled,
+      !coreProtocolProfile
+    ) && !coreProtocolProfile;
+  const mcpRuntimeExtensionEnabled =
+    parseBoolean(
+      options.mcpRuntimeExtensionEnabled ??
+        process.env.LOOM_EXTENSION_MCP_RUNTIME_ENABLED ??
+        options.store?.mcpRuntimeExtensionEnabled,
+      !coreProtocolProfile
+    ) && !coreProtocolProfile;
+  const workflowExtensionEnabled =
+    parseBoolean(
+      options.workflowExtensionEnabled ??
+        process.env.LOOM_EXTENSION_WORKFLOW_ENABLED ??
+        options.store?.workflowExtensionEnabled,
+      !coreProtocolProfile
+    ) && !coreProtocolProfile;
+  const e2eeExtensionEnabled =
+    parseBoolean(
+      options.e2eeExtensionEnabled ??
+        process.env.LOOM_EXTENSION_E2EE_ENABLED ??
+        options.store?.e2eeExtensionEnabled,
+      !coreProtocolProfile
+    ) && !coreProtocolProfile;
+  const complianceExtensionEnabled =
+    parseBoolean(
+      options.complianceExtensionEnabled ??
+        process.env.LOOM_EXTENSION_COMPLIANCE_ENABLED ??
+        options.store?.complianceExtensionEnabled,
+      !coreProtocolProfile
+    ) && !coreProtocolProfile;
   const idempotencyTtlMs = parsePositiveNumber(
     options.idempotencyTtlMs ?? process.env.LOOM_IDEMPOTENCY_TTL_MS,
     24 * 60 * 60 * 1000
@@ -1691,6 +1749,13 @@ export function createLoomServer(options = {}) {
     options.store ||
     new LoomStore({
       nodeId: options.nodeId,
+      protocolProfile,
+      emailBridgeExtensionEnabled,
+      legacyGatewayExtensionEnabled,
+      mcpRuntimeExtensionEnabled,
+      workflowExtensionEnabled,
+      e2eeExtensionEnabled,
+      complianceExtensionEnabled,
       dataDir: options.dataDir,
       systemSigningKeyId,
       systemSigningPrivateKeyPem,
@@ -1784,6 +1849,15 @@ export function createLoomServer(options = {}) {
         )
       )
     });
+  store.protocolProfile = protocolProfile;
+  store.coreProtocolProfile = coreProtocolProfile;
+  store.emailBridgeExtensionEnabled = emailBridgeExtensionEnabled;
+  store.legacyGatewayExtensionEnabled = legacyGatewayExtensionEnabled;
+  store.mcpRuntimeExtensionEnabled = mcpRuntimeExtensionEnabled;
+  store.workflowExtensionEnabled = workflowExtensionEnabled;
+  store.e2eeExtensionEnabled = e2eeExtensionEnabled;
+  store.complianceExtensionEnabled = complianceExtensionEnabled;
+  store.mcpClientEnabled = store.mcpClientEnabled !== false && mcpRuntimeExtensionEnabled;
   const maxBodyBytes = parsePositiveNumber(
     options.maxBodyBytes ?? process.env.LOOM_MAX_BODY_BYTES,
     DEFAULT_MAX_BODY_BYTES
@@ -1860,10 +1934,12 @@ export function createLoomServer(options = {}) {
     options.identitySignupEnabled ?? process.env.LOOM_IDENTITY_SIGNUP_ENABLED,
     true
   );
-  const bridgeInboundEnabled = parseBoolean(
-    options.bridgeInboundEnabled ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_ENABLED,
-    true
-  );
+  const bridgeInboundEnabled =
+    emailBridgeExtensionEnabled &&
+    parseBoolean(
+      options.bridgeInboundEnabled ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_ENABLED,
+      true
+    );
   const bridgeInboundPublicConfirmed = parseBoolean(
     options.bridgeInboundPublicConfirmed ?? process.env.LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED,
     false
@@ -1899,6 +1975,16 @@ export function createLoomServer(options = {}) {
     options.bridgeInboundAllowPayloadAuthResults ??
       process.env.LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_PAYLOAD_AUTH_RESULTS,
     true
+  );
+  const bridgeInboundAllowAutomaticActuation = parseBoolean(
+    options.bridgeInboundAllowAutomaticActuation ??
+      process.env.LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION,
+    false
+  );
+  const bridgeInboundAutomationConfirmed = parseBoolean(
+    options.bridgeInboundAutomationConfirmed ??
+      process.env.LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED,
+    false
   );
   const inboundContentFilterEnabled = parseBoolean(
     options.inboundContentFilterEnabled ?? process.env.LOOM_INBOUND_CONTENT_FILTER_ENABLED,
@@ -2011,12 +2097,36 @@ export function createLoomServer(options = {}) {
         "Refusing weak public inbound bridge auth policy; enable strict policy or set LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true"
       );
     }
+    if (bridgeInboundAllowAutomaticActuation && !bridgeInboundAutomationConfirmed) {
+      throw new Error(
+        "Refusing public inbound bridge auto-actuation without LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true"
+      );
+    }
   }
-  const bridgeSendEnabled = parseBoolean(options.bridgeSendEnabled ?? process.env.LOOM_BRIDGE_EMAIL_SEND_ENABLED, true);
-  const gatewaySmtpSubmitEnabled = parseBoolean(
-    options.gatewaySmtpSubmitEnabled ?? process.env.LOOM_GATEWAY_SMTP_SUBMIT_ENABLED,
-    true
-  );
+  const bridgeOutboundEnabled =
+    emailBridgeExtensionEnabled &&
+    parseBoolean(
+      options.bridgeOutboundEnabled ?? process.env.LOOM_BRIDGE_EMAIL_OUTBOUND_ENABLED,
+      true
+    );
+  const bridgeSendEnabled =
+    emailBridgeExtensionEnabled &&
+    parseBoolean(options.bridgeSendEnabled ?? process.env.LOOM_BRIDGE_EMAIL_SEND_ENABLED, true);
+  const gatewayImapEnabled =
+    legacyGatewayExtensionEnabled &&
+    parseBoolean(options.gatewayImapEnabled ?? process.env.LOOM_GATEWAY_IMAP_ENABLED, true);
+  const gatewaySmtpSubmitEnabled =
+    legacyGatewayExtensionEnabled &&
+    parseBoolean(
+      options.gatewaySmtpSubmitEnabled ?? process.env.LOOM_GATEWAY_SMTP_SUBMIT_ENABLED,
+      true
+    );
+  const mcpRuntimeRoutesEnabled =
+    mcpRuntimeExtensionEnabled &&
+    parseBoolean(options.mcpRuntimeRoutesEnabled ?? process.env.LOOM_MCP_RUNTIME_ROUTES_ENABLED, true);
+  const complianceRoutesEnabled =
+    complianceExtensionEnabled &&
+    parseBoolean(options.complianceRoutesEnabled ?? process.env.LOOM_COMPLIANCE_ROUTES_ENABLED, true);
   const requestLogEnabled = parseBoolean(options.requestLogEnabled ?? process.env.LOOM_REQUEST_LOG_ENABLED, false);
   const requestLogFormat = normalizeLogFormat(
     options.requestLogFormat ?? process.env.LOOM_REQUEST_LOG_FORMAT ?? "json"
@@ -2030,6 +2140,7 @@ export function createLoomServer(options = {}) {
   store.bridgeInboundRejectOnAuthFailure = bridgeInboundRejectOnAuthFailure;
   store.bridgeInboundQuarantineOnAuthFailure = bridgeInboundQuarantineOnAuthFailure;
   store.bridgeInboundAllowPayloadAuthResults = bridgeInboundAllowPayloadAuthResults;
+  store.bridgeInboundAllowAutomaticActuation = bridgeInboundAllowAutomaticActuation;
   store.inboundContentFilterEnabled = inboundContentFilterEnabled;
   store.inboundContentFilterRejectMalware = inboundContentFilterRejectMalware;
   store.inboundContentFilterSpamThreshold = inboundContentFilterSpamThreshold;
@@ -2919,23 +3030,32 @@ export function createLoomServer(options = {}) {
         return;
       }
 
+      if (methodIs(req, "GET") && path === "/v1/protocol/extensions") {
+        sendJson(res, 200, store.getProtocolExtensions(domain));
+        return;
+      }
+
       if (methodIs(req, "GET") && path === "/v1/protocol/compliance") {
+        assertRouteEnabled(complianceRoutesEnabled, req, path);
         sendJson(res, 200, store.getComplianceScore());
         return;
       }
 
       if (methodIs(req, "GET") && path === "/v1/admin/compliance/audit") {
+        assertRouteEnabled(complianceRoutesEnabled, req, path);
         requireAdminToken(req, adminToken);
         sendJson(res, 200, store.runComplianceAudit());
         return;
       }
 
       if (methodIs(req, "GET") && path === "/v1/mime/registry") {
+        assertRouteEnabled(complianceRoutesEnabled, req, path);
         sendJson(res, 200, store.getMimeRegistry());
         return;
       }
 
       if (methodIs(req, "GET") && path === "/v1/admin/nist/summary") {
+        assertRouteEnabled(complianceRoutesEnabled, req, path);
         requireAdminToken(req, adminToken);
         sendJson(res, 200, store.getNistComplianceSummary());
         return;
@@ -3455,6 +3575,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "POST") && path === "/v1/bridge/email/outbound") {
+        assertRouteEnabled(bridgeOutboundEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const body = await readJson(req, maxBodyBytes);
         const rendered = store.renderBridgeOutboundEmail(body, actorIdentity);
@@ -3534,6 +3655,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "GET") && path === "/v1/gateway/imap/folders") {
+        assertRouteEnabled(gatewayImapEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const folders = store.listGatewayImapFolders(actorIdentity);
         sendJson(res, 200, { folders });
@@ -3541,6 +3663,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "GET") && path.startsWith("/v1/gateway/imap/folders/") && path.endsWith("/messages")) {
+        assertRouteEnabled(gatewayImapEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const encodedFolderName = path.slice("/v1/gateway/imap/folders/".length, -"/messages".length);
         const folderName = decodeURIComponent(encodedFolderName) || "INBOX";
@@ -3645,12 +3768,14 @@ export function createLoomServer(options = {}) {
 
       // ─── MCP Routes ─────────────────────────────────────────────────
       if (methodIs(req, "GET") && path === "/v1/mcp/tools") {
+        assertRouteEnabled(mcpRuntimeRoutesEnabled, req, path);
         const toolList = mcpToolRegistry.listTools();
         sendJson(res, 200, { tools: toolList });
         return;
       }
 
       if (methodIs(req, "GET") && path === "/v1/mcp/sse") {
+        assertRouteEnabled(mcpRuntimeRoutesEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const session = createMcpSseSession({
           registry: mcpToolRegistry,
@@ -3669,6 +3794,7 @@ export function createLoomServer(options = {}) {
       }
 
       if (methodIs(req, "POST") && path === "/v1/mcp/message") {
+        assertRouteEnabled(mcpRuntimeRoutesEnabled, req, path);
         const actorIdentity = requireActorIdentity(req, store);
         const url = requestUrl(req);
         const sessionId = url.searchParams.get("session_id");

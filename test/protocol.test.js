@@ -1843,6 +1843,380 @@ test("bridge inbound ignores payload auth_results when disabled and sanitizes or
   assert.equal(envelope?.meta?.bridge?.auth_policy?.allow_payload_auth_results, false);
 });
 
+test("bridge sender envelopes cannot trigger automatic workflow actuation by default", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    mcpClientEnabled: false
+  });
+
+  const inbound = store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      text: "bridge baseline"
+    },
+    "loom://alice@node.test"
+  );
+
+  const unsignedWorkflowEnvelope = {
+    loom: "1.1",
+    id: "env_01ARZ3NDEKTSV4RRFFQ69G5FC1",
+    thread_id: inbound.thread_id,
+    parent_id: inbound.envelope_id,
+    type: "workflow",
+    from: {
+      identity: "bridge://sender@example.net",
+      display: "sender@example.net",
+      key_id: store.systemSigningKeyId,
+      type: "bridge"
+    },
+    to: [{ identity: "loom://alice@node.test", role: "primary" }],
+    created_at: "2026-02-21T10:00:00Z",
+    priority: "normal",
+    content: {
+      human: {
+        text: "run workflow now",
+        format: "plaintext"
+      },
+      structured: {
+        intent: "workflow.execute@v1",
+        parameters: {
+          workflow_id: "wf_bridge_01",
+          definition: {
+            steps: [{ step_id: "step_1" }]
+          }
+        }
+      },
+      encrypted: false
+    },
+    attachments: []
+  };
+
+  const signed = signEnvelope(
+    unsignedWorkflowEnvelope,
+    store.systemSigningPrivateKeyPem,
+    store.systemSigningKeyId
+  );
+
+  assert.throws(
+    () => store.ingestEnvelope(signed, { actorIdentity: "bridge://sender@example.net" }),
+    (error) =>
+      error?.code === "CAPABILITY_DENIED" &&
+      /non-authoritative/.test(String(error?.message || "")) &&
+      error?.details?.field === "type"
+  );
+});
+
+test("bridge sender workflow envelopes are allowed only with explicit opt-in", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    mcpClientEnabled: false,
+    bridgeInboundAllowAutomaticActuation: true
+  });
+
+  const inbound = store.createBridgeInboundEnvelope(
+    {
+      smtp_from: "sender@example.net",
+      rcpt_to: ["alice@node.test"],
+      text: "bridge baseline"
+    },
+    "loom://alice@node.test"
+  );
+
+  const unsignedWorkflowEnvelope = {
+    loom: "1.1",
+    id: "env_01ARZ3NDEKTSV4RRFFQ69G5FC2",
+    thread_id: inbound.thread_id,
+    parent_id: inbound.envelope_id,
+    type: "workflow",
+    from: {
+      identity: "bridge://sender@example.net",
+      display: "sender@example.net",
+      key_id: store.systemSigningKeyId,
+      type: "bridge"
+    },
+    to: [{ identity: "loom://alice@node.test", role: "primary" }],
+    created_at: "2026-02-21T10:05:00Z",
+    priority: "normal",
+    content: {
+      human: {
+        text: "run workflow now",
+        format: "plaintext"
+      },
+      structured: {
+        intent: "workflow.execute@v1",
+        parameters: {
+          workflow_id: "wf_bridge_02",
+          definition: {
+            steps: [{ step_id: "step_1" }]
+          }
+        }
+      },
+      encrypted: false
+    },
+    attachments: []
+  };
+
+  const signed = signEnvelope(
+    unsignedWorkflowEnvelope,
+    store.systemSigningPrivateKeyPem,
+    store.systemSigningKeyId
+  );
+
+  const stored = store.ingestEnvelope(signed, { actorIdentity: "bridge://sender@example.net" });
+  assert.equal(stored.type, "workflow");
+  const thread = store.getThread(stored.thread_id);
+  assert.equal(thread?.workflow?.workflow_id, "wf_bridge_02");
+});
+
+test("core protocol profile rejects workflow extension envelopes at ingest", () => {
+  const keys = generateSigningKeyPair();
+  const store = new LoomStore({
+    nodeId: "node.test",
+    protocolProfile: "loom-core-1"
+  });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_core_workflow_1", public_key_pem: keys.publicKeyPem }]
+  });
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FD1",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FD2",
+      parent_id: null,
+      type: "workflow",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_core_workflow_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-22T10:00:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "execute core-blocked workflow", format: "plaintext" },
+        structured: {
+          intent: "workflow.execute@v1",
+          parameters: {
+            workflow_id: "wf_core_blocked_1",
+            definition: { steps: [{ step_id: "step_1" }] }
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_core_workflow_1"
+  );
+
+  assert.throws(
+    () => store.ingestEnvelope(envelope),
+    (error) =>
+      error?.code === "CAPABILITY_DENIED" &&
+      error?.details?.extension_id === "loom-ext-workflow-v1"
+  );
+});
+
+test("core protocol profile rejects MCP runtime intents at ingest", () => {
+  const keys = generateSigningKeyPair();
+  const store = new LoomStore({
+    nodeId: "node.test",
+    protocolProfile: "loom-core-1"
+  });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_core_mcp_1", public_key_pem: keys.publicKeyPem }]
+  });
+
+  const envelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FD3",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FD4",
+      parent_id: null,
+      type: "workflow",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_core_mcp_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-22T10:05:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "invoke tool via workflow envelope", format: "plaintext" },
+        structured: {
+          intent: "mcp.tool_request@v1",
+          parameters: {
+            tool: "filesystem.read",
+            args: { path: "/tmp/mock.txt" }
+          }
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_core_mcp_1"
+  );
+
+  assert.throws(
+    () => store.ingestEnvelope(envelope),
+    (error) =>
+      error?.code === "CAPABILITY_DENIED" &&
+      error?.details?.extension_id === "loom-ext-mcp-runtime-v1"
+  );
+});
+
+test("core protocol profile rejects E2EE extension envelopes at ingest", () => {
+  const keys = generateSigningKeyPair();
+  const store = new LoomStore({
+    nodeId: "node.test",
+    protocolProfile: "loom-core-1"
+  });
+
+  store.registerIdentity({
+    id: "loom://alice@node.test",
+    display_name: "Alice",
+    signing_keys: [{ key_id: "k_sign_alice_core_e2ee_1", public_key_pem: keys.publicKeyPem }]
+  });
+
+  const encryptedEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FD5",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FD6",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_core_e2ee_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-22T10:10:00Z",
+      priority: "normal",
+      content: {
+        encrypted: true,
+        profile: "loom-e2ee-1",
+        epoch: 0,
+        ciphertext: "YWJj",
+        wrapped_keys: [
+          {
+            to: "loom://bob@node.test",
+            algorithm: "X25519-HKDF-SHA256",
+            key_id: "k_enc_bob_core_1",
+            ciphertext: "ZGVm"
+          }
+        ]
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_core_e2ee_1"
+  );
+
+  assert.throws(
+    () => store.ingestEnvelope(encryptedEnvelope),
+    (error) =>
+      error?.code === "CAPABILITY_DENIED" &&
+      error?.details?.extension_id === "loom-ext-e2ee-x25519-v1" &&
+      error?.details?.field === "content.encrypted"
+  );
+
+  const encryptionIntentEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FD7",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FD8",
+      parent_id: null,
+      type: "thread_op",
+      from: {
+        identity: "loom://alice@node.test",
+        display: "Alice",
+        key_id: "k_sign_alice_core_e2ee_1",
+        type: "human"
+      },
+      to: [{ identity: "loom://bob@node.test", role: "primary" }],
+      created_at: "2026-02-22T10:11:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "rotate keys", format: "plaintext" },
+        structured: {
+          intent: "encryption.rotate@v1",
+          parameters: {}
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    keys.privateKeyPem,
+    "k_sign_alice_core_e2ee_1"
+  );
+
+  assert.throws(
+    () => store.ingestEnvelope(encryptionIntentEnvelope),
+    (error) =>
+      error?.code === "CAPABILITY_DENIED" &&
+      error?.details?.extension_id === "loom-ext-e2ee-x25519-v1" &&
+      error?.details?.field === "content.structured.intent"
+  );
+});
+
+test("core protocol profile rejects bridge sender envelopes at ingest", () => {
+  const store = new LoomStore({
+    nodeId: "node.test",
+    protocolProfile: "loom-core-1"
+  });
+
+  const bridgeEnvelope = signEnvelope(
+    {
+      loom: "1.1",
+      id: "env_01ARZ3NDEKTSV4RRFFQ69G5FD9",
+      thread_id: "thr_01ARZ3NDEKTSV4RRFFQ69G5FE0",
+      parent_id: null,
+      type: "message",
+      from: {
+        identity: "bridge://sender@example.net",
+        display: "sender@example.net",
+        key_id: store.systemSigningKeyId,
+        type: "bridge"
+      },
+      to: [{ identity: "loom://alice@node.test", role: "primary" }],
+      created_at: "2026-02-22T10:15:00Z",
+      priority: "normal",
+      content: {
+        human: { text: "bridge content", format: "plaintext" },
+        structured: {
+          intent: "message.general@v1",
+          parameters: {}
+        },
+        encrypted: false
+      },
+      attachments: []
+    },
+    store.systemSigningPrivateKeyPem,
+    store.systemSigningKeyId
+  );
+
+  assert.throws(
+    () => store.ingestEnvelope(bridgeEnvelope, { actorIdentity: "bridge://sender@example.net" }),
+    (error) =>
+      error?.code === "CAPABILITY_DENIED" &&
+      error?.details?.extension_id === "loom-ext-email-bridge-v1"
+  );
+});
+
 test("bridge inbound content filter rejects risky executable attachments", () => {
   const store = new LoomStore({
     nodeId: "node.test",

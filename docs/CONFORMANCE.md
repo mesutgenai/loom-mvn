@@ -1,10 +1,14 @@
-# LOOM MVN v1.1 Conformance Profile (v0.2.9)
+# LOOM MVN v1.1 Conformance Profile (v0.4.1)
 
 This document defines the current conformance surface implemented by this MVN and the test vectors that gate protocol behavior.
 
 ## Scope
 
 This profile is for API and protocol behaviors implemented in this repository (`src/`). It is not a full Internet email MTA profile.
+
+Core/extension layering reference:
+
+- `docs/LOOM-CORE.md`
 
 Release and governance references:
 
@@ -13,6 +17,8 @@ Release and governance references:
 - License: `LICENSE`
 - Stability policy: `docs/STABILITY.md`
 - Release policy: `docs/RELEASE-POLICY.md`
+- Extension registry: `docs/EXTENSION-REGISTRY.md`
+- Config profiles: `docs/CONFIG-PROFILES.md`
 - Compliance controls package: `docs/COMPLIANCE-CONTROLS.md`
 - IMAP compatibility matrix: `docs/IMAP-COMPATIBILITY-MATRIX.md`
 
@@ -22,11 +28,12 @@ Release and governance references:
 - Envelope signatures use Ed25519 with a domain-separated context prefix (`LOOM-ENVELOPE-SIG-v1\0`) prepended to canonical payload before signing. Legacy (non-prefixed) signatures are accepted during migration window when no `signature.context` field is present.
 - Delegation signatures use Ed25519 with a domain-separated context prefix (`LOOM-DELEGATION-SIG-v1\0`). Legacy fallback applies during migration window.
 - Envelope schema, thread DAG integrity, and delegation/capability checks are enforced at ingest.
+- LOOM identities are canonicalized to lowercase (`loom://local@domain`) and envelope identity values MUST already be in canonical lowercase form.
 - Envelope `from.device_id` is an optional field (1-128 character string) enabling per-device replay tracking.
 - Encrypted envelope content must use a supported E2EE profile, replay metadata (`replay_counter`, `profile_commitment`), and valid wrapped-key/ciphertext fields.
 - E2EE crypto path is profile-constrained (X25519 + HKDF-SHA-256 + XChaCha20-Poly1305) with deterministic ciphertext package structure checks.
 - Supported encrypted profile ids include `loom-e2ee-x25519-xchacha20-v1` and `loom-e2ee-x25519-xchacha20-v2` (aliases `loom-e2ee-1`, `loom-e2ee-2`). Each profile declares security properties (`forward_secrecy`, `post_compromise_security`, `confidentiality`).
-- E2EE profile `loom-e2ee-mls-1` is reserved for future MLS (RFC 9420) implementation and cannot be used for encryption or decryption until it transitions to active status.
+- E2EE profile `loom-e2ee-mls-1` is active in this MVN profile with MLS metadata/welcome/commit validation and RFC 9420-aligned security properties (FS/PCS).
 - Thread encryption policy is enforced (encrypted threads require encrypted envelopes with matching profile and epoch).
 - Encrypted ingest supports configurable replay protection: `strict` mode enforces monotonic `replay_counter` increase per sender per epoch; `sliding_window` mode (default) uses a 64-entry sliding window allowing out-of-order delivery within the window. Replay state is keyed by `senderIdentity:deviceId`.
 - Thread size limits are enforced at ingest: `max_envelopes_per_thread` (default 10000) and `max_pending_parents` (default 500). Limits are configurable at store level and overridable per-ingest via context.
@@ -35,11 +42,15 @@ Release and governance references:
 - Delegation chain verification enforces `created_at` presence (ISO-8601), rejects `created_at` more than 5 minutes in the future (configurable via `maxCreatedAtFutureSkewMs`), enforces maximum chain depth (default 10, configurable via `maxChainLength`), and verifies root delegator is not an agent type when `enforceRootDelegatorType` is enabled.
 - Federation delivery requires signed requests and nonce/timestamp replay checks.
 - Federation protocol capabilities are published for negotiation (`/v1/protocol/capabilities`) including trust-anchor posture and supported encrypted profiles.
+- Protocol profile runtime mode is enforced via `LOOM_PROTOCOL_PROFILE` (`loom-v1.1-full` default, `loom-core-1` core-only). In core mode, extension routes fail closed (`404`) and extension envelope ingest is rejected (`CAPABILITY_DENIED`).
+- Machine-readable extension state is published at `GET /v1/protocol/extensions`.
+- Extension route gates covered by conformance include bridge (`/v1/bridge/*`), legacy gateway (`/v1/gateway/*`), MCP runtime (`/v1/mcp/*`), and compliance overlays (`/v1/protocol/compliance`, `/v1/mime/registry`, `/v1/admin/compliance/audit`, `/v1/admin/nist/summary`).
 - Email outbox supports per-recipient DSN-style status updates via `POST /v1/email/outbox/{id}/dsn`.
 - Outbound MIME rendering maps LOOM envelope attachments (blob-backed) into SMTP relay attachments.
 - Wire SMTP advertises and accepts `SMTPUTF8`/`8BITMIME` ESMTP parameters for gateway-compatible submission flows.
 - Wire IMAP supports boolean `SEARCH`/`UID SEARCH` composition (`OR`, `NOT`, grouped criteria), `APPEND` literal continuation mode, and `UID THREAD`/`UID SORT` compatibility commands.
 - Inbound content filtering enforces profile-aware decisions (`strict|balanced|agent`) with configurable thresholds and profile-labeled decision counters.
+- Bridge sender envelopes are non-authoritative by default: bridged actors may not submit actuation envelopes (`workflow`, `thread_op`, or non-`message.general@v1` intents) unless explicit bridge auto-actuation policy opt-in is enabled.
 - An informational JSON Schema (draft 2020-12) is published at `src/protocol/schemas/envelope-v1.1.schema.json`. In-code `validateEnvelopeShape` remains the authoritative validation path.
 
 ## Out of Scope (Current)

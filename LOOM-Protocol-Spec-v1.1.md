@@ -204,17 +204,17 @@ loom://{local}@{domain}[#{fragment}]
 ```
 
 Examples:
-- `loom://Almarion@cowork-os.com` — human identity  
-- `loom://assistant.Almarion@cowork-os.com` — agent scoped to human  
+- `loom://almarion@cowork-os.com` — human identity  
+- `loom://assistant.almarion@cowork-os.com` — agent scoped to human  
 - `loom://billing@acme.corp` — role/team identity  
-- `loom://Almarion@cowork-os.com#thr_01JMKB7W...` — client-side deep link  
+- `loom://almarion@cowork-os.com#thr_01JMKB7W...` — client-side deep link  
 - `bridge://alice@gmail.com` — bridged email identity  
 
 Rules:
 - Local parts MUST match: `[a-z0-9][a-z0-9._-]{0,63}`
 - Agent scoping uses `.` separators (`agent.human`, `subagent.agent.human`)
 - Fragment identifiers are **client-side only** and MUST NOT be transmitted in envelopes
-- Domain part is case-insensitive; local part is case-sensitive
+- Addresses are case-insensitive for comparison and MUST be serialized in canonical lowercase form in envelopes and identity documents
 - `bridge://` scheme is reserved for bridged identities
 
 ### 6.2 Identity Document
@@ -224,7 +224,7 @@ Each identity resolves to an Identity Document retrievable via the LOOM API and/
 ```json
 {
   "loom": "1.1",
-  "id": "loom://Almarion@cowork-os.com",
+  "id": "loom://almarion@cowork-os.com",
   "type": "human",
   "display_name": "Almarion",
   "node": "cowork-os.com",
@@ -240,7 +240,7 @@ Each identity resolves to an Identity Document retrievable via the LOOM API and/
   },
   "delegations": [],
   "capabilities": ["send", "receive", "create_thread", "delegate"],
-  "verified_bridges": { "email": "Almarion@cowork-os.com" },
+  "verified_bridges": { "email": "almarion@cowork-os.com" },
   "aliases": ["loom://m@cowork-os.com"],
   "metadata": { "timezone": "Europe/Lisbon", "locale": "en" }
 }
@@ -264,11 +264,11 @@ Agent identities add required fields:
 ```json
 {
   "loom": "1.1",
-  "id": "loom://assistant.Almarion@cowork-os.com",
+  "id": "loom://assistant.almarion@cowork-os.com",
   "type": "agent",
   "display_name": "Almarion's Assistant",
   "node": "cowork-os.com",
-  "delegator": "loom://Almarion@cowork-os.com",
+  "delegator": "loom://almarion@cowork-os.com",
   "agent_info": { "provider": "anthropic", "model": "claude-opus-4", "version": "2026.02" },
   "delegation_scope": ["read.*", "reply.routine", "task.create", "calendar.*"],
   "delegation_expires": "2026-06-01T00:00:00Z",
@@ -343,21 +343,21 @@ Each E2EE profile declares its security properties to enable informed profile se
 |---|---|---|---|---|
 | `loom-e2ee-x25519-xchacha20-v1` | active | No | No | best_effort |
 | `loom-e2ee-x25519-xchacha20-v2` | active | No | No | best_effort |
-| `loom-e2ee-mls-1` | reserved | Yes | Yes | mls_grade |
+| `loom-e2ee-mls-1` | active | Yes | Yes | mls_grade |
 
 - **best_effort**: Per-epoch key wrapping without forward secrecy or post-compromise security. Suitable for stored-message confidentiality.
 - **mls_grade**: Full forward secrecy and post-compromise security via MLS (RFC 9420) TreeKEM ratcheting.
 
-#### 7.4.2 MLS Migration Path (Future)
+#### 7.4.2 MLS Profile Notes
 
-The `loom-e2ee-mls-1` profile is reserved for future implementation of MLS (RFC 9420) based encryption. When implemented, it will provide:
+The `loom-e2ee-mls-1` profile is implemented for MLS (RFC 9420)-grade semantics in the MVN profile and provides:
 
 - **TreeKEM key agreement** replacing per-recipient key wrapping
 - **Forward secrecy** through continuous key ratcheting
 - **Post-compromise security** via tree-based key update
 - **Group state management** through MLS Welcome/Commit messages mapped to LOOM epoch operations
 
-Implementations MUST NOT attempt to use the `loom-e2ee-mls-1` profile for encryption or decryption until it transitions from `reserved` to `active` status. The `resolveE2eeProfile()` function returns `null` for reserved profiles.
+Implementations that do not yet implement MLS MAY continue to negotiate non-MLS profiles (`loom-e2ee-x25519-xchacha20-v1|v2`) and fail closed for unknown/unsupported profiles.
 
 ---
 
@@ -488,6 +488,8 @@ All IDs are ULIDs with type prefixes:
 
 ## 9. Envelope Types & Schemas
 
+Implementation-profile extension lifecycle and versioning rules are tracked in `docs/EXTENSION-REGISTRY.md`.
+
 ### 9.1 Core Type Registry (Normative)
 
 | Type | Purpose |
@@ -532,7 +534,7 @@ A Thread is:
   "created_at": "2026-02-16T16:37:00Z",
   "updated_at": "2026-02-16T17:10:00Z",
   "participants": [
-    { "identity": "loom://Almarion@cowork-os.com", "role": "owner", "joined_at": "2026-02-16T16:37:00Z", "left_at": null }
+    { "identity": "loom://almarion@cowork-os.com", "role": "owner", "joined_at": "2026-02-16T16:37:00Z", "left_at": null }
   ],
   "labels": ["finance", "q1-2026"],
   "forks": [
@@ -767,8 +769,8 @@ Delegation chains prove agent authority and scope.
 
 ```json
 {
-  "delegator": "loom://Almarion@cowork-os.com",
-  "delegate": "loom://assistant.Almarion@cowork-os.com",
+  "delegator": "loom://almarion@cowork-os.com",
+  "delegate": "loom://assistant.almarion@cowork-os.com",
   "scope": ["read.*", "reply.routine", "task.create", "calendar.*"],
   "created_at": "2026-01-15T10:00:00Z",
   "expires_at": "2026-06-01T00:00:00Z",
@@ -1584,6 +1586,11 @@ Agent     Node A         Node B       Sarah
 
 ## Changelog
 
+### 1.1.0-patch.2 — February 2026 (MVN v0.4.1)
+- Runtime protocol profile split formalized for conformance and implementation (`loom-v1.1-full` default, `loom-core-1` core-only), with extension discovery endpoint (`GET /v1/protocol/extensions`) and fail-closed extension route behavior in core mode.
+- Bridge boundary defaults tightened: bridge-derived structured extraction is non-authoritative and bridge sender envelopes are non-actuating by default unless explicit policy opt-in is configured.
+- Extension lifecycle alignment updated for runtime discovery: `loom-ext-e2ee-mls-1` reports as active when MLS wire profile support is enabled.
+
 ### 1.1.0-patch.1 — February 2026 (MVN v0.2.9)
 - Explicit RFC 8785 JCS number serialization reference (Section 7.2)
 - Domain-separated signature context prefix for envelopes (`LOOM-ENVELOPE-SIG-v1\0`) and delegations (`LOOM-DELEGATION-SIG-v1\0`) with legacy fallback migration window (Section 7.3, 13.3.1)
@@ -1592,7 +1599,7 @@ Agent     Node A         Node B       Sarah
 - Thread size limits: `max_envelopes_per_thread` and `max_pending_parents` (Section 10.7)
 - Formalized Proof-of-Possession (PoP) hardening for capability tokens with `cnf.key_id` binding (Section 12.6)
 - Delegation chain tightening: `created_at` enforcement, clock-skew rejection, max chain depth, root delegator type binding (Section 13.3)
-- E2EE security property labels on all profiles; MLS reserved placeholder profile `loom-e2ee-mls-1` (Section 7.4.1, 7.4.2)
+- E2EE security property labels on all profiles; MLS profile `loom-e2ee-mls-1` active in MVN conformance profile (Section 7.4.1, 7.4.2)
 - Configurable sliding-window replay protection as alternative to strict-monotonic mode (Section 23.1)
 
 ### 1.1.0 — February 2026

@@ -56,6 +56,56 @@ const THREAD_OP_TO_GRANT = {
   "thread.context_budget@v1": "admin"
 };
 
+function normalizedIntentPrefix(intent) {
+  const normalized = String(intent || "")
+    .trim()
+    .toLowerCase();
+  return normalized;
+}
+
+function assertEnvelopeExtensionPolicyCore(envelope, authoritativeSenderType) {
+  const intent = normalizedIntentPrefix(envelope?.content?.structured?.intent);
+  const envelopeType = String(envelope?.type || "")
+    .trim()
+    .toLowerCase();
+  const encrypted = envelope?.content?.encrypted === true;
+
+  if (this.emailBridgeExtensionEnabled !== true && authoritativeSenderType === "bridge") {
+    throw new LoomError("CAPABILITY_DENIED", "Email bridge extension is disabled for this protocol profile", 403, {
+      extension_id: "loom-ext-email-bridge-v1",
+      field: "from.type",
+      protocol_profile: this.protocolProfile
+    });
+  }
+
+  if (this.mcpRuntimeExtensionEnabled !== true && intent.startsWith("mcp.")) {
+    throw new LoomError("CAPABILITY_DENIED", "MCP runtime extension is disabled for this protocol profile", 403, {
+      extension_id: "loom-ext-mcp-runtime-v1",
+      field: "content.structured.intent",
+      protocol_profile: this.protocolProfile
+    });
+  }
+
+  if (
+    this.workflowExtensionEnabled !== true &&
+    (envelopeType === "workflow" || intent.startsWith("workflow."))
+  ) {
+    throw new LoomError("CAPABILITY_DENIED", "Workflow extension is disabled for this protocol profile", 403, {
+      extension_id: "loom-ext-workflow-v1",
+      field: envelopeType === "workflow" ? "type" : "content.structured.intent",
+      protocol_profile: this.protocolProfile
+    });
+  }
+
+  if (this.e2eeExtensionEnabled !== true && (encrypted || intent.startsWith("encryption."))) {
+    throw new LoomError("CAPABILITY_DENIED", "E2EE extension is disabled for this protocol profile", 403, {
+      extension_id: "loom-ext-e2ee-x25519-v1",
+      field: encrypted ? "content.encrypted" : "content.structured.intent",
+      protocol_profile: this.protocolProfile
+    });
+  }
+}
+
 function ensureSenderReplayStateMap(thread) {
   if (!thread.encryption || typeof thread.encryption !== "object" || Array.isArray(thread.encryption)) {
     thread.encryption = {
@@ -1197,6 +1247,31 @@ export function ingestEnvelopeCore(envelope, context = {}) {
   }
 
   const authoritativeSenderType = this.resolveAuthoritativeEnvelopeSenderType(envelope);
+  assertEnvelopeExtensionPolicyCore.call(this, envelope, authoritativeSenderType);
+
+  if (authoritativeSenderType === "bridge") {
+    const allowBridgeAutomaticActuation =
+      context?.allowBridgeAutomaticActuation === true ||
+      this.bridgeInboundAllowAutomaticActuation === true;
+    if (!allowBridgeAutomaticActuation) {
+      const envelopeType = String(envelope?.type || "").trim() || "message";
+      const intent = String(envelope?.content?.structured?.intent || "").trim() || "message.general@v1";
+      const isSafeType = envelopeType === "message";
+      const isSafeIntent = intent === "message.general@v1";
+      if (!isSafeType || !isSafeIntent) {
+        throw new LoomError(
+          "CAPABILITY_DENIED",
+          "Bridge sender envelopes are non-authoritative by default and cannot trigger automatic actuation",
+          403,
+          {
+            type: envelopeType,
+            intent,
+            field: !isSafeType ? "type" : "content.structured.intent"
+          }
+        );
+      }
+    }
+  }
 
   // Agent trust enforcement — check before spending further resources
   if (authoritativeSenderType === "agent") {

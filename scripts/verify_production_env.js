@@ -2,6 +2,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { applyConfigProfileEnvDefaults } from "../src/node/config_profile.js";
 
 function parseBoolean(value, defaultValue = false) {
   if (value == null) {
@@ -81,6 +82,17 @@ if (args.envFile) {
   console.log(`Loaded env file: ${envFilePath}`);
 }
 
+let activeConfigProfile = null;
+try {
+  activeConfigProfile = applyConfigProfileEnvDefaults(env, env.LOOM_CONFIG_PROFILE);
+} catch (error) {
+  console.error(`ERROR: ${error?.message || String(error)}`);
+  process.exit(1);
+}
+if (activeConfigProfile) {
+  console.log(`Applied LOOM config profile defaults: ${activeConfigProfile}`);
+}
+
 const errors = [];
 const warnings = [];
 const checks = [];
@@ -144,6 +156,14 @@ const bridgeInboundQuarantineOnAuthFailure = parseBoolean(
 );
 const bridgeInboundWeakAuthPolicyConfirmed = parseBoolean(
   env.LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED,
+  false
+);
+const bridgeInboundAllowAutomaticActuation = parseBoolean(
+  env.LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION,
+  false
+);
+const bridgeInboundAutomationConfirmed = parseBoolean(
+  env.LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED,
   false
 );
 const pgUrl = String(env.LOOM_PG_URL || "").trim();
@@ -280,6 +300,16 @@ if (publicService) {
 
     if (!bridgeInboundRejectOnAuthFailure && !bridgeInboundQuarantineOnAuthFailure) {
       fail("Inbound bridge auth failures are neither rejected nor quarantined.");
+    }
+
+    if (bridgeInboundAllowAutomaticActuation && !bridgeInboundAutomationConfirmed) {
+      fail(
+        "LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION=true requires LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true on public service."
+      );
+    } else if (bridgeInboundAllowAutomaticActuation) {
+      warn("Inbound bridge automatic actuation is enabled with explicit confirmation.");
+    } else {
+      ok("Inbound bridge non-actuating default enabled");
     }
   }
 

@@ -308,7 +308,7 @@ export const NIST_ZERO_TRUST_MAPPINGS = Object.freeze([
     principle: "ZT-5",
     title: "Enterprise monitors and measures integrity and security posture",
     description: "Continuous compliance auditing with automated scoring.",
-    loom_feature: "ATP compliance layer, 23 automated checks, hash-chain audit logs"
+    loom_feature: "Protocol compliance layer, 23 automated checks, hash-chain audit logs"
   })
 ]);
 

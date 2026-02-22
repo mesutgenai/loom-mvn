@@ -2,6 +2,53 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+- No changes yet.
+
+## v0.4.1 — 2026-02-22
+
+### Protocol Boundary Hardening
+
+- Bridged sender envelopes are now non-actuating by default at ingest.
+  - Bridge identities can submit only `type=message` with `message.general@v1` intent unless explicit opt-in is enabled.
+  - New config: `LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION` (default `false`).
+  - Public-service safeguard: enabling bridged automatic actuation now also requires `LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true`.
+- Inbound bridge envelopes now carry explicit non-authoritative structured trust metadata (`meta.bridge.structured_trust` and structured parameter trust hints).
+
+### Naming Clarification
+
+- Added canonical module name `protocol_compliance.js` and kept `atp_compliance.js` as backward-compatible re-export shim.
+- Compliance report title updated to `LOOM Protocol Compliance Report`.
+
+### Docs and Positioning
+
+- README clone URLs updated to `mesutgenai/loom-mvn`.
+- README and conformance release references aligned with `v0.4.1` / `0.4.1`.
+- Added `docs/LOOM-CORE.md` defining `loom-core-1` cut-line and extension boundaries.
+- Added `docs/EXTENSION-REGISTRY.md` with formal extension lifecycle + versioning rules.
+- Added `docs/CONFIG-PROFILES.md` and `.env.secure-public.example` for reduced-surface secure deployment profile guidance.
+- Updated bridge hardening runbook and production env example with explicit bridged auto-actuation controls.
+- Updated v1.1 spec identity examples and rules to canonical lowercase identity serialization.
+- Updated docs to reflect current runtime profile behavior and extension-gated routes (bridge/gateway/MCP/compliance overlays).
+- Updated docs to include `GET /v1/protocol/extensions` as canonical machine-readable extension discovery endpoint.
+- Updated docs/spec text to reflect active MLS wire profile status (`loom-e2ee-mls-1`) in the MVN conformance profile.
+- Normalized legacy docs (`LOOM-protocol-design.md`, `LOOM-specification-v1.0.md`) to align with canonical lowercase identity rules, versioned intents (`@v1`), and bridge non-authoritative/non-actuating defaults.
+
+### Core Runtime and Extension Discovery
+
+- Added runtime protocol-profile enforcement via `LOOM_PROTOCOL_PROFILE` (`loom-v1.1-full` default, `loom-core-1` core-only).
+- Added machine-readable extension registry endpoint: `GET /v1/protocol/extensions`.
+- In `loom-core-1`, extension routes now fail closed (`404`) for bridge, gateway, MCP, and compliance overlays.
+- In `loom-core-1`, ingest now rejects extension envelopes/intents with `CAPABILITY_DENIED`.
+- Protocol capabilities now reflect extension state (MCP/compliance/E2EE advertisements are suppressed when disabled).
+- Aligned extension lifecycle state for MLS with runtime behavior: `loom-ext-e2ee-mls-1` now reports `active` in extension discovery.
+
+### Release Metadata
+
+- Bumped repository/package version to `0.4.1` and synced lockfile metadata.
+- Updated `LOOM_RELEASE_VERSION` runtime constant to `0.4.1`.
+
 ## v0.4.0 — 2026-02-21
 
 Security hardening, compliance, and operational modules addressing

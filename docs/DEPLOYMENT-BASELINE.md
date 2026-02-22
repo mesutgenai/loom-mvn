@@ -31,6 +31,7 @@ Deploy LOOM as an internet-facing service with enforced TLS and startup safety g
 
 1. Start from:
 - `.env.production.example`
+- or `.env.secure-public.example` with `LOOM_CONFIG_PROFILE=secure_public` for reduced env surface
 
 2. Replace all placeholders with deployment-specific values and secrets from your secret manager.
 

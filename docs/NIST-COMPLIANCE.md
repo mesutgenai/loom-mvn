@@ -99,7 +99,7 @@ Machine-readable mappings are available via `GET /v1/admin/nist/summary` and in 
 | All communication is secured | TLS-required federation, E2EE, webhook HMAC |
 | Per-session access grants | Scoped capability tokens with expiration and audience constraints |
 | Dynamic policy-driven access | Agent trust scoring adjusts privileges based on behavior |
-| Continuous security monitoring | ATP compliance layer, 23 automated checks, hash-chain audit logs |
+| Continuous security monitoring | Protocol compliance layer, 23 automated checks, hash-chain audit logs |
 
 ## Related Documentation
 

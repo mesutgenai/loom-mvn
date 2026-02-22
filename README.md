@@ -7,7 +7,7 @@ This repository tracks **LOOM** (Linked Operations & Orchestrated Messaging).
 Clone and run locally:
 
 ```bash
-git clone https://github.com/Almariongenai/loom-mvn.git
+git clone https://github.com/mesutgenai/loom-mvn.git
 cd loom-mvn
 npm install
 npm start
@@ -110,13 +110,15 @@ LOOM approach:
 
 Email remains useful as a bridge transport for legacy users and systems. It is not enough as the core protocol for agent-native collaboration. LOOM keeps compatibility where needed, but moves the source of truth to signed, structured, auditable protocol primitives.
 
+Positioning baseline: **LOOM-native when possible, email-compatible always**.
+
 ## Current status
 
-- Current release tag is `v0.3.0` (see `CHANGELOG.md` for release-level change history, including unreleased additions).
-- Repository package version is `0.3.0` (`package.json`).
+- Current release tag is `v0.4.1` (see `CHANGELOG.md` for release-level change history, including unreleased additions).
+- Repository package version is `0.4.1` (`package.json`).
 - npm publication is intentionally disabled (`"private": true`), so versioning is tracked in git tags/changelog rather than npm registry releases.
-- **1470 tests, 0 failures** across 52 test files.
-- **49 protocol modules** covering all LOOM v1.1 specification sections plus security, compliance, and operational extensions.
+- Comprehensive automated tests are included (`npm test`) and also run in CI.
+- Protocol modules cover all LOOM v1.1 specification sections plus security, compliance, and operational extensions.
 - Protocol design docs are available in:
   - `CHANGELOG.md`
   - `LOOM-protocol-design.md`
@@ -149,6 +151,9 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `docs/SECRETS-KEY-ROTATION.md`
   - `docs/OPEN-SOURCE-STRATEGY.md`
   - `docs/POSTGRES-OPERATIONS.md`
+  - `docs/LOOM-CORE.md`
+  - `docs/EXTENSION-REGISTRY.md`
+  - `docs/CONFIG-PROFILES.md`
 - Community and governance docs:
   - `CONTRIBUTING.md`
   - `CODE_OF_CONDUCT.md`
@@ -157,6 +162,15 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 - Repository baseline now includes:
   - `LICENSE` (Apache-2.0)
   - GitHub Actions CI workflow (`.github/workflows/ci.yml`)
+
+## Core vs Extensions
+
+To keep independent implementation scope tractable, LOOM now documents a strict core cut-line and extension model in `docs/LOOM-CORE.md`, with formal extension governance in `docs/EXTENSION-REGISTRY.md`.
+
+- **LOOM Core**: identity/addressing, canonical envelopes + signatures, thread DAG semantics, capability token baseline, federation trust wrapper baseline.
+- **Extensions**: email bridge, legacy gateway, MCP runtime, workflow orchestration, E2EE profiles, compliance/operational overlays.
+- Runtime profile switch: `LOOM_PROTOCOL_PROFILE=loom-core-1` disables extension routes and extension ingest semantics by default.
+- Runtime discovery endpoint: `GET /v1/protocol/extensions` returns machine-readable extension enablement state for the active profile.
 
 ## Ground-Up Reboot Track (v2.0 Draft)
 
@@ -187,7 +201,7 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
 - Optional disk persistence (`LOOM_DATA_DIR`) with hash-chained audit log
 - Envelope `from.device_id` support for multi-device replay tracking (1-128 character string, optional)
 - Configurable replay protection: `strict` mode (monotonic counter) or `sliding_window` mode (64-entry sliding window allowing out-of-order delivery); replay state keyed by `senderIdentity:deviceId`
-- E2EE profile security property labels (`forward_secrecy`, `post_compromise_security`, `confidentiality`) on all profiles; MLS placeholder profile (`loom-e2ee-mls-1`) reserved for future RFC 9420 implementation
+- E2EE profile security property labels (`forward_secrecy`, `post_compromise_security`, `confidentiality`) on all profiles, including active MLS profile support (`loom-e2ee-mls-1`) for RFC 9420-grade properties
 - Protocol module library covering all LOOM v1.1 specification sections:
   - Intent taxonomy validation (`src/protocol/intents.js`) — validates intent strings against the v1.1 taxonomy
   - Delivery/read/failure receipts (`src/protocol/receipts.js`) — system-generated receipt envelope builders
@@ -218,7 +232,7 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - Prompt injection detection (`src/protocol/prompt_injection.js`) — heuristic scanner for 5 injection categories with configurable thresholds
   - MCP execution sandboxing (`src/protocol/mcp_sandbox.js`) — tool classification, size guards, permission checks, and rate limiting for MCP tools
   - MIME type registry (`src/protocol/mime_registry.js`) — type normalization, dangerous-type detection, configurable allow/deny policies
-  - ATP compliance auditing (`src/protocol/atp_compliance.js`) — 23 automated compliance checks with scoring and level classification
+  - Protocol compliance auditing (`src/protocol/protocol_compliance.js`) — 23 automated compliance checks with scoring and level classification
   - Compression negotiation (`src/protocol/compression.js`) — Accept-Encoding/Content-Encoding negotiation for gzip, brotli, deflate
   - NIST SP 800-53 alignment (`src/protocol/nist_mapping.js`) — 29 controls across 7 families, SP 800-207 zero-trust mapping
   - Key rotation policy (`src/protocol/key_rotation.js`) — federation key rotation scheduling with grace periods, overlap windows, and audit trail
@@ -242,7 +256,7 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - Prompt injection analysis on ingestion with escalation triggers and agent trust event recording
   - MCP sandbox enforcement (rate limits, tool permissions, argument/result size guards)
   - MIME policy enforcement on blob creation (dangerous-type detection, configurable allow/deny)
-  - ATP compliance auditing with 23 automated checks and scoring
+  - Protocol compliance auditing with 23 automated checks and scoring
   - Transparent response compression via Accept-Encoding negotiation (gzip/br/deflate)
   - NIST SP 800-53 compliance summary cross-referencing 29 controls with audit results
   - Federation key rotation management (assessment, execution, history, serialized policy)
@@ -277,6 +291,7 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
 - Maintenance sweep support for token/cache cleanup and retention enforcement (`message` + `blob` policies)
 - Admin persistence operations: schema status, backup export, and restore
 - In-memory node API:
+  - Profile note: endpoints marked as extension surfaces are disabled (fail-closed `404`) when `LOOM_PROTOCOL_PROFILE=loom-core-1` unless extension/profile policy enables them.
   - `GET /.well-known/loom.json`
   - `GET /ready`
   - `GET /metrics` (Prometheus format, admin token by default)
@@ -301,17 +316,17 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - `DELETE /v1/envelopes/{id}/content` (content-level envelope deletion with legal hold enforcement)
   - `POST /v1/admin/retention/enforce` (admin token required; trigger retention policy enforcement)
   - `GET /v1/audit?limit=...`
-  - `POST /v1/bridge/email/inbound`
-  - `POST /v1/bridge/email/outbound`
-  - `POST /v1/bridge/email/send` (queue + immediate relay attempt)
+  - `POST /v1/bridge/email/inbound` (extension: `loom-ext-email-bridge-v1`)
+  - `POST /v1/bridge/email/outbound` (extension: `loom-ext-email-bridge-v1`)
+  - `POST /v1/bridge/email/send` (queue + immediate relay attempt; extension: `loom-ext-email-bridge-v1`)
   - `POST /v1/email/outbox`
   - `GET /v1/email/outbox`
   - `POST /v1/email/outbox/process`
   - `POST /v1/email/outbox/{id}/process`
   - `POST /v1/email/outbox/{id}/dsn`
-  - `GET /v1/gateway/imap/folders`
-  - `GET /v1/gateway/imap/folders/{folder}/messages?limit=...`
-  - `POST /v1/gateway/smtp/submit`
+  - `GET /v1/gateway/imap/folders` (extension: `loom-ext-legacy-gateway-v1`)
+  - `GET /v1/gateway/imap/folders/{folder}/messages?limit=...` (extension: `loom-ext-legacy-gateway-v1`)
+  - `POST /v1/gateway/smtp/submit` (extension: `loom-ext-legacy-gateway-v1`)
   - `GET /v1/mailbox/threads/{id}/state`
   - `PATCH /v1/mailbox/threads/{id}/state`
   - `POST /v1/blobs`
@@ -326,6 +341,10 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - `DELETE /v1/delegations/{id}`
   - `GET /v1/federation/hello`
   - `GET /v1/protocol/capabilities` (supported E2EE profiles + federation trust-anchor negotiation posture)
+  - `GET /v1/protocol/extensions` (machine-readable extension registry + runtime enablement state)
+  - `GET /v1/mcp/tools` (extension: `loom-ext-mcp-runtime-v1`)
+  - `GET /v1/mcp/sse` (extension: `loom-ext-mcp-runtime-v1`)
+  - `POST /v1/mcp/message` (extension: `loom-ext-mcp-runtime-v1`)
   - `GET /.well-known/loom-capabilities.json` (well-known alias for protocol capabilities)
   - `GET /.well-known/loom-keyset.json` (signed federation keyset)
   - `GET /.well-known/loom-revocations.json` (signed federation key revocations)
@@ -360,13 +379,14 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - `GET /v1/admin/persistence/backup` (admin token required)
   - `POST /v1/admin/persistence/restore` (admin token required, `confirm=restore`)
   - `GET /v1/admin/agent-trust` (admin token required; agent trust status)
-  - `GET /v1/admin/nist/summary` (admin token required; NIST compliance summary)
+  - `GET /v1/admin/compliance/audit` (admin token required; detailed compliance audit; extension: `loom-ext-compliance-v1`)
+  - `GET /v1/admin/nist/summary` (admin token required; NIST compliance summary; extension: `loom-ext-compliance-v1`)
   - `GET /v1/admin/key-rotation/status` (admin token required; key rotation assessment)
   - `POST /v1/admin/key-rotation/rotate` (admin token required; trigger key rotation)
   - `GET /v1/admin/key-rotation/history` (admin token required; rotation audit trail)
   - `GET /v1/admin/search-index/status` (admin token required; search index stats)
-  - `GET /v1/protocol/compliance` (ATP compliance score and audit report)
-  - `GET /v1/mime/registry` (MIME type registry and policy)
+  - `GET /v1/protocol/compliance` (protocol compliance score and audit report; extension: `loom-ext-compliance-v1`)
+  - `GET /v1/mime/registry` (MIME type registry and policy; extension: `loom-ext-compliance-v1`)
   - `GET /v1/agents` (agent card discovery)
 
 ## Run
@@ -374,7 +394,7 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
 From a fresh machine:
 
 ```bash
-git clone https://github.com/Almariongenai/loom-mvn.git
+git clone https://github.com/mesutgenai/loom-mvn.git
 cd loom-mvn
 npm install
 npm start
@@ -615,6 +635,15 @@ There is no separate mailbox provisioning step for local identities. If an ident
 Optional persistence:
 
 - Set `LOOM_DATA_DIR=/absolute/path` to persist state and audit log between restarts.
+- Optional secure-profile defaults:
+  - Set `LOOM_CONFIG_PROFILE=secure_public` to apply hardened public-service defaults without setting every individual guard variable.
+  - Start from `.env.secure-public.example` for the reduced-surface profile template.
+  - Explicit env values and explicit server options always override profile defaults.
+- Protocol profile/runtime extension surface:
+  - `LOOM_PROTOCOL_PROFILE=loom-v1.1-full|loom-core-1` (default `loom-v1.1-full`).
+  - `LOOM_CONFIG_PROFILE=secure_public` does not force `loom-core-1`; set `LOOM_PROTOCOL_PROFILE` explicitly when you want core-only runtime behavior.
+  - Optional extension toggles (ignored in `loom-core-1`): `LOOM_EXTENSION_EMAIL_BRIDGE_ENABLED`, `LOOM_EXTENSION_LEGACY_GATEWAY_ENABLED`, `LOOM_EXTENSION_MCP_RUNTIME_ENABLED`, `LOOM_EXTENSION_WORKFLOW_ENABLED`, `LOOM_EXTENSION_E2EE_ENABLED`, `LOOM_EXTENSION_COMPLIANCE_ENABLED`.
+  - Route-level toggles (also subject to extension/profile gates): `LOOM_BRIDGE_EMAIL_INBOUND_ENABLED`, `LOOM_BRIDGE_EMAIL_OUTBOUND_ENABLED`, `LOOM_BRIDGE_EMAIL_SEND_ENABLED`, `LOOM_GATEWAY_IMAP_ENABLED`, `LOOM_GATEWAY_SMTP_SUBMIT_ENABLED`, `LOOM_MCP_RUNTIME_ROUTES_ENABLED`, `LOOM_COMPLIANCE_ROUTES_ENABLED`.
 - Optional local state-file encryption at rest:
   - `LOOM_STATE_ENCRYPTION_KEY` (32-byte key as base64url/base64/hex)
   - `LOOM_REQUIRE_STATE_ENCRYPTION_AT_REST=true|false` (when `true`, plaintext state files are refused)
@@ -757,6 +786,7 @@ Optional persistence:
     - If `LOOM_FEDERATION_REMOTE_IDENTITY_RESOLVE_ENABLED=true` (default), `LOOM_REMOTE_IDENTITY_HOST_ALLOWLIST` is also required.
   - Server refuses public service with inbound bridge enabled unless `LOOM_BRIDGE_EMAIL_INBOUND_PUBLIC_CONFIRMED=true`.
   - Server refuses weak public inbound bridge auth policy unless `LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true`.
+  - Server refuses bridged auto-actuation on public service unless explicitly confirmed via `LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true`.
 - For `thread_op` submissions by non-owner participants, authorize with either:
   - `content.structured.parameters.capability_token` (portable signed token; recommended for federation portability)
   - `x-loom-capability-token` (legacy/local presentation secret header)
@@ -785,6 +815,8 @@ Optional persistence:
     - `LOOM_BRIDGE_EMAIL_INBOUND_REJECT_ON_AUTH_FAILURE=true|false` (default `true` on public service, else `false`; if `false`, failures can be quarantined instead)
     - `LOOM_BRIDGE_EMAIL_INBOUND_QUARANTINE_ON_AUTH_FAILURE=true|false` (default `true`)
     - `LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_PAYLOAD_AUTH_RESULTS=true|false` (default `true`; when `false`, only sanitized header auth evidence is trusted)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION=true|false` (default `false`; bridged senders remain non-authoritative unless explicitly enabled)
+    - `LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true|false` (default `false`; required on public service when automatic actuation is enabled)
     - `LOOM_BRIDGE_EMAIL_INBOUND_HEADER_ALLOWLIST` (comma-separated inbound header names to retain in bridge metadata)
     - `LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true|false` (default `false`; required only if you intentionally weaken public inbound auth policy defaults)
   - Inbound content filter controls:

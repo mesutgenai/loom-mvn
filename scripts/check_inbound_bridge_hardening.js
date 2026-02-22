@@ -2,6 +2,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { applyConfigProfileEnvDefaults } from "../src/node/config_profile.js";
 
 function parseBoolean(value, defaultValue = false) {
   if (value == null) {
@@ -120,6 +121,17 @@ async function main() {
     console.log(`Loaded env file: ${envFilePath}`);
   }
 
+  let activeConfigProfile = null;
+  try {
+    activeConfigProfile = applyConfigProfileEnvDefaults(env, env.LOOM_CONFIG_PROFILE);
+  } catch (error) {
+    console.error(`ERROR: ${error?.message || String(error)}`);
+    process.exit(1);
+  }
+  if (activeConfigProfile) {
+    console.log(`Applied LOOM config profile defaults: ${activeConfigProfile}`);
+  }
+
   const checks = [];
   const warnings = [];
   const errors = [];
@@ -149,6 +161,14 @@ async function main() {
   );
   const bridgeInboundWeakAuthPolicyConfirmed = parseBoolean(
     env.LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED,
+    false
+  );
+  const bridgeInboundAllowAutomaticActuation = parseBoolean(
+    env.LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION,
+    false
+  );
+  const bridgeInboundAutomationConfirmed = parseBoolean(
+    env.LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED,
     false
   );
   const adminToken = String(env.LOOM_ADMIN_TOKEN || "").trim();
@@ -195,6 +215,16 @@ async function main() {
 
     if (!bridgeInboundRejectOnAuthFailure && !bridgeInboundQuarantineOnAuthFailure) {
       errors.push("Inbound auth failures are neither rejected nor quarantined; enable at least one mitigation.");
+    }
+
+    if (bridgeInboundAllowAutomaticActuation && !bridgeInboundAutomationConfirmed) {
+      errors.push(
+        "LOOM_BRIDGE_EMAIL_INBOUND_ALLOW_AUTOMATIC_ACTUATION=true requires LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true on public service."
+      );
+    } else if (bridgeInboundAllowAutomaticActuation) {
+      warnings.push("Inbound bridge automatic actuation is enabled with explicit confirmation.");
+    } else {
+      checks.push("Inbound bridge non-actuating default is enforced");
     }
   }
 

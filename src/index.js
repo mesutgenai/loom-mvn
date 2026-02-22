@@ -3,6 +3,7 @@ import { createEmailRelayFromEnv } from "./node/email_relay.js";
 import { createPostgresPersistenceFromEnv } from "./node/persistence_postgres.js";
 import { createWireGatewayFromEnv } from "./node/wire_gateway.js";
 import { parseBoolean, parseHostAllowlist } from "./node/env.js";
+import { applyConfigProfileEnvDefaults } from "./node/config_profile.js";
 import { randomUUID } from "node:crypto";
 
 function isPublicBindHost(value) {
@@ -37,6 +38,8 @@ function normalizePositiveInteger(value, fallback, { min = 1, max = Number.MAX_S
 
   return Math.min(max, floored);
 }
+
+applyConfigProfileEnvDefaults(process.env, process.env.LOOM_CONFIG_PROFILE);
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";

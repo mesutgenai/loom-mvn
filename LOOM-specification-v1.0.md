@@ -10,6 +10,10 @@
 **Authors:** Almarion (CoWork-OS)  
 **License:** Open Specification — free to implement, extend, and build upon.
 
+> Historical specification baseline.
+> Canonical behavior now lives in `LOOM-Protocol-Spec-v1.1.md`, `LOOM-Agent-First-Protocol-v2.0.md`, `docs/LOOM-CORE.md`, and `docs/EXTENSION-REGISTRY.md`.
+> If this v1.0 draft conflicts with those references, follow the canonical set.
+
 ---
 
 ## Table of Contents
@@ -200,7 +204,7 @@ loom://{local}@{domain}[#{fragment}]
 | Part | Required | Description | Example |
 |------|----------|-------------|---------|
 | `loom://` | Yes | Scheme identifier | — |
-| `{local}` | Yes | Local part — user, agent, team, or service name | `Almarion`, `assistant.Almarion`, `billing` |
+| `{local}` | Yes | Local part — user, agent, team, or service name | `almarion`, `assistant.almarion`, `billing` |
 | `@` | Yes | Separator | — |
 | `{domain}` | Yes | Domain of the hosting LOOM node | `cowork-os.com`, `acme.corp` |
 | `#{fragment}` | No | Deep-link to a thread, envelope, or object | `#thr_01JMK8W`, `#invoice-q1` |
@@ -208,12 +212,12 @@ loom://{local}@{domain}[#{fragment}]
 **Address examples:**
 
 ```
-loom://Almarion@cowork-os.com                    — Human identity
-loom://assistant.Almarion@cowork-os.com          — Agent scoped to a human
-loom://research.assistant.Almarion@cowork-os.com — Sub-agent (nested delegation)
+loom://almarion@cowork-os.com                    — Human identity
+loom://assistant.almarion@cowork-os.com          — Agent scoped to a human
+loom://research.assistant.almarion@cowork-os.com — Sub-agent (nested delegation)
 loom://billing@acme.corp                      — Team/role address
 loom://ci-bot@acme.corp                       — Service identity
-loom://Almarion@cowork-os.com#thr_01JMK8W        — Deep-link to a specific thread
+loom://almarion@cowork-os.com#thr_01JMK8W        — Deep-link to a specific thread
 bridge://alice@gmail.com                      — Bridged email identity
 ```
 
@@ -223,7 +227,7 @@ bridge://alice@gmail.com                      — Bridged email identity
 - Agent scoping uses `.` as the hierarchy separator (e.g., `agent.human`)
 - The `bridge://` scheme is reserved for email-bridged identities
 - Fragment identifiers are client-side references and are NOT transmitted in envelopes
-- Addresses are **case-insensitive** for the domain part and **case-sensitive** for the local part
+- Addresses are treated case-insensitively and serialized to canonical lowercase form on wire.
 
 ### 6.2 Identity Document
 
@@ -232,7 +236,7 @@ Every LOOM identity resolves to an **Identity Document** — a JSON object publi
 ```json
 {
   "loom": "1.0",
-  "id": "loom://Almarion@cowork-os.com",
+  "id": "loom://almarion@cowork-os.com",
   "type": "human",
   "display_name": "Almarion",
   "node": "cowork-os.com",
@@ -256,7 +260,7 @@ Every LOOM identity resolves to an **Identity Document** — a JSON object publi
   "delegations": [],
   "capabilities": ["send", "receive", "create_thread", "delegate"],
   "verified_bridges": {
-    "email": "Almarion@cowork-os.com"
+    "email": "almarion@cowork-os.com"
   },
   "metadata": {
     "avatar_url": "https://cowork-os.com/avatars/Almarion.png",
@@ -283,11 +287,11 @@ Agent identities carry additional required fields:
 ```json
 {
   "loom": "1.0",
-  "id": "loom://assistant.Almarion@cowork-os.com",
+  "id": "loom://assistant.almarion@cowork-os.com",
   "type": "agent",
   "display_name": "Almarion's Assistant",
   "node": "cowork-os.com",
-  "delegator": "loom://Almarion@cowork-os.com",
+  "delegator": "loom://almarion@cowork-os.com",
   "agent_info": {
     "model": "claude-opus-4",
     "provider": "anthropic",
@@ -543,7 +547,7 @@ The default type. Used for freeform conversation.
       "format": "markdown"
     },
     "structured": {
-      "intent": "message.general",
+      "intent": "message.general@v1",
       "parameters": {
         "topic": "q1-report",
         "sentiment": "inquiry"
@@ -852,7 +856,7 @@ A Thread is a **directed acyclic graph (DAG)** of envelopes, rooted at a single 
 Threads can be addressed directly using fragment identifiers:
 
 ```
-loom://Almarion@cowork-os.com#thr_01JMKB7W8P
+loom://almarion@cowork-os.com#thr_01JMKB7W8P
 ```
 
 This is a client-side convenience — the node resolves the identity and then looks up the thread in the local store.
@@ -922,20 +926,20 @@ Delegation is the mechanism by which humans authorize agents (and agents authori
 │                        DELEGATION CHAIN                                │
 │                                                                        │
 │   Human (Almarion)                                                        │
-│   loom://Almarion@cowork-os.com                                          │
+│   loom://almarion@cowork-os.com                                          │
 │   scope: * (root authority)                                            │
 │        │                                                               │
 │        │  DELEGATES (signed)                                           │
 │        ▼                                                               │
 │   Agent (Almarion's Assistant)                                            │
-│   loom://assistant.Almarion@cowork-os.com                                │
+│   loom://assistant.almarion@cowork-os.com                                │
 │   scope: [read.*, reply.routine, task.create, calendar.*]             │
 │   expires: 2026-06-01                                                  │
 │        │                                                               │
 │        │  SUB-DELEGATES (signed, scope ⊂ parent)                      │
 │        ▼                                                               │
 │   Sub-Agent (Calendar Specialist)                                      │
-│   loom://cal.assistant.Almarion@cowork-os.com                            │
+│   loom://cal.assistant.almarion@cowork-os.com                            │
 │   scope: [calendar.schedule, calendar.read]                           │
 │   expires: 2026-02-28, single_use: false                              │
 │                                                                        │
@@ -946,8 +950,8 @@ Delegation is the mechanism by which humans authorize agents (and agents authori
 
 ```json
 {
-  "delegator": "loom://Almarion@cowork-os.com",
-  "delegate": "loom://assistant.Almarion@cowork-os.com",
+  "delegator": "loom://almarion@cowork-os.com",
+  "delegate": "loom://assistant.almarion@cowork-os.com",
   "scope": ["read.*", "reply.routine", "task.create", "calendar.*"],
   "created_at": "2026-01-15T10:00:00Z",
   "expires_at": "2026-06-01T00:00:00Z",
@@ -1003,8 +1007,8 @@ Delegation revocations are broadcast via a signed `delegation.revoked` event:
     "structured": {
       "intent": "delegation.revoked",
       "parameters": {
-        "delegator": "loom://Almarion@cowork-os.com",
-        "delegate": "loom://assistant.Almarion@cowork-os.com",
+        "delegator": "loom://almarion@cowork-os.com",
+        "delegate": "loom://assistant.almarion@cowork-os.com",
         "revoked_at": "2026-02-16T18:00:00Z",
         "reason": "Agent compromised"
       }
@@ -1066,7 +1070,7 @@ LOOM uses **cryptographic proof-of-key** for authentication (no passwords):
 ```json
 // POST /v1/auth/challenge
 {
-  "identity": "loom://Almarion@cowork-os.com",
+  "identity": "loom://almarion@cowork-os.com",
   "key_id": "k_sign_01JMK..."
 }
 
@@ -1078,7 +1082,7 @@ LOOM uses **cryptographic proof-of-key** for authentication (no passwords):
 
 // POST /v1/auth/token
 {
-  "identity": "loom://Almarion@cowork-os.com",
+  "identity": "loom://almarion@cowork-os.com",
   "key_id": "k_sign_01JMK...",
   "challenge": "base64url-random-nonce",
   "signature": "base64url-ed25519-signature"
@@ -1391,7 +1395,7 @@ After connection, the client sends a subscription message:
   "action": "subscribe",
   "channels": [
     { "type": "thread", "id": "thr_01JMKB7W..." },
-    { "type": "identity", "id": "loom://Almarion@cowork-os.com" },
+    { "type": "identity", "id": "loom://almarion@cowork-os.com" },
     { "type": "all_threads" }
   ]
 }
@@ -1443,7 +1447,7 @@ Identities MAY broadcast presence:
 {
   "action": "presence.update",
   "data": {
-    "identity": "loom://assistant.Almarion@cowork-os.com",
+    "identity": "loom://assistant.almarion@cowork-os.com",
     "status": "available | busy | away | offline",
     "response_time": "instant | minutes | hours | days",
     "capabilities_active": ["reply.routine", "task.triage", "calendar.read"],
@@ -1474,15 +1478,15 @@ The `structured` content layer uses a namespace-based intent system that enables
 
 | Namespace | Description | Examples |
 |-----------|-------------|---------|
-| `message.*` | General messages | `message.general`, `message.question`, `message.reply` |
-| `task.*` | Task lifecycle | `task.create`, `task.assign`, `task.update`, `task.complete` |
-| `approval.*` | Approval workflows | `approval.request`, `approval.response` |
-| `schedule.*` | Scheduling | `schedule.meeting`, `schedule.propose_times`, `schedule.confirm` |
-| `event.*` | Calendar events | `event.invite`, `event.rsvp`, `event.cancel` |
-| `data.*` | Data exchange | `data.request`, `data.deliver`, `data.query` |
-| `handoff.*` | Responsibility transfer | `handoff.transfer`, `handoff.accept`, `handoff.reject` |
-| `notification.*` | Status updates | `notification.system`, `notification.alert`, `notification.digest` |
-| `delegation.*` | Delegation management | `delegation.grant`, `delegation.revoked`, `delegation.request` |
+| `message.*` | General messages | `message.general@v1`, `message.question@v1`, `message.reply@v1` |
+| `task.*` | Task lifecycle | `task.create@v1`, `task.assign@v1`, `task.update@v1`, `task.complete@v1` |
+| `approval.*` | Approval workflows | `approval.request@v1`, `approval.response@v1` |
+| `schedule.*` | Scheduling | `schedule.meeting@v1`, `schedule.propose_times@v1`, `schedule.confirm@v1` |
+| `event.*` | Calendar events | `event.invite@v1`, `event.rsvp@v1`, `event.cancel@v1` |
+| `data.*` | Data exchange | `data.request@v1`, `data.deliver@v1`, `data.query@v1` |
+| `handoff.*` | Responsibility transfer | `handoff.transfer@v1`, `handoff.accept@v1`, `handoff.reject@v1` |
+| `notification.*` | Status updates | `notification.system@v1`, `notification.alert@v1`, `notification.digest@v1` |
+| `delegation.*` | Delegation management | `delegation.grant@v1`, `delegation.revoked@v1`, `delegation.request@v1` |
 
 The `response_schema` field in structured content tells the recipient exactly what format is expected in reply, enabling zero-ambiguity agent-to-agent communication.
 
@@ -1492,13 +1496,13 @@ When an agent sends an envelope, the `from` block MUST include:
 
 ```json
 "from": {
-  "identity": "loom://assistant.Almarion@cowork-os.com",
+  "identity": "loom://assistant.almarion@cowork-os.com",
   "display": "Almarion's Assistant",
   "key_id": "k_sign_agent_01JMK...",
   "type": "agent",
   "delegation_chain": [
     {
-      "delegator": "loom://Almarion@cowork-os.com",
+      "delegator": "loom://almarion@cowork-os.com",
       "scope": ["read.*", "reply.routine"],
       "signature": "sig_EdDSA_..."
     }
@@ -1644,7 +1648,7 @@ Workflows are multi-step processes defined as special envelopes:
           {
             "id": "step_3",
             "action": "notification",
-            "to": "loom://Almarion@cowork-os.com",
+            "to": "loom://almarion@cowork-os.com",
             "parameters": {
               "template": "expense_processed",
               "data": { "expense_id": "exp_892", "status": "paid" }
@@ -1653,7 +1657,7 @@ Workflows are multi-step processes defined as special envelopes:
           {
             "id": "step_abort",
             "action": "notification",
-            "to": "loom://Almarion@cowork-os.com",
+            "to": "loom://almarion@cowork-os.com",
             "parameters": {
               "template": "expense_rejected",
               "data": { "expense_id": "exp_892" }
@@ -1662,7 +1666,7 @@ Workflows are multi-step processes defined as special envelopes:
           {
             "id": "step_error_notify",
             "action": "notification",
-            "to": ["loom://Almarion@cowork-os.com", "loom://finance-admin@acme.corp"],
+            "to": ["loom://almarion@cowork-os.com", "loom://finance-admin@acme.corp"],
             "parameters": {
               "template": "payment_failed",
               "data": { "expense_id": "exp_892" }
@@ -1718,7 +1722,7 @@ Workflow steps support conditions:
 ┌─────────────────┐         ┌──────────────────────────┐         ┌─────────────────┐
 │   Email World    │         │      EMAIL BRIDGE         │         │   LOOM World    │
 │                  │         │                           │         │                 │
-│  alice@gmail.com │──SMTP──►│  ┌──────────────────┐   │         │ loom://Almarion@   │
+│  alice@gmail.com │──SMTP──►│  ┌──────────────────┐   │         │ loom://almarion@   │
 │                  │         │  │ Inbound Gateway   │───┼──LOOM──►│ cowork-os.com   │
 │                  │         │  │ • SMTP receiver    │   │         │                 │
 │                  │         │  │ • SPF/DKIM verify  │   │         │                 │
@@ -1748,15 +1752,17 @@ When an email arrives at the bridge:
 5. **Extract intent** (best-effort, AI-assisted):
    - Analyze subject line and body for structured intent
    - Map to closest LOOM intent namespace
-   - If extraction confidence is low, set `intent: "message.general"` with `extraction_confidence: 0.3`
+   - If extraction confidence is low, set `intent: "message.general@v1"` with `extraction_confidence: 0.3`
 6. **Generate LOOM envelope** with:
    - `from`: bridge identity
    - `content.human`: email body (Markdown-converted)
-   - `content.structured`: extracted intent
+   - `content.structured`: extracted intent (non-authoritative by default)
    - `meta.bridge.original_headers`: full email headers preserved
    - `meta.bridge.original_message_id`: email Message-ID for threading
+   - `meta.bridge.structured_trust`: trust marker (`authoritative=false`, `trust_level=low`)
 7. **Thread matching**: Use `In-Reply-To` and `References` headers to map to existing LOOM threads
 8. **Deliver** to LOOM recipient normally
+9. Bridge-originated envelopes are non-actuating by default unless explicit LOOM-native authorization is granted.
 
 ### 19.3 Outbound: LOOM → Email
 
@@ -1786,7 +1792,7 @@ Bridge identities (`bridge://`) have restricted capabilities:
 | E2EE | ❌ (email doesn't support it) |
 | Capability tokens | ❌ (all bridge participants get default `reply` capability) |
 | Real-time presence | ❌ |
-| Workflow participation | ⚠️ Limited (approval steps work via email reply) |
+| Workflow participation | ⚠️ Read-only/non-actuating by default; explicit opt-in required for actuation |
 
 ---
 
@@ -1921,7 +1927,7 @@ Every LOOM node maintains an immutable audit log of:
   "id": "audit_01JMK...",
   "timestamp": "2026-02-16T17:10:00Z",
   "event_type": "envelope.delivered",
-  "actor": "loom://Almarion@cowork-os.com",
+  "actor": "loom://almarion@cowork-os.com",
   "target": "env_01JMKB9X...",
   "details": {
     "thread_id": "thr_01JMKB7W...",
@@ -2086,46 +2092,48 @@ A MVN MAY defer:
 
 The intent registry is extensible. Core intents ship with the protocol:
 
+Canonical wire format in current specs appends major versions.
+
 ```
-message.general          — Freeform message
-message.question         — Question expecting an answer
-message.reply            — Direct reply to a question
-task.create              — New task
-task.assign              — Assign task to identity
-task.update              — Update task state
-task.complete            — Mark task complete
-task.fail                — Mark task failed
-approval.request         — Request yes/no/conditional decision
-approval.response        — Respond to approval request
-schedule.meeting         — Propose a meeting
-schedule.propose_times   — Suggest available times
-schedule.confirm         — Confirm a scheduled event
-event.invite             — Calendar event invitation
-event.rsvp               — RSVP to event
-event.cancel             — Cancel event
-event.update             — Update event details
-data.request             — Request structured data
-data.deliver             — Deliver structured data
-data.query               — Query for specific data points
-handoff.transfer         — Transfer responsibility
-handoff.accept           — Accept a handoff
-handoff.reject           — Reject a handoff
-notification.system      — System notification
-notification.alert       — Urgent alert
-notification.digest      — Summary/digest notification
-delegation.grant         — New delegation issued
-delegation.revoked       — Delegation revoked
-delegation.request       — Request delegation from a human
-receipt.delivered        — Delivery confirmation
-receipt.read             — Read confirmation
-receipt.processed        — Action/processing confirmation
-receipt.failed           — Delivery/processing failure
-workflow.execute         — Execute a multi-step workflow
-workflow.step_complete   — Workflow step completed
-workflow.complete        — Entire workflow completed
-workflow.failed          — Workflow failed at a step
-agent.negotiate          — Agent capability negotiation
-agent.heartbeat          — Agent liveness signal
+message.general@v1          — Freeform message
+message.question@v1         — Question expecting an answer
+message.reply@v1            — Direct reply to a question
+task.create@v1              — New task
+task.assign@v1              — Assign task to identity
+task.update@v1              — Update task state
+task.complete@v1            — Mark task complete
+task.fail@v1                — Mark task failed
+approval.request@v1         — Request yes/no/conditional decision
+approval.response@v1        — Respond to approval request
+schedule.meeting@v1         — Propose a meeting
+schedule.propose_times@v1   — Suggest available times
+schedule.confirm@v1         — Confirm a scheduled event
+event.invite@v1             — Calendar event invitation
+event.rsvp@v1               — RSVP to event
+event.cancel@v1             — Cancel event
+event.update@v1             — Update event details
+data.request@v1             — Request structured data
+data.deliver@v1             — Deliver structured data
+data.query@v1               — Query for specific data points
+handoff.transfer@v1         — Transfer responsibility
+handoff.accept@v1           — Accept a handoff
+handoff.reject@v1           — Reject a handoff
+notification.system@v1      — System notification
+notification.alert@v1       — Urgent alert
+notification.digest@v1      — Summary/digest notification
+delegation.grant@v1         — New delegation issued
+delegation.revoked@v1       — Delegation revoked
+delegation.request@v1       — Request delegation from a human
+receipt.delivered@v1        — Delivery confirmation
+receipt.read@v1             — Read confirmation
+receipt.processed@v1        — Action/processing confirmation
+receipt.failed@v1           — Delivery/processing failure
+workflow.execute@v1         — Execute a multi-step workflow
+workflow.step_complete@v1   — Workflow step completed
+workflow.complete@v1        — Entire workflow completed
+workflow.failed@v1          — Workflow failed at a step
+agent.negotiate@v1          — Agent capability negotiation
+agent.heartbeat@v1          — Agent liveness signal
 ```
 
 ### Appendix C: Sequence Diagrams

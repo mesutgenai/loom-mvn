@@ -1,6 +1,6 @@
 {
   "name": "loom-mvn",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "LOOM Protocol v1.1 Minimum Viable Node scaffold",
   "type": "module",
@@ -37,7 +37,7 @@
     "check:dr-plan": "node scripts/check_disaster_recovery_plan.js",
     "check:access-governance": "node scripts/check_access_governance.js",
     "check:compliance": "node scripts/check_compliance_controls.js",
-    "test:inbound-bridge-hardening": "node --test --test-name-pattern \"^(API refuses public inbound bridge exposure without explicit confirmation|API rejects inbound bridge admin requirement without configured admin token|API applies strict inbound bridge auth defaults on public service|API refuses weak inbound bridge auth policy on public service without explicit confirmation|API requires admin token for inbound bridged email when configured|API quarantines inbound bridged email when auth policy marks message as unverified|API can reject inbound bridged email when auth failure rejection is enabled)$\" test/server.test.js",
+    "test:inbound-bridge-hardening": "node --test --test-name-pattern \"^(API refuses public inbound bridge exposure without explicit confirmation|API rejects inbound bridge admin requirement without configured admin token|API applies strict inbound bridge auth defaults on public service|API refuses weak inbound bridge auth policy on public service without explicit confirmation|API refuses public inbound bridge auto-actuation without explicit confirmation|API requires admin token for inbound bridged email when configured|API quarantines inbound bridged email when auth policy marks message as unverified|API can reject inbound bridged email when auth failure rejection is enabled)$\" test/server.test.js",
     "probe:rate-limits": "node scripts/run_rate_limit_probe.js",
     "drill:compliance": "node scripts/run_compliance_probe.js",
     "drill:federation-trust": "node scripts/run_federation_trust_drill.js",

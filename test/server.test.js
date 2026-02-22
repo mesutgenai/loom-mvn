@@ -329,6 +329,106 @@ test("API node document advertises identity resolve URL", async (t) => {
   assert.equal(typeof identity.body.node_signature?.value, "string");
 });
 
+test("API exposes protocol extension registry endpoint", async (t) => {
+  const { server } = createLoomServer({ nodeId: "node.test", domain: "127.0.0.1" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const extensions = await jsonRequest(`${baseUrl}/v1/protocol/extensions`);
+  assert.equal(extensions.response.status, 200);
+  assert.equal(extensions.body?.protocol_profile, "loom-v1.1-full");
+  assert.equal(
+    extensions.body?.protocol_extensions_url,
+    "https://127.0.0.1/v1/protocol/extensions"
+  );
+  assert.equal(Array.isArray(extensions.body?.extensions), true);
+  assert.equal(extensions.body?.extensions?.length >= 8, true);
+
+  const emailBridge = extensions.body.extensions.find((entry) => entry.id === "loom-ext-email-bridge-v1");
+  assert.equal(Boolean(emailBridge), true);
+  assert.equal(emailBridge.enabled, true);
+  assert.equal(emailBridge.reason, "enabled");
+
+  const mlsExtension = extensions.body.extensions.find((entry) => entry.id === "loom-ext-e2ee-mls-1");
+  assert.equal(Boolean(mlsExtension), true);
+  assert.equal(mlsExtension.status, "active");
+  assert.equal(mlsExtension.enabled, true);
+  assert.equal(mlsExtension.reason, "enabled");
+});
+
+test("API core protocol profile disables extension routes by default", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    protocolProfile: "loom-core-1",
+    adminToken: "admin-secret-token"
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const capabilities = await jsonRequest(`${baseUrl}/v1/protocol/capabilities`);
+  assert.equal(capabilities.response.status, 200);
+  assert.equal(capabilities.body?.protocol_profile, "loom-core-1");
+  assert.equal(capabilities.body?.mcp?.supported, false);
+  assert.equal(capabilities.body?.compliance?.compliance_url, null);
+  assert.equal(Array.isArray(capabilities.body?.federation_negotiation?.e2ee_profiles), true);
+  assert.equal(capabilities.body?.federation_negotiation?.e2ee_profiles?.length, 0);
+
+  const extensions = await jsonRequest(`${baseUrl}/v1/protocol/extensions`);
+  assert.equal(extensions.response.status, 200);
+  assert.equal(extensions.body?.protocol_profile, "loom-core-1");
+  assert.equal(Array.isArray(extensions.body?.extensions), true);
+  for (const entry of extensions.body.extensions) {
+    assert.equal(entry.enabled, false);
+    assert.equal(entry.reason, "disabled_by_protocol_profile");
+  }
+
+  const deniedRoutes = await Promise.all([
+    jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+    jsonRequest(`${baseUrl}/v1/bridge/email/outbound`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+    jsonRequest(`${baseUrl}/v1/bridge/email/send`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+    jsonRequest(`${baseUrl}/v1/gateway/imap/folders`),
+    jsonRequest(`${baseUrl}/v1/gateway/imap/folders/INBOX/messages?limit=1`),
+    jsonRequest(`${baseUrl}/v1/gateway/smtp/submit`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+    jsonRequest(`${baseUrl}/v1/mcp/tools`),
+    jsonRequest(`${baseUrl}/v1/protocol/compliance`),
+    jsonRequest(`${baseUrl}/v1/mime/registry`),
+    jsonRequest(`${baseUrl}/v1/admin/compliance/audit`, {
+      headers: {
+        "x-loom-admin-token": "admin-secret-token"
+      }
+    }),
+    jsonRequest(`${baseUrl}/v1/admin/nist/summary`, {
+      headers: {
+        "x-loom-admin-token": "admin-secret-token"
+      }
+    })
+  ]);
+
+  for (const denied of deniedRoutes) {
+    assert.equal(denied.response.status, 404);
+    assert.equal(denied.body?.error?.code, "ENVELOPE_NOT_FOUND");
+  }
+});
+
 test("API protocol capability endpoint reports curated trust-anchor mode when bindings are configured", async (t) => {
   const { server } = createLoomServer({
     nodeId: "node.test",
@@ -1646,6 +1746,30 @@ test("API applies strict inbound bridge auth defaults on public service", () => 
   );
 });
 
+test("API secure_public config profile applies hardened defaults", () => {
+  const { store } = createLoomServer({
+    ...buildPublicServiceSigningKeyOptions(),
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    configProfile: "secure_public",
+    trustProxy: true,
+    adminToken: "admin-secret-token"
+  });
+  assert.equal(store.identityRegistrationProofRequired, true);
+  assert.equal(store.federationRequireProtocolCapabilities, true);
+  assert.equal(store.federationRequireE2eeProfileOverlap, true);
+  assert.equal(store.federationRequireTrustModeParity, true);
+  assert.equal(store.federationTrustMode, "public_dns_webpki");
+  assert.equal(store.bridgeInboundRequireAuthResults, true);
+  assert.equal(store.bridgeInboundRequireDmarcPass, true);
+  assert.equal(store.bridgeInboundRejectOnAuthFailure, true);
+  assert.equal(store.bridgeInboundAllowPayloadAuthResults, false);
+  assert.equal(store.bridgeInboundAllowAutomaticActuation, false);
+  assert.equal(store.inboundContentFilterEnabled, true);
+  assert.equal(store.inboundContentFilterRejectMalware, true);
+  assert.equal(store.inboundContentFilterProfileBridge, "strict");
+});
+
 test("API refuses weak inbound bridge auth policy on public service without explicit confirmation", () => {
   assert.throws(
     () =>
@@ -1661,6 +1785,24 @@ test("API refuses weak inbound bridge auth policy on public service without expl
         bridgeInboundRequireDmarcPass: false
       }),
     /LOOM_BRIDGE_EMAIL_INBOUND_WEAK_AUTH_POLICY_CONFIRMED=true/
+  );
+});
+
+test("API refuses public inbound bridge auto-actuation without explicit confirmation", () => {
+  assert.throws(
+    () =>
+      createLoomServer({
+        ...buildPublicServiceSigningKeyOptions(),
+        nodeId: "node.test",
+        domain: "127.0.0.1",
+        publicService: true,
+        trustProxy: true,
+        adminToken: "admin-secret-token",
+        bridgeInboundEnabled: true,
+        bridgeInboundPublicConfirmed: true,
+        bridgeInboundAllowAutomaticActuation: true
+      }),
+    /LOOM_BRIDGE_EMAIL_INBOUND_AUTOMATION_CONFIRMED=true/
   );
 });
 
