@@ -112,9 +112,11 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
 
 ## Current status
 
-- Current release tag is `v0.3.0` (see `CHANGELOG.md` for release-level change history).
+- Current release tag is `v0.3.0` (see `CHANGELOG.md` for release-level change history, including unreleased additions).
 - Repository package version is `0.3.0` (`package.json`).
 - npm publication is intentionally disabled (`"private": true`), so versioning is tracked in git tags/changelog rather than npm registry releases.
+- **1470 tests, 0 failures** across 52 test files.
+- **49 protocol modules** covering all LOOM v1.1 specification sections plus security, compliance, and operational extensions.
 - Protocol design docs are available in:
   - `CHANGELOG.md`
   - `LOOM-protocol-design.md`
@@ -131,6 +133,7 @@ Email remains useful as a bridge transport for legacy users and systems. It is n
   - `docs/FEDERATION-INTEROP-DRILL.md`
   - `docs/INBOUND-BRIDGE-HARDENING.md`
   - `docs/INCIDENT-RESPONSE-ONCALL.md`
+  - `docs/NIST-COMPLIANCE.md`
   - `docs/OBSERVABILITY-ALERTING.md`
   - `docs/OUTBOX-WORKER-RELIABILITY.md`
   - `docs/RATE-LIMIT-POLICY.md`
@@ -208,8 +211,18 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - MLS TLS codec (`src/protocol/mls_codec.js`) — TLS-style encoding/decoding primitives
   - Workflow orchestration (`src/protocol/workflow.js`) — workflow state machine (execute → step_complete → complete/failed)
   - Inference provider identity (`src/protocol/agent_info.js`) — agent_info field validation and normalization
+  - Agent card validation (`src/protocol/agent_card.js`) — A2A agent card schema validation and normalization
+  - Agent trust scoring (`src/protocol/agent_trust.js`) — event-based trust scoring with decay, threshold enforcement, and level classification
   - Agent loop detection (`src/protocol/loop_protection.js`) — loop detection helpers for agent chains
   - Context window tracking (`src/protocol/context_window.js`) — token budget tracking for agent conversations
+  - Prompt injection detection (`src/protocol/prompt_injection.js`) — heuristic scanner for 5 injection categories with configurable thresholds
+  - MCP execution sandboxing (`src/protocol/mcp_sandbox.js`) — tool classification, size guards, permission checks, and rate limiting for MCP tools
+  - MIME type registry (`src/protocol/mime_registry.js`) — type normalization, dangerous-type detection, configurable allow/deny policies
+  - ATP compliance auditing (`src/protocol/atp_compliance.js`) — 23 automated compliance checks with scoring and level classification
+  - Compression negotiation (`src/protocol/compression.js`) — Accept-Encoding/Content-Encoding negotiation for gzip, brotli, deflate
+  - NIST SP 800-53 alignment (`src/protocol/nist_mapping.js`) — 29 controls across 7 families, SP 800-207 zero-trust mapping
+  - Key rotation policy (`src/protocol/key_rotation.js`) — federation key rotation scheduling with grace periods, overlap windows, and audit trail
+  - Search index (`src/protocol/search_index.js`) — in-memory inverted index with LRU eviction for efficient envelope lookups
 - MCP client and server runtime modules (`src/node/mcp_client.js`, `src/node/mcp_server.js`) — tool-use request/response lifecycle with service identity management
 - Store-integrated protocol features (all wired into the ingestion pipeline and state management):
   - Post-ingestion event emission for real-time event streams
@@ -224,6 +237,16 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - Validated search with URL parameter type coercion
   - Full mailbox export/import with thread and envelope preservation
   - Agent identity `agent_info` fields (provider, model, version, capabilities)
+  - Agent card registration and discovery for agent-type identities
+  - Agent trust scoring with event recording and threshold-based enforcement (warning/quarantine/block)
+  - Prompt injection analysis on ingestion with escalation triggers and agent trust event recording
+  - MCP sandbox enforcement (rate limits, tool permissions, argument/result size guards)
+  - MIME policy enforcement on blob creation (dangerous-type detection, configurable allow/deny)
+  - ATP compliance auditing with 23 automated checks and scoring
+  - Transparent response compression via Accept-Encoding negotiation (gzip/br/deflate)
+  - NIST SP 800-53 compliance summary cross-referencing 29 controls with audit results
+  - Federation key rotation management (assessment, execution, history, serialized policy)
+  - Search index with auto-indexing on ingestion, removal on retention sweep, and indexed fast-path in searchEnvelopes
   - Cursor-based event log retrieval
   - Rate limit response headers on 429 errors
 - Informational JSON Schema (draft 2020-12) published at `src/protocol/schemas/envelope-v1.1.schema.json`; in-code `validateEnvelopeShape` remains authoritative
@@ -336,6 +359,15 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
   - `GET /v1/admin/persistence/schema` (admin token required)
   - `GET /v1/admin/persistence/backup` (admin token required)
   - `POST /v1/admin/persistence/restore` (admin token required, `confirm=restore`)
+  - `GET /v1/admin/agent-trust` (admin token required; agent trust status)
+  - `GET /v1/admin/nist/summary` (admin token required; NIST compliance summary)
+  - `GET /v1/admin/key-rotation/status` (admin token required; key rotation assessment)
+  - `POST /v1/admin/key-rotation/rotate` (admin token required; trigger key rotation)
+  - `GET /v1/admin/key-rotation/history` (admin token required; rotation audit trail)
+  - `GET /v1/admin/search-index/status` (admin token required; search index stats)
+  - `GET /v1/protocol/compliance` (ATP compliance score and audit report)
+  - `GET /v1/mime/registry` (MIME type registry and policy)
+  - `GET /v1/agents` (agent card discovery)
 
 ## Run
 
@@ -700,6 +732,19 @@ Optional persistence:
   - `LOOM_MESSAGE_RETENTION_DAYS` (default `0`, disabled)
   - `LOOM_BLOB_RETENTION_DAYS` (default `0`, disabled)
   - `LOOM_MAINTENANCE_SWEEP_INTERVAL_MS` (default `60000`; set `0` to disable periodic sweeps)
+- Compression controls:
+  - `LOOM_COMPRESSION_ENABLED=true|false` (default `false`; enable transparent response compression)
+  - `LOOM_COMPRESSION_MIN_SIZE` (default `1024`; minimum response size in bytes before compression applies)
+  - `LOOM_COMPRESSION_ENCODING` (default `gzip`; preferred encoding: `gzip`, `br`, or `deflate`)
+  - `LOOM_COMPRESSION_LEVEL` (default `6`; compression level 1-11)
+- Key rotation policy controls:
+  - `LOOM_KEY_ROTATION_MAX_AGE_DAYS` (default `90`; maximum federation signing key age before rotation)
+  - `LOOM_KEY_ROTATION_GRACE_PERIOD_DAYS` (default `7`; grace period before key expires where rotation is recommended)
+  - `LOOM_KEY_ROTATION_OVERLAP_HOURS` (default `24`; overlap window where old key remains valid during transition)
+  - `LOOM_KEY_ROTATION_AUTO_ROTATE=true|false` (default `false`; enable automatic key rotation)
+- Search index controls:
+  - `LOOM_SEARCH_INDEX_ENABLED=true|false` (default `true`; enable in-memory search index for fast envelope lookups)
+  - `LOOM_SEARCH_INDEX_MAX_ENTRIES` (default `100000`; maximum indexed envelopes before LRU eviction)
 - Set `LOOM_ADMIN_TOKEN` to protect operational endpoints (`/metrics`, `/v1/admin/status`).
 - Set `LOOM_METRICS_PUBLIC=true` only if you intentionally want unauthenticated `/metrics`.
 - Set `LOOM_ALLOW_OPEN_OUTBOUND_HOSTS_ON_PUBLIC_BIND=true` only if you intentionally want to disable strict outbound host allowlist startup guards on public service.
@@ -1015,6 +1060,9 @@ npm run drill:persistence -- --base-url https://<loom-host> --execute-restore
 - Current wire IMAP limitation: `COPY`/`UID COPY` are intentionally rejected because LOOM mailbox state currently models a single effective folder per thread participant.
 - Wire IMAP compatibility profile and extension coverage are tracked in `docs/IMAP-COMPATIBILITY-MATRIX.md`.
 - Compliance control mapping (audit export + retention + policy links) is tracked in `docs/COMPLIANCE-CONTROLS.md`.
+- NIST SP 800-53 Rev 5 compliance mapping (29 controls, 7 families) and SP 800-207 zero-trust alignment documented in `docs/NIST-COMPLIANCE.md`.
+- Federation signing key rotation policy is enforced via `key_rotation.js` with configurable max age, grace period, and overlap windows. Manual and automated rotation supported via admin API.
+- In-memory search index (`search_index.js`) replaces linear-scan search when enabled, providing sub-millisecond lookups via multi-dimensional inverted index with LRU eviction.
 - Federation abuse/rate-policy hardening is implemented for baseline operations; deeper interoperability coverage can be extended.
 - Federation onboarding can be made fail-closed via strict protocol capability gates (`LOOM_FEDERATION_REQUIRE_PROTOCOL_CAPABILITIES`, `LOOM_FEDERATION_REQUIRE_E2EE_PROFILE_OVERLAP`, `LOOM_FEDERATION_REQUIRE_TRUST_MODE_PARITY`).
 - Production hardening included in this MVP baseline: payload-size guard, sensitive-route rate limiting, and automatic outbox worker loop.

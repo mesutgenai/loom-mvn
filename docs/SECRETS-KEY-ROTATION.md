@@ -24,11 +24,60 @@ Never commit real values to this repository.
 ## Rotation Policy
 
 - `LOOM_ADMIN_TOKEN`: rotate every 90 days or immediately after suspected exposure.
-- `LOOM_NODE_SIGNING_PRIVATE_KEY_PEM`: rotate every 180 days or immediately after suspected exposure.
+- `LOOM_NODE_SIGNING_PRIVATE_KEY_PEM`: rotate every 90 days (configurable via `LOOM_KEY_ROTATION_MAX_AGE_DAYS`) or immediately after suspected exposure.
 - SMTP and DB credentials: rotate per provider policy (recommended every 90 days).
 - Emergency rotation: complete within 24 hours for confirmed compromise.
 
-## Node Signing Key Rotation Procedure
+### Automated Rotation Policy
+
+The node enforces a configurable key rotation policy via `src/protocol/key_rotation.js`:
+
+| Parameter | Env Var | Default |
+|-----------|---------|---------|
+| Max key age | `LOOM_KEY_ROTATION_MAX_AGE_DAYS` | 90 days |
+| Grace period | `LOOM_KEY_ROTATION_GRACE_PERIOD_DAYS` | 7 days |
+| Overlap window | `LOOM_KEY_ROTATION_OVERLAP_HOURS` | 24 hours |
+| Auto-rotate | `LOOM_KEY_ROTATION_AUTO_ROTATE` | `false` |
+
+Key states managed by the policy engine:
+
+- **current** — key is within valid age range
+- **grace** — key age exceeds `max_age - grace_period`; rotation recommended
+- **expired** — key age exceeds `max_age`; rotation required
+- **overlap** — old key remains valid during transition window
+- **retired** — key has been replaced and overlap has elapsed
+- **revoked** — key has been explicitly revoked
+- **pending** — replacement key not yet active
+
+### Monitoring Rotation Status
+
+```bash
+# Check rotation status via admin API
+curl -sS -H "x-loom-admin-token: $ADMIN_TOKEN" \
+  http://localhost:8787/v1/admin/key-rotation/status
+
+# View rotation audit trail
+curl -sS -H "x-loom-admin-token: $ADMIN_TOKEN" \
+  http://localhost:8787/v1/admin/key-rotation/history
+```
+
+### Triggering Rotation
+
+```bash
+# Assess and rotate if needed
+curl -sS -X POST -H "x-loom-admin-token: $ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{}' \
+  http://localhost:8787/v1/admin/key-rotation/rotate
+
+# Force rotation regardless of policy state
+curl -sS -X POST -H "x-loom-admin-token: $ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"force": true}' \
+  http://localhost:8787/v1/admin/key-rotation/rotate
+```
+
+## Node Signing Key Rotation Procedure (Manual)
 
 1. Generate a new signing key pair in your secure key workflow.
 2. Assign a new `LOOM_NODE_SIGNING_KEY_ID`.

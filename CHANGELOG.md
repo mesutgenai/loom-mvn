@@ -4,7 +4,135 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
-No unreleased changes yet.
+Security hardening, compliance, and operational modules addressing
+evaluation report gaps. Adds 10 new protocol modules, extends store
+integration, and introduces new admin routes and env vars.
+
+### New Protocol Modules
+
+- **prompt_injection.js**: Heuristic prompt injection detection for
+  envelope content. Pattern-based scanning across 5 categories
+  (instruction override, role manipulation, delimiter injection, data
+  exfiltration, encoding evasion) with configurable sender-type
+  thresholds and escalation triggers (Section 26.2).
+- **mcp_sandbox.js**: Execution sandboxing for MCP tool invocations.
+  Tool classification (read/write/admin), argument and result size
+  enforcement, permission checks, and rate limiter factory (Section 22.3).
+- **agent_card.js**: Agent card schema validation and normalization per
+  A2A (Agent-to-Agent) specification. Validates capabilities, auth
+  schemes, endpoints, and provider metadata (Section 25.2).
+- **agent_trust.js**: Agent trust scoring with event-based decay,
+  configurable thresholds for warning/quarantine/block levels, and
+  trust level classification. Supports violation recording, score
+  computation, and enforcement assertions (Section 25.4).
+- **mime_registry.js**: MIME type registry with type normalization,
+  dangerous-type detection, and configurable allow/deny policies.
+  Covers text, image, document, audio, video, and dangerous type
+  categories (Section 14.2).
+- **atp_compliance.js**: ATP (Authenticated Transfer Protocol)
+  compliance audit engine with 23 automated checks, scoring (0-100),
+  and compliance level classification (full/high/partial/low/none).
+  Cross-references store capabilities against protocol requirements
+  (Section 28).
+- **compression.js**: Accept-Encoding/Content-Encoding negotiation
+  with gzip, brotli, and deflate support. Quality-value parsing,
+  encoding selection, and configurable compression policies with
+  minimum size thresholds (Section 29).
+- **nist_mapping.js**: NIST SP 800-53 Rev 5 control mapping with 29
+  controls across 7 families (AC, AU, IA, SC, SI, CM, IR) and 5
+  SP 800-207 zero-trust principle alignments. Coverage computation
+  and formatted compliance reporting (Section 30).
+- **key_rotation.js**: Formalized rotation scheduling for federation
+  signing keys. Policy-based state machine with 7 states (current,
+  grace, expired, overlap, retired, revoked, pending), rotation needs
+  assessment, action plan generation, and structured audit trail
+  (Section 25.5).
+- **search_index.js**: In-memory term-based inverted index for
+  efficient envelope lookups. Bounded memory via LRU eviction with
+  configurable max entries. Multi-dimensional indexing (sender, intent,
+  type, thread, date bucket, text terms) with set-intersection query
+  strategy (Section 16.7).
+
+### Store Integration
+
+All 10 modules wired into the store and ingestion pipeline:
+
+- **Prompt injection**: Envelope ingestion analyzes content for
+  injection signals. High-signal envelopes from agents trigger
+  `requires_human_escalation` and `sys.injection` thread labels.
+  Violations recorded as agent trust events.
+- **MCP sandboxing**: Rate limiting, argument/result size enforcement,
+  tool permission checks, and write-tool guards applied to MCP tool
+  request processing in both mcp_client and mcp_server.
+- **Agent cards**: `registerAgentCard()` and `getAgentCard()` with
+  full schema validation and normalization on agent-type identities.
+- **Agent trust**: `recordAgentTrustEvent()`, `getAgentTrustScore()`,
+  `assertAgentTrustForIngestion()` with configurable decay windows
+  and threshold-based enforcement (warning/quarantine/block).
+- **MIME policy**: `isDangerousMimeType()` and `isAllowedBlobMimeType()`
+  enforcement on blob creation with configurable allow/deny lists.
+- **ATP compliance**: `runComplianceAudit()` produces 23-check audit
+  reports. `getComplianceScore()` and `getComplianceNodeState()`.
+- **Compression**: Transparent response compression via
+  `res._compressionCtx` on all `sendJson` call sites. Inbound
+  Content-Encoding decompression in `readRawBody`.
+- **NIST alignment**: `getNistComplianceSummary()` cross-references
+  29 NIST controls with compliance audit results per family.
+- **Key rotation**: `assessKeyRotationStatus()` evaluates federation
+  signing keys against rotation policy. `executeKeyRotation()`
+  generates new key pairs and bumps keyset version. History tracked
+  and serialized. Policy configurable via env vars.
+- **Search index**: Envelopes auto-indexed on ingestion and removed
+  on retention sweep. `searchEnvelopes()` uses indexed fast-path
+  with set-intersection when available, falling back to linear scan.
+  Index rebuilt from stored envelopes on state load.
+
+### New HTTP Endpoints
+
+- `GET /v1/protocol/compliance` — ATP compliance score and audit
+- `GET /v1/mime/registry` — MIME type registry and policy
+- `GET /v1/agents` — agent card discovery
+- `GET /v1/admin/nist/summary` — NIST compliance summary (admin)
+- `GET /v1/admin/agent-trust` — agent trust status (admin)
+- `GET /v1/admin/key-rotation/status` — key rotation assessment (admin)
+- `POST /v1/admin/key-rotation/rotate` — trigger key rotation (admin)
+- `GET /v1/admin/key-rotation/history` — rotation audit trail (admin)
+- `GET /v1/admin/search-index/status` — search index stats (admin)
+
+### New Environment Variables
+
+- `LOOM_COMPRESSION_ENABLED` (default: `false`)
+- `LOOM_COMPRESSION_MIN_SIZE` (default: `1024`)
+- `LOOM_COMPRESSION_ENCODING` (default: `gzip`)
+- `LOOM_COMPRESSION_LEVEL` (default: `6`)
+- `LOOM_KEY_ROTATION_MAX_AGE_DAYS` (default: `90`)
+- `LOOM_KEY_ROTATION_GRACE_PERIOD_DAYS` (default: `7`)
+- `LOOM_KEY_ROTATION_OVERLAP_HOURS` (default: `24`)
+- `LOOM_KEY_ROTATION_AUTO_ROTATE` (default: `false`)
+- `LOOM_SEARCH_INDEX_ENABLED` (default: `true`)
+- `LOOM_SEARCH_INDEX_MAX_ENTRIES` (default: `100000`)
+
+### New Documentation
+
+- `docs/NIST-COMPLIANCE.md` — NIST SP 800-53 Rev 5 and SP 800-207
+  control mapping with per-family tables, crypto compliance matrix,
+  and zero-trust alignment documentation.
+
+### Protocol Capabilities
+
+`getProtocolCapabilities()` now advertises:
+- `key_rotation` — enabled status, policy, and status URL
+- `search_index` — enabled status, stats, and status URL
+- `nist_alignment` — SP 800-53 coverage and SP 800-207 zero-trust
+- `compression` — enabled status, supported encodings, min size
+- `agents` — agent cards, trust scoring, discovery URL
+- `compliance` — compliance URL and MIME policy mode
+
+### Tests
+
+- 112 new unit tests across 10 test files for all protocol modules.
+- Extended mcp_client, mcp, and content_filter_corpus integration tests.
+- **Total: 1470 tests, 0 failures.**
 
 ## v0.3.0 - 2026-02-20
 
