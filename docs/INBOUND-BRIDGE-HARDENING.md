@@ -38,6 +38,19 @@ Optional telemetry/tuning controls:
 - `LOOM_INBOUND_CONTENT_FILTER_DECISION_LOG_SALT` (rotation secret)
 - `LOOM_BRIDGE_EMAIL_INBOUND_HEADER_ALLOWLIST` (retain only explicitly listed headers in bridge metadata)
 
+## Bridge Trust Metadata Signals
+
+Inbound bridge envelopes should preserve explicit trust metadata for downstream clients/agents:
+
+- `meta.bridge.structured_trust.authoritative=false`
+- `meta.bridge.structured_trust.trust_level=low` (default)
+- `meta.bridge.structured_trust.auto_actuation_allowed` reflects runtime bridge policy
+- `meta.bridge.structured_trust.reason` documents why trust is low by default
+- `content.structured.parameters.authoritative=false`
+- `content.structured.parameters.trust_level=low`
+
+These signals are intended to keep bridge-derived structured content non-authoritative unless explicitly re-verified in LOOM-native flows.
+
 ## Static Policy Validation
 
 Run against production environment configuration:

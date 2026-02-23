@@ -75,7 +75,7 @@ test("COMPLIANCE_CHECKS is frozen", () => {
 test("each check has required fields", () => {
   for (const check of COMPLIANCE_CHECKS) {
     assert.ok(typeof check.id === "string" && check.id.length > 0, `check missing id`);
-    assert.ok(typeof check.section === "string" && check.section.length > 0, `${check.id} missing section`);
+    assert.ok(typeof check.reference === "string" && check.reference.length > 0, `${check.id} missing reference`);
     assert.ok(["required", "recommended", "optional"].includes(check.severity), `${check.id} invalid severity`);
     assert.ok(typeof check.description === "string" && check.description.length > 0, `${check.id} missing description`);
     assert.ok(typeof check.evaluate === "function", `${check.id} missing evaluate`);
@@ -111,11 +111,13 @@ test("listComplianceChecks does not include evaluate function", () => {
   }
 });
 
-test("listComplianceChecks entries have id, section, severity, description", () => {
+test("listComplianceChecks entries have id, reference, section, severity, description", () => {
   const checks = listComplianceChecks();
   for (const check of checks) {
     assert.ok(typeof check.id === "string");
+    assert.ok(typeof check.reference === "string");
     assert.ok(typeof check.section === "string");
+    assert.ok(check.section.length > 0);
     assert.ok(typeof check.severity === "string");
     assert.ok(typeof check.description === "string");
   }
@@ -127,7 +129,8 @@ test("getComplianceCheckById finds existing check", () => {
   const check = getComplianceCheckById("envelope_validation");
   assert.ok(check);
   assert.equal(check.id, "envelope_validation");
-  assert.equal(check.section, "3.1");
+  assert.equal(check.reference, "LOOM-Protocol-Spec-v1.1.md §8.1");
+  assert.equal(check.section, "8.1");
   assert.equal(check.severity, "required");
 });
 

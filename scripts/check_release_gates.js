@@ -8,6 +8,7 @@ const REQUIRED_FILES = [
   "CHANGELOG.md",
   "docs/CONFORMANCE.md",
   "docs/RELEASE-CHECKLIST.md",
+  ".env.secure-public.example",
   "ops/federation/interop-targets.json"
 ];
 
@@ -61,6 +62,19 @@ function main() {
   const checks = [];
   const warnings = [];
   const errors = [];
+  let gitRepoDetected = false;
+
+  try {
+    const inside = execSync("git rev-parse --is-inside-work-tree", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"]
+    })
+      .trim()
+      .toLowerCase();
+    gitRepoDetected = inside === "true";
+  } catch {
+    warnings.push("Not running inside a git worktree; tracked-artifact checks skipped.");
+  }
 
   for (const relPath of REQUIRED_FILES) {
     const path = resolve(relPath);
@@ -68,6 +82,17 @@ function main() {
       errors.push(`Required release artifact missing: ${relPath}`);
     } else {
       checks.push(`Release artifact present: ${relPath}`);
+      if (gitRepoDetected) {
+        try {
+          const escaped = relPath.replace(/"/g, '\\"');
+          execSync(`git ls-files --error-unmatch -- "${escaped}"`, {
+            stdio: ["ignore", "ignore", "ignore"]
+          });
+          checks.push(`Release artifact tracked in git: ${relPath}`);
+        } catch {
+          errors.push(`Required release artifact is not tracked in git: ${relPath}`);
+        }
+      }
     }
   }
 

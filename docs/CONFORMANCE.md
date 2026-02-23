@@ -43,6 +43,7 @@ Release and governance references:
 - Federation delivery requires signed requests and nonce/timestamp replay checks.
 - Federation protocol capabilities are published for negotiation (`/v1/protocol/capabilities`) including trust-anchor posture and supported encrypted profiles.
 - Protocol profile runtime mode is enforced via `LOOM_PROTOCOL_PROFILE` (`loom-v1.1-full` default, `loom-core-1` core-only). In core mode, extension routes fail closed (`404`) and extension envelope ingest is rejected (`CAPABILITY_DENIED`).
+- Disabled extension routes return `404` with machine-readable error code `EXTENSION_DISABLED`; optional diagnostics may include disable reason details (`disabled_by_protocol_profile|disabled_by_extension_toggle|disabled_by_route_toggle`) when enabled.
 - Machine-readable extension state is published at `GET /v1/protocol/extensions`.
 - Extension route gates covered by conformance include bridge (`/v1/bridge/*`), legacy gateway (`/v1/gateway/*`), MCP runtime (`/v1/mcp/*`), and compliance overlays (`/v1/protocol/compliance`, `/v1/mime/registry`, `/v1/admin/compliance/audit`, `/v1/admin/nist/summary`).
 - Email outbox supports per-recipient DSN-style status updates via `POST /v1/email/outbox/{id}/dsn`.

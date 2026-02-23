@@ -1238,9 +1238,16 @@ When email arrives:
   - `from.type="bridge"`
   - `meta.bridge.source="email"`
   - `meta.bridge.original_headers` preserved
+  - `meta.bridge.structured_trust` SHOULD be present with:
+    - `authoritative=false`
+    - `trust_level` (for example `low`)
+    - `auto_actuation_allowed` (boolean policy signal)
+    - `reason` (for example `bridged_content_is_non_authoritative_by_default`)
   - `content.human`: body converted to markdown where possible
   - `content.structured`: best-effort intent extraction with:
     - `extracted=true`
+    - `authoritative=false`
+    - `trust_level` (for example `low`)
     - `extraction_confidence` (0..1)
 - Thread mapping:
   - map Message-ID / References / In-Reply-To to thread_id/parent_id
@@ -1366,6 +1373,7 @@ Nodes MUST:
 | IDENTITY_NOT_FOUND | 404 | Identity missing |
 | THREAD_NOT_FOUND | 404 | Thread missing |
 | ENVELOPE_NOT_FOUND | 404 | Envelope missing |
+| EXTENSION_DISABLED | 404 | Extension surface disabled by protocol profile or route policy |
 | ENVELOPE_DUPLICATE | 409 | Duplicate envelope ID |
 | THREAD_LOCKED | 409 | Thread locked |
 | STATE_TRANSITION_INVALID | 409 | Invalid state transition |

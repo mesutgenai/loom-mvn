@@ -41,6 +41,7 @@ Repository governance metadata SHOULD additionally record:
 
 1. Extension IDs MUST be lowercase and immutable.
 2. Extension IDs SHOULD follow `loom-ext-<name>-v<major>`.
+   Examples: `loom-ext-email-bridge-v1`, `loom-ext-legacy-gateway-v1`, `loom-ext-compliance-v1`.
 3. Intent-like wire contracts MUST include explicit major suffixes (for example `message.general@v1`).
 4. Reserved identifiers MUST NOT be emitted on wire as active features.
 5. Aliases MAY exist for migration, but every alias MUST map to one canonical identifier.

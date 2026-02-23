@@ -61,6 +61,7 @@ Profile interaction notes:
   - `LOOM_CONFIG_PROFILE=secure_public`
   - `LOOM_PROTOCOL_PROFILE=loom-core-1`
 - Extension toggles (`LOOM_EXTENSION_*`) and route toggles remain subordinate to `LOOM_PROTOCOL_PROFILE`; in `loom-core-1`, extension surfaces remain disabled even if toggles are set to `true`.
+- Disabled extension-route diagnostics default to redacted on public service (`LOOM_EXTENSION_DISABLE_ERROR_DIAGNOSTICS=false` by default when `LOOM_PUBLIC_SERVICE=true`).
 
 ## Explicit Values Still Required
 

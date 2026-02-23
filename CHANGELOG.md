@@ -4,7 +4,29 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
-- No changes yet.
+### Extension Route Error Semantics
+
+- Disabled extension routes now return `404` with `EXTENSION_DISABLED` instead of overloading `ENVELOPE_NOT_FOUND`.
+- Error details now include machine-readable disable reason (`disabled_by_protocol_profile|disabled_by_extension_toggle|disabled_by_route_toggle`), extension id, and active protocol profile.
+- Server tests updated to assert extension-disable semantics for both core-profile and route-toggle disable paths.
+- Added diagnostics redaction control (`LOOM_EXTENSION_DISABLE_ERROR_DIAGNOSTICS`) so public deployments can suppress extension/profile metadata on disabled-route responses.
+
+### Compliance Reference Alignment
+
+- Compliance checks now publish canonical `reference` values aligned to v1.1 spec anchors (with `section` retained as a backward-compatible alias).
+- Compliance report formatting now emits the canonical reference string for failed checks.
+- Restored stable `section` values for compatibility-sensitive consumers while keeping canonical `reference` in all check/audit outputs.
+
+### Bridge Metadata Documentation
+
+- v1.1 spec bridge section now documents `meta.bridge.structured_trust` and structured non-authoritative trust hints (`authoritative=false`, `trust_level`, `auto_actuation_allowed`, reason metadata).
+- Error-code registry now documents `EXTENSION_DISABLED`.
+
+### Release/Docs Guardrails
+
+- Added `.gitignore` exception for `.env.secure-public.example` so the secure-profile env template is committed and included in tagged releases.
+- Release-gate checks now require `.env.secure-public.example` and verify required artifacts are tracked in git.
+- Extension registry docs now include explicit identifier format examples.
 
 ## v0.4.1 — 2026-02-22
 

@@ -2,7 +2,7 @@
 //
 // Protocol-level compliance check definitions and audit execution.
 // Pure-function module with no store or server dependencies.
-// Evaluates node state against LOOM v1.1 specification sections.
+// Evaluates node state against canonical LOOM spec/doc references.
 
 // ─── Severity Levels ─────────────────────────────────────────────────────────
 
@@ -27,7 +27,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   // ── Required (8) ─────────────────────────────────────────────────────────
   Object.freeze({
     id: "envelope_validation",
-    section: "3.1",
+    section: "8.1",
+    reference: "LOOM-Protocol-Spec-v1.1.md §8.1",
     severity: "required",
     description: "Envelope shape validation is enabled",
     evaluate: (state) => ({
@@ -37,7 +38,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "signature_ed25519",
-    section: "7.2",
+    section: "7.3",
+    reference: "LOOM-Protocol-Spec-v1.1.md §7.3",
     severity: "required",
     description: "Ed25519 signature verification is enabled",
     evaluate: (state) => ({
@@ -47,7 +49,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "capability_token_format",
-    section: "9.1",
+    section: "12.1",
+    reference: "LOOM-Protocol-Spec-v1.1.md §12.1",
     severity: "required",
     description: "Capability token format enforcement",
     evaluate: (state) => ({
@@ -57,7 +60,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "federation_handshake",
-    section: "12.1",
+    section: "15.7",
+    reference: "LOOM-Protocol-Spec-v1.1.md §15.7",
     severity: "required",
     description: "Federation protocol negotiation support",
     evaluate: (state) => ({
@@ -67,7 +71,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "thread_dag_validation",
-    section: "5.1",
+    section: "10.2",
+    reference: "LOOM-Protocol-Spec-v1.1.md §10.2",
     severity: "required",
     description: "Thread DAG validation is active",
     evaluate: (state) => ({
@@ -77,7 +82,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "idempotency_support",
-    section: "11.2",
+    section: "14.4",
+    reference: "LOOM-Protocol-Spec-v1.1.md §14.4",
     severity: "required",
     description: "Idempotency key support is enabled",
     evaluate: (state) => ({
@@ -87,7 +93,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "rate_limiting",
-    section: "11.4",
+    section: "14.3",
+    reference: "LOOM-Protocol-Spec-v1.1.md §14.3",
     severity: "required",
     description: "Rate limiting is configured",
     evaluate: (state) => ({
@@ -97,7 +104,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "replay_protection",
-    section: "11.3",
+    section: "15.5",
+    reference: "LOOM-Protocol-Spec-v1.1.md §15.5",
     severity: "required",
     description: "Replay protection is enabled",
     evaluate: (state) => ({
@@ -109,7 +117,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   // ── Recommended (10) ─────────────────────────────────────────────────────
   Object.freeze({
     id: "e2ee_support",
-    section: "14.1",
+    section: "7.4",
+    reference: "LOOM-Protocol-Spec-v1.1.md §7.4",
     severity: "recommended",
     description: "End-to-end encryption profile support",
     evaluate: (state) => ({
@@ -121,7 +130,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "content_format_validation",
-    section: "4.2",
+    section: "8.2",
+    reference: "LOOM-Protocol-Spec-v1.1.md §8.2",
     severity: "recommended",
     description: "Content format validation for human-readable content",
     evaluate: (state) => ({
@@ -134,6 +144,7 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   Object.freeze({
     id: "mime_registry",
     section: "16.7",
+    reference: "LOOM-Protocol-Spec-v1.1.md §16.7",
     severity: "recommended",
     description: "MIME type registry and policy enforcement",
     evaluate: (state) => ({
@@ -143,7 +154,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "content_filter",
-    section: "20.1",
+    section: "23.2",
+    reference: "LOOM-Protocol-Spec-v1.1.md §23.2",
     severity: "recommended",
     description: "Inbound content filtering is enabled",
     evaluate: (state) => ({
@@ -155,7 +167,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "loop_protection",
-    section: "10.1",
+    section: "18.5",
+    reference: "LOOM-Protocol-Spec-v1.1.md §18.5",
     severity: "recommended",
     description: "Agent loop protection is configured",
     evaluate: (state) => ({
@@ -167,7 +180,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "agent_trust",
-    section: "18.3",
+    section: "18.5",
+    reference: "docs/CONFORMANCE.md (Agent trust extension profile)",
     severity: "recommended",
     description: "Agent behavioral trust scoring is enabled",
     evaluate: (state) => ({
@@ -179,7 +193,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "retention_policies",
-    section: "19.1",
+    section: "25.4",
+    reference: "LOOM-Protocol-Spec-v1.1.md §25.4",
     severity: "recommended",
     description: "Message retention policies are configured",
     evaluate: (state) => ({
@@ -191,7 +206,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "audit_logging",
-    section: "20.2",
+    section: "25.1",
+    reference: "LOOM-Protocol-Spec-v1.1.md §25.1",
     severity: "recommended",
     description: "Audit logging with HMAC integrity is enabled",
     evaluate: (state) => ({
@@ -203,7 +219,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "mcp_sandbox",
-    section: "15.2",
+    section: "22.3",
+    reference: "docs/CONFORMANCE.md (MCP runtime extension profile)",
     severity: "recommended",
     description: "MCP tool sandbox policy is enforced",
     evaluate: (state) => ({
@@ -215,7 +232,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "prompt_injection_detection",
-    section: "15.4",
+    section: "23.1",
+    reference: "docs/CONFORMANCE.md (Prompt injection hardening profile)",
     severity: "recommended",
     description: "Prompt injection detection is active",
     evaluate: (state) => ({
@@ -229,7 +247,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   // ── Optional (5) ─────────────────────────────────────────────────────────
   Object.freeze({
     id: "federation_trust_anchors",
-    section: "12.5",
+    section: "15.7",
+    reference: "LOOM-Protocol-Spec-v1.1.md §15.7",
     severity: "optional",
     description: "Federation trust anchors are configured",
     evaluate: (state) => ({
@@ -239,7 +258,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "state_encryption_at_rest",
-    section: "19.3",
+    section: "23.2",
+    reference: "LOOM-Protocol-Spec-v1.1.md §23.2",
     severity: "optional",
     description: "State encryption at rest is enabled",
     evaluate: (state) => ({
@@ -251,7 +271,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "federation_signed_receipts",
-    section: "12.8",
+    section: "24.3",
+    reference: "LOOM-Protocol-Spec-v1.1.md §24.3",
     severity: "optional",
     description: "Federation requires signed delivery receipts",
     evaluate: (state) => ({
@@ -263,7 +284,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "blob_retention",
-    section: "16.9",
+    section: "25.4",
+    reference: "LOOM-Protocol-Spec-v1.1.md §25.4",
     severity: "optional",
     description: "Blob retention policy is configured",
     evaluate: (state) => ({
@@ -275,7 +297,8 @@ export const COMPLIANCE_CHECKS = Object.freeze([
   }),
   Object.freeze({
     id: "identity_proof_of_key",
-    section: "8.2",
+    section: "14.2",
+    reference: "LOOM-Protocol-Spec-v1.1.md §14.2",
     severity: "optional",
     description: "Identity registration requires proof of key",
     evaluate: (state) => ({
@@ -289,10 +312,34 @@ export const COMPLIANCE_CHECKS = Object.freeze([
 
 // ─── Check Listing ───────────────────────────────────────────────────────────
 
+function resolveComplianceReference(check) {
+  const reference = typeof check?.reference === "string" ? check.reference.trim() : "";
+  if (reference) {
+    return reference;
+  }
+  const legacySection = typeof check?.section === "string" ? check.section.trim() : "";
+  return legacySection;
+}
+
+function resolveComplianceSection(check) {
+  const section = typeof check?.section === "string" ? check.section.trim() : "";
+  if (section) {
+    return section;
+  }
+  const reference = resolveComplianceReference(check);
+  const match = /§\s*([0-9]+(?:\.[0-9]+)*)/.exec(reference);
+  if (match) {
+    return match[1];
+  }
+  return reference || "unspecified";
+}
+
 export function listComplianceChecks() {
   return COMPLIANCE_CHECKS.map((check) => ({
     id: check.id,
-    section: check.section,
+    reference: resolveComplianceReference(check),
+    // Backward-compatible legacy field retained for existing clients.
+    section: resolveComplianceSection(check),
     severity: check.severity,
     description: check.description
   }));
@@ -303,9 +350,13 @@ export function getComplianceCheckById(checkId) {
   if (!normalized) return null;
   const check = COMPLIANCE_CHECKS.find((c) => c.id === normalized);
   if (!check) return null;
+  const reference = resolveComplianceReference(check);
+  const section = resolveComplianceSection(check);
   return {
     id: check.id,
-    section: check.section,
+    reference,
+    // Backward-compatible legacy field retained for existing clients.
+    section,
     severity: check.severity,
     description: check.description
   };
@@ -320,9 +371,13 @@ export function evaluateComplianceCheck(checkId, nodeState) {
     return { id: normalized, pass: false, severity: "required", detail: "Unknown check" };
   }
   const result = check.evaluate(nodeState || {});
+  const reference = resolveComplianceReference(check);
+  const section = resolveComplianceSection(check);
   return {
     id: check.id,
-    section: check.section,
+    reference,
+    // Backward-compatible legacy field retained for existing clients.
+    section,
     severity: check.severity,
     pass: result.pass === true,
     detail: result.detail || ""
@@ -335,9 +390,13 @@ export function runComplianceAudit(nodeState) {
   const state = nodeState || {};
   const results = COMPLIANCE_CHECKS.map((check) => {
     const result = check.evaluate(state);
+    const reference = resolveComplianceReference(check);
+    const section = resolveComplianceSection(check);
     return {
       id: check.id,
-      section: check.section,
+      reference,
+      // Backward-compatible legacy field retained for existing clients.
+      section,
       severity: check.severity,
       pass: result.pass === true,
       detail: result.detail || ""
@@ -427,7 +486,8 @@ export function formatComplianceReport(auditResult) {
   if (failed.length > 0) {
     lines.push("Failed checks:");
     for (const check of failed) {
-      lines.push(`  [${check.severity}] ${check.id} (Section ${check.section}): ${check.detail}`);
+      const reference = String(check.reference || check.section || "unspecified reference");
+      lines.push(`  [${check.severity}] ${check.id} (${reference}): ${check.detail}`);
     }
   } else {
     lines.push("All checks passed.");

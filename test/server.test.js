@@ -425,8 +425,33 @@ test("API core protocol profile disables extension routes by default", async (t)
 
   for (const denied of deniedRoutes) {
     assert.equal(denied.response.status, 404);
-    assert.equal(denied.body?.error?.code, "ENVELOPE_NOT_FOUND");
+    assert.equal(denied.body?.error?.code, "EXTENSION_DISABLED");
+    assert.equal(denied.body?.error?.details?.reason, "disabled_by_protocol_profile");
   }
+});
+
+test("API can redact extension-disabled diagnostics when configured", async (t) => {
+  const { server } = createLoomServer({
+    nodeId: "node.test",
+    domain: "127.0.0.1",
+    protocolProfile: "loom-core-1",
+    extensionDisableErrorDiagnostics: false
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const denied = await jsonRequest(`${baseUrl}/v1/bridge/email/inbound`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+  assert.equal(denied.response.status, 404);
+  assert.equal(denied.body?.error?.code, "EXTENSION_DISABLED");
+  assert.equal(denied.body?.error?.details?.reason, undefined);
+  assert.equal(denied.body?.error?.details?.extension_id, undefined);
+  assert.equal(denied.body?.error?.details?.protocol_profile, undefined);
+  assert.equal(denied.body?.error?.details?.path, "/v1/bridge/email/inbound");
 });
 
 test("API protocol capability endpoint reports curated trust-anchor mode when bindings are configured", async (t) => {
@@ -1092,21 +1117,27 @@ test("API can disable bridge and gateway send routes", async (t) => {
     body: JSON.stringify({})
   });
   assert.equal(inbound.response.status, 404);
-  assert.equal(inbound.body.error.code, "ENVELOPE_NOT_FOUND");
+  assert.equal(inbound.body.error.code, "EXTENSION_DISABLED");
+  assert.equal(inbound.body.error?.details?.reason, "disabled_by_route_toggle");
+  assert.equal(inbound.body.error?.details?.extension_id, "loom-ext-email-bridge-v1");
 
   const directSend = await jsonRequest(`${baseUrl}/v1/bridge/email/send`, {
     method: "POST",
     body: JSON.stringify({})
   });
   assert.equal(directSend.response.status, 404);
-  assert.equal(directSend.body.error.code, "ENVELOPE_NOT_FOUND");
+  assert.equal(directSend.body.error.code, "EXTENSION_DISABLED");
+  assert.equal(directSend.body.error?.details?.reason, "disabled_by_route_toggle");
+  assert.equal(directSend.body.error?.details?.extension_id, "loom-ext-email-bridge-v1");
 
   const smtpSubmit = await jsonRequest(`${baseUrl}/v1/gateway/smtp/submit`, {
     method: "POST",
     body: JSON.stringify({})
   });
   assert.equal(smtpSubmit.response.status, 404);
-  assert.equal(smtpSubmit.body.error.code, "ENVELOPE_NOT_FOUND");
+  assert.equal(smtpSubmit.body.error.code, "EXTENSION_DISABLED");
+  assert.equal(smtpSubmit.body.error?.details?.reason, "disabled_by_route_toggle");
+  assert.equal(smtpSubmit.body.error?.details?.extension_id, "loom-ext-legacy-gateway-v1");
 });
 
 test("API enforces rate limit on sensitive auth routes", async (t) => {

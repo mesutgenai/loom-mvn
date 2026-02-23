@@ -291,7 +291,7 @@ See `LOOM-Agent-First-Protocol-v2.0.md` for the structural blueprint.
 - Maintenance sweep support for token/cache cleanup and retention enforcement (`message` + `blob` policies)
 - Admin persistence operations: schema status, backup export, and restore
 - In-memory node API:
-  - Profile note: endpoints marked as extension surfaces are disabled (fail-closed `404`) when `LOOM_PROTOCOL_PROFILE=loom-core-1` unless extension/profile policy enables them.
+  - Profile note: endpoints marked as extension surfaces are disabled (fail-closed `404`) when `LOOM_PROTOCOL_PROFILE=loom-core-1` unless extension/profile policy enables them; disabled extension routes return `EXTENSION_DISABLED` and can expose or redact machine-readable disable details by policy.
   - `GET /.well-known/loom.json`
   - `GET /ready`
   - `GET /metrics` (Prometheus format, admin token by default)
@@ -644,6 +644,7 @@ Optional persistence:
   - `LOOM_CONFIG_PROFILE=secure_public` does not force `loom-core-1`; set `LOOM_PROTOCOL_PROFILE` explicitly when you want core-only runtime behavior.
   - Optional extension toggles (ignored in `loom-core-1`): `LOOM_EXTENSION_EMAIL_BRIDGE_ENABLED`, `LOOM_EXTENSION_LEGACY_GATEWAY_ENABLED`, `LOOM_EXTENSION_MCP_RUNTIME_ENABLED`, `LOOM_EXTENSION_WORKFLOW_ENABLED`, `LOOM_EXTENSION_E2EE_ENABLED`, `LOOM_EXTENSION_COMPLIANCE_ENABLED`.
   - Route-level toggles (also subject to extension/profile gates): `LOOM_BRIDGE_EMAIL_INBOUND_ENABLED`, `LOOM_BRIDGE_EMAIL_OUTBOUND_ENABLED`, `LOOM_BRIDGE_EMAIL_SEND_ENABLED`, `LOOM_GATEWAY_IMAP_ENABLED`, `LOOM_GATEWAY_SMTP_SUBMIT_ENABLED`, `LOOM_MCP_RUNTIME_ROUTES_ENABLED`, `LOOM_COMPLIANCE_ROUTES_ENABLED`.
+  - Optional extension-disable diagnostics policy: `LOOM_EXTENSION_DISABLE_ERROR_DIAGNOSTICS=true|false` (default `false` on public service, else `true`).
 - Optional local state-file encryption at rest:
   - `LOOM_STATE_ENCRYPTION_KEY` (32-byte key as base64url/base64/hex)
   - `LOOM_REQUIRE_STATE_ENCRYPTION_AT_REST=true|false` (when `true`, plaintext state files are refused)
