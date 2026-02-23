@@ -3,6 +3,7 @@
 Status: Draft  
 Date: 2026-02-20  
 Supersedes planning assumptions in `LOOM-Protocol-Spec-v1.1.md` for future-major work.
+Review baseline: aligned against repository state through `v0.4.2`.
 
 ## 1. Purpose
 

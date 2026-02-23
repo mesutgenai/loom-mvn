@@ -13,6 +13,7 @@
 > Historical specification baseline.
 > Canonical behavior now lives in `LOOM-Protocol-Spec-v1.1.md`, `LOOM-Agent-First-Protocol-v2.0.md`, `docs/LOOM-CORE.md`, and `docs/EXTENSION-REGISTRY.md`.
 > If this v1.0 draft conflicts with those references, follow the canonical set.
+> Review baseline: synchronized with repository state through `v0.4.2`.
 
 ---
 

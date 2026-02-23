@@ -5,6 +5,7 @@
 > Historical design draft.
 > Canonical behavior is defined by `LOOM-Protocol-Spec-v1.1.md`, `LOOM-Agent-First-Protocol-v2.0.md`, `docs/LOOM-CORE.md`, and `docs/EXTENSION-REGISTRY.md`.
 > If this draft conflicts with those documents, follow the canonical set above.
+> Review baseline: synchronized with repository state through `v0.4.2`.
 
 ---
 

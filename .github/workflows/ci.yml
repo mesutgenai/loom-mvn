@@ -1,4 +1,5 @@
 name: CI
+# Workflow baseline reviewed for v0.4.2 release line consistency.
 
 on:
   push:
