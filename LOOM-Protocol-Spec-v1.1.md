@@ -1594,6 +1594,11 @@ Agent     Node A         Node B       Sarah
 
 ## Changelog
 
+### 1.1.0-patch.3 — February 2026 (MVN v0.4.2)
+- Disabled extension routes use `EXTENSION_DISABLED` (`404`) with optional diagnostics for disable reason, extension id, and active protocol profile.
+- Compliance audit references now publish canonical spec/doc pointers while retaining stable `section` values for compatibility-sensitive consumers.
+- Bridge metadata guidance now explicitly includes `meta.bridge.structured_trust` and structured non-authoritative trust hints for downstream clients and agents.
+
 ### 1.1.0-patch.2 — February 2026 (MVN v0.4.1)
 - Runtime protocol profile split formalized for conformance and implementation (`loom-v1.1-full` default, `loom-core-1` core-only), with extension discovery endpoint (`GET /v1/protocol/extensions`) and fail-closed extension route behavior in core mode.
 - Bridge boundary defaults tightened: bridge-derived structured extraction is non-authoritative and bridge sender envelopes are non-actuating by default unless explicit policy opt-in is configured.

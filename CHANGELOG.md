@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- No changes yet.
+
+## v0.4.2 — 2026-02-23
+
 ### Extension Route Error Semantics
 
 - Disabled extension routes now return `404` with `EXTENSION_DISABLED` instead of overloading `ENVELOPE_NOT_FOUND`.

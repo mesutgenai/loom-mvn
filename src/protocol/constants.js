@@ -1,5 +1,5 @@
 export const LOOM_VERSION = "1.1";
-export const LOOM_RELEASE_VERSION = "0.4.1";
+export const LOOM_RELEASE_VERSION = "0.4.2";
 
 export const ID_PREFIX = {
   envelope: "env_",

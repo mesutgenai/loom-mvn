@@ -114,8 +114,8 @@ Positioning baseline: **LOOM-native when possible, email-compatible always**.
 
 ## Current status
 
-- Current release tag is `v0.4.1` (see `CHANGELOG.md` for release-level change history, including unreleased additions).
-- Repository package version is `0.4.1` (`package.json`).
+- Current release tag is `v0.4.2` (see `CHANGELOG.md` for release-level change history, including unreleased additions).
+- Repository package version is `0.4.2` (`package.json`).
 - npm publication is intentionally disabled (`"private": true`), so versioning is tracked in git tags/changelog rather than npm registry releases.
 - Comprehensive automated tests are included (`npm test`) and also run in CI.
 - Protocol modules cover all LOOM v1.1 specification sections plus security, compliance, and operational extensions.
