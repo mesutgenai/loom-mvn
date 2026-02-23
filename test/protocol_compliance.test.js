@@ -134,6 +134,13 @@ test("getComplianceCheckById finds existing check", () => {
   assert.equal(check.severity, "required");
 });
 
+test("getComplianceCheckById preserves stable section with doc-based reference checks", () => {
+  const check = getComplianceCheckById("agent_trust");
+  assert.ok(check);
+  assert.equal(check.section, "18.5");
+  assert.equal(check.reference, "docs/CONFORMANCE.md (Agent trust extension profile)");
+});
+
 test("getComplianceCheckById returns null for unknown id", () => {
   assert.equal(getComplianceCheckById("nonexistent_check"), null);
 });

@@ -973,6 +973,8 @@ function assertRouteEnabled(enabled, req, path, options = {}) {
     return;
   }
 
+  // Callers can map disabled extension surfaces to explicit protocol codes while
+  // preserving a generic route-not-found transport posture.
   const errorCode =
     typeof options.code === "string" && options.code.trim().length > 0
       ? options.code.trim()

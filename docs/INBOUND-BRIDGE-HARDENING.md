@@ -1,6 +1,7 @@
 # LOOM Inbound Bridge Hardening Runbook
 
 This runbook is the implementation artifact for `P0-06` in `docs/PRODUCTION-READINESS.md`.
+Reviewed for release baseline: `v0.4.2`.
 
 ## Objective
 

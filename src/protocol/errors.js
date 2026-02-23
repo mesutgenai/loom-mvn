@@ -13,6 +13,8 @@ export const STATUS_BY_CODE = {
   SIGNATURE_INVALID: 401,
   DELEGATION_INVALID: 403,
   CAPABILITY_DENIED: 403,
+  // Keep HTTP 404 to preserve fail-closed route-surface behavior while exposing
+  // explicit machine semantics through the protocol error code.
   EXTENSION_DISABLED: 404,
   AUDIENCE_DENIED: 403,
   ENCRYPTION_REQUIRED: 403,

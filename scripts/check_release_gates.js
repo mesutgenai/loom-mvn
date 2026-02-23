@@ -103,7 +103,7 @@ function main() {
     } else {
       checks.push("CHANGELOG.md includes `## Unreleased` section");
     }
-    if (!/^## v\d+\.\d+\.\d+ - \d{4}-\d{2}-\d{2}/m.test(changelog)) {
+    if (!/^## v\d+\.\d+\.\d+ (?:-|—) \d{4}-\d{2}-\d{2}/m.test(changelog)) {
       warnings.push("CHANGELOG.md does not contain a versioned release heading in expected format.");
     } else {
       checks.push("CHANGELOG.md contains versioned release entries");

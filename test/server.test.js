@@ -426,6 +426,7 @@ test("API core protocol profile disables extension routes by default", async (t)
   for (const denied of deniedRoutes) {
     assert.equal(denied.response.status, 404);
     assert.equal(denied.body?.error?.code, "EXTENSION_DISABLED");
+    assert.equal(denied.body?.error?.message, "Route not found");
     assert.equal(denied.body?.error?.details?.reason, "disabled_by_protocol_profile");
   }
 });
@@ -1118,6 +1119,7 @@ test("API can disable bridge and gateway send routes", async (t) => {
   });
   assert.equal(inbound.response.status, 404);
   assert.equal(inbound.body.error.code, "EXTENSION_DISABLED");
+  assert.equal(inbound.body.error.message, "Route not found");
   assert.equal(inbound.body.error?.details?.reason, "disabled_by_route_toggle");
   assert.equal(inbound.body.error?.details?.extension_id, "loom-ext-email-bridge-v1");
 
@@ -1127,6 +1129,7 @@ test("API can disable bridge and gateway send routes", async (t) => {
   });
   assert.equal(directSend.response.status, 404);
   assert.equal(directSend.body.error.code, "EXTENSION_DISABLED");
+  assert.equal(directSend.body.error.message, "Route not found");
   assert.equal(directSend.body.error?.details?.reason, "disabled_by_route_toggle");
   assert.equal(directSend.body.error?.details?.extension_id, "loom-ext-email-bridge-v1");
 
@@ -1136,6 +1139,7 @@ test("API can disable bridge and gateway send routes", async (t) => {
   });
   assert.equal(smtpSubmit.response.status, 404);
   assert.equal(smtpSubmit.body.error.code, "EXTENSION_DISABLED");
+  assert.equal(smtpSubmit.body.error.message, "Route not found");
   assert.equal(smtpSubmit.body.error?.details?.reason, "disabled_by_route_toggle");
   assert.equal(smtpSubmit.body.error?.details?.extension_id, "loom-ext-legacy-gateway-v1");
 });

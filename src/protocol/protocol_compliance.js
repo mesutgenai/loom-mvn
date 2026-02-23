@@ -322,6 +322,8 @@ function resolveComplianceReference(check) {
 }
 
 function resolveComplianceSection(check) {
+  // `section` is retained as a stable compatibility field for existing tooling,
+  // while `reference` carries the canonical pointer for current docs/spec text.
   const section = typeof check?.section === "string" ? check.section.trim() : "";
   if (section) {
     return section;

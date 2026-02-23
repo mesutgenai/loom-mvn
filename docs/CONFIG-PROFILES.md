@@ -1,6 +1,6 @@
 # LOOM Configuration Profiles
 
-Status: Draft (implementation profile)
+Status: Draft (implementation profile; reviewed for v0.4.2)
 
 ## Purpose
 

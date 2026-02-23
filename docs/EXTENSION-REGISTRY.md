@@ -1,6 +1,6 @@
 # LOOM Extension Registry and Versioning Rules
 
-Status: Draft (normative for this repository profile)
+Status: Draft (normative for this repository profile; reviewed for v0.4.2)
 
 ## Purpose
 

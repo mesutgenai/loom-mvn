@@ -4,6 +4,7 @@ scripts/output/
 .DS_Store
 .env
 .env.*
+# Keep release profile templates tracked.
 !.env.example
 !.env.production.example
 !.env.secure-public.example
